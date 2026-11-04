@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv2a_clear_color_test C)
+set(CMAKE_C_STANDARD 11)
+add_executable(nv2a_clear_color_test test_main.c)
+target_include_directories(nv2a_clear_color_test PRIVATE ../../src/kernel)
+enable_testing()
+add_test(NAME nv2a_clear_color COMMAND nv2a_clear_color_test)

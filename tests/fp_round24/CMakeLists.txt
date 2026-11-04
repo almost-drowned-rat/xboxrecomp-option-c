@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(fp_round24_test C)
+# recomp_fp_round24 (option C, F4) against the version before it, bit for bit.
+enable_testing()
+add_executable(fp-round24-test fp_round24_test.c)
+target_include_directories(fp-round24-test PRIVATE ../../templates/runtime ../../src)
+if(NOT WIN32)
+    target_link_libraries(fp-round24-test PRIVATE m)
+endif()
+add_test(NAME fp-round24-matches-reference COMMAND fp-round24-test)

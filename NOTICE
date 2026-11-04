@@ -1,0 +1,228 @@
+xboxrecomp — third-party attribution
+====================================
+
+xboxrecomp is MIT licensed (see LICENSE). The components listed below are
+not, and are included here under their original licences with their original
+copyright intact. They are other people's work and are credited as such.
+
+
+LGPL-2.1-or-later — extracted from xemu
+---------------------------------------
+
+  https://github.com/xemu-project/xemu
+
+  Files, with the copyright each one carries:
+
+    src/apu/apu_core.c    MCPX APU core
+                          (c) 2012 espes; 2018-2019 Jannik Vogel;
+                          2019-2025 Matt Borgerson
+    src/apu/apu_dsp.c     MCPX APU DSP (GP/EP)
+                          (c) 2012 espes; 2019-2025 Matt Borgerson
+    src/apu/apu_vp.c      MCPX APU voice processor
+                          (c) 2012 espes; 2018-2019 Jannik Vogel;
+                          2019-2025 Matt Borgerson
+    src/apu/apu_regs.h    (c) 2012 espes; 2018-2019 Jannik Vogel;
+                          2019-2021 Matt Borgerson
+    src/apu/apu_state.h   (c) 2012 espes; 2018-2019 Jannik Vogel;
+                          2019-2025 Matt Borgerson
+    src/apu/apu_debug.h   (c) 2020-2021 Matt Borgerson
+    src/apu/xbox_adpcm.h  Xbox ADPCM block decoder (moved out of apu_state.h)
+                          (c) 2012 espes; 2018-2019 Jannik Vogel;
+                          2019-2025 Matt Borgerson
+    src/apu/fpconv.h      (c) 2020-2025 Matt Borgerson
+    src/nv2a/nv2a_regs.h  NV2A register definitions
+                          (c) 2012 espes; 2015 Jannik Vogel
+    src/nv2a/nv2a_core.c  NV2A core register handlers, adapted
+                          (c) 2012 espes; 2015 Jannik Vogel;
+                          2018-2025 Matt Borgerson
+    src/nv2a/nv2a_state.h NV2A device state, adapted from nv2a_int.h
+                          (c) 2012 espes; 2015 Jannik Vogel;
+                          2018-2025 Matt Borgerson
+    src/apu/apu.h         MCPX APU public API
+                          (header has no copyright line)
+      (the three above listed after sp00n e2909fd by kaskabayev, #233)
+    src/nv2a_gl/gl_vsh_ff.c  fixed-function vertex lighting and REFLECTION_MAP
+                          texgen with the texture matrix (GLSL) and the
+                          specular exponent, after glsl/vsh-ff.c, glsl/vsh.c
+                          and pgraph.c (xemu 36334d9)
+                          (c) 2012, 2015 espes; 2015 Jannik Vogel;
+                          2018-2025 Matt Borgerson
+
+  src/apu/apu_shim.h is this project's own file but is released under the
+  same licence, because it exists only to host the extracted APU code.
+
+  Licensed under the GNU Lesser General Public License, version 2.1 or (at
+  your option) any later version. The full text is in LICENSES/LGPL-2.1.txt;
+  the canonical copy is
+  https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
+
+  These files keep their own licence. Linking against them from MIT or
+  proprietary code is expressly permitted by the LGPL — that is what
+  distinguishes it from the GPL. What the LGPL asks in return is that the
+  notices stay, that the source stays available, and that a user can relink
+  against a modified version. Distributing this repository, source included,
+  satisfies that.
+
+
+MIT — taken from other projects (branch vulkan-backend)
+------------------------------------------------------
+
+  antoxa2584x/burnout3-sw, commit 0bf84b5 (its LICENSE: MIT, (c) 2026 sp00nz;
+  the Vulkan renderer and the back-end interface are antoxa2584x's work):
+    src/nv2a_vk/                     Vulkan NV2A renderer
+    src/nv2a_gl/gl_vsh.c, gl_psh.c   shader generators (Vulkan dialect)
+    src/kernel/nv2a_backend.h, nv2a_pb_exec.c, nv2a_pb_scan.c (executor
+    replaced), parts of xbox_memory_layout.c, xbox_devbus.c, kernel_bridge.c
+    and kernel_xbox.c, as listed in each file's header
+
+  TGP482/XboxXBE-Recomp, commit 65e959d (MIT, (c) 2026 TGP482) – design
+  reference, rewritten in C, no code copied:
+    src/xdk/xdk_xinput.c   after runtime/xdk/xapi.cpp
+    src/xdk/xdk_dsound.c   after runtime/xdk/dsound.cpp
+
+  TGP482/XboxXBE-Recomp, commit 65e959d (MIT, (c) 2026 TGP482) – code
+  adapted (branch option-c), licence text kept in the file header:
+    tools/symbols/xbe2pe.py   after tools/symbols/xbe2pe.py (flat PE with
+                              function names as exports; reads tools.disasm
+                              functions.json instead of the game TOML)
+
+  xenophobentx/xboxrecomp (Takedawn's fork), commit e34e52e "apu: resample
+  voices by their pitch (linear interpolation)" (MIT, (c) 2026 sp00nz) –
+  code adapted (branch option-c):
+    src/apu/apu_resample.h    after voice_resample in its src/apu/apu_vp.c
+                              (split into a header so tests/apu_resample can
+                              drive it)
+
+  xenophobentx/xboxrecomp (Takedawn's fork), branch takedawn f7b6368 (MIT,
+  (c) 2026 sp00nz; the files last changed in cace227) – taken as they are
+  (branch option-c, 2026-10-28):
+    src/apu/apu_gp.c, apu_gp.h       a title's GP effects image, modelled
+    src/apu/apu_dsp56k.c, .h         the DSP56300 interpreter its reverb runs on
+    tests/apu_gp, tests/apu_dsp56k   their unit tests
+  and adapted: the model's hook-up in src/apu/apu_dsp.c (GP scratch access,
+  commands, export check, stereo fold) and the return-voice case in
+  src/apu/apu_vp.c (voice_plays_gp_export), after its apu_dsp.c / apu_vp.c.
+  The title's wiring (Burnout 3: gp_image.c, from Takedawn's game repository,
+  MIT) lives in the game's own repository.
+
+  sp00nznet/xboxrecomp (the upstream of this toolkit), v0.14.0..v0.16.0
+  (f0f8a46; MIT, (c) 2026 sp00nz) – commits taken or rewritten into option-c's
+  ctx form in U1 (2026-10-27; authors in CONTRIBUTORS.md):
+    tools/recomp/lifter.py, translator.py, templates/runtime/recomp_types.h
+        cebfc64 neg, 54b64ca pop esp, 114193f 16-bit push/pop, e3f6373 lahf
+        _cf, bbbaadb comisd lanes, 2db0a2f parity setcc/cmov, bb2b5c7
+        sahf/fcomi snapshot, 01064f3 fcmov, b40805c tbyte, 2d38bcd ficom,
+        f69a435 + 999a8c6 fprem/trig/fscale, c50c597 MXCSR, 46aee91 in/out,
+        0239dd3..4b449d7 (#176) callback recovery, c9c9701 offset frame
+    tools/disasm/functions.py    7fc6f0d + fce44fb code-section pointer tables
+                                 (with option-c's stricter filter)
+    src/kernel/kernel_bridge.c   117a649 callback registers, a37d669 APC esp,
+                                 f775a5a multiple-object waits
+    src/kernel/kernel_hal.c      46aee91 port I/O, field pin 0x80C0
+    src/kernel/kernel_path.c     c18d741 E:\CACHE (here to data\TitleCache)
+    src/kernel/nv2a_pb_exec.c    ffab460 fog plane / eye position constants
+    src/kernel/nv2a_pb_scan.c    ffab460 method names
+    src/apu/apu_vp.c, apu_regs.h b380f02 + aabebed ADPCM buffers, 70afb54
+                                 volume ramps
+  The xemu-derived files those touch keep their LGPL listing above.
+
+  TGP482/XboxXBE-Recomp: pin moved from 65e959d to 91146ff (reviewed in U1;
+  nothing new taken from it).
+
+
+Public domain / MIT-0 / MIT — vendored unchanged (branch vulkan-backend)
+------------------------------------------------------------------------
+
+  Audio decoders for the custom soundtracks (src/media/third_party/, files as
+  published, licence text at the end of each file):
+    dr_mp3.h  v0.7.4, dr_flac.h v0.13.4, dr_wav.h v0.14.6
+              mackron/dr_libs, commit d422edf; (c) David Reid; public
+              domain (Unlicense) or MIT No Attribution, at your choice
+    stb_vorbis.c  nothings/stb, commit 003501f; (c) Sean Barrett; MIT or
+              public domain, at your choice
+
+  SMAA (src/nv2a_vk/third_party/smaa/: SMAA.hlsl, AreaTex.h, SearchTex.h,
+  LICENSE.txt), iryoku/smaa, commit 71c806a; (c) 2013 Jorge Jimenez, Jose I.
+  Echevarria, Belen Masia, Fernando Navarro, Diego Gutierrez; MIT (the
+  LICENSE.txt next to the files). Built into the renderer as GLSL at
+  configure time (CMake turns SMAA.hlsl into a header).
+
+  miniz (src/shaderpack/third_party/miniz/: miniz_tinfl.c, miniz_tinfl.h,
+  miniz.h, miniz_common.h, miniz_tdef.h, miniz_zip.h, LICENSE),
+  richgel999/miniz, tag 3.1.2, commit 77d0dce; (c) 2013-2014 RAD Game Tools
+  and Valve Software, (c) 2010-2014 Rich Geldreich and Tenacious Software
+  LLC; MIT (the LICENSE next to the files). Vendored unchanged; only the
+  inflater (tinfl) is compiled, for the shader packs' zips
+  (src/shaderpack/zip_read.c, written for this toolkit).
+
+  pl_mpeg (src/bootvideo/third_party/pl_mpeg/: pl_mpeg.h, LICENSE),
+  phoboslab/pl_mpeg, commit c871f2b (2025-12-30); Dominic Szablewski; MIT
+  (SPDX identifier in the header; LICENSE holds the standard MIT text, the
+  upstream repository has no separate licence file). Vendored unchanged;
+  decodes the boot animation (media/boot.mpg: MPEG-1 video, MP2 audio,
+  MPEG-PS) in src/bootvideo/boot_video.c.
+
+  librashader C header (src/nv2a_vk/third_party/librashader/librashader.h),
+  SnowflakePowered/librashader, tag librashader-v0.12.0, commit 87e8a97;
+  (c) 2022 chyyran; MIT (the licence text at the top of the file); identical
+  in v0.12.1. Only the header: the librashader library (MPL-2.0 or GPLv3) is
+  not part of this toolkit's sources -- a port's deps script builds it from
+  its upstream source (Vulkan runtime only) into a separate DLL next to the
+  exe, which src/nv2a_vk/shader_pass.c loads at run time. A distributed
+  build must ship librashader's licence and say where its source is.
+
+  NoRain211/doaxvb-re (GPL-3.0) docs/custom-soundtracks.md was the design
+  reference for src/xdk/xdk_soundtrack.c (which XAPI functions and media
+  object methods to replace); no code taken, written new for this toolkit.
+
+Derived algorithms — credited, independently implemented
+--------------------------------------------------------
+
+  src/d3d/d3d8_swizzle.h
+    Implements Xbox Z-order (Morton) texture unswizzling. The
+    masked-increment technique is Fabian Giesen's, published on his blog;
+    xemu's hw/xbox/nv2a/pgraph/swizzle.c is cited in the file as the
+    reference that pointed us at it.
+
+  src/d3d/d3d8_combiners.h
+    NV2A register-combiner translation. Cites xemu's pgraph combiner
+    implementation as a reference for the hardware's behaviour.
+
+  src/apu/apu_lowpass.h  (branch option-c)
+    The voice processor's per-voice low-pass: Hal Chamberlin's digital state
+    variable filter ("Musical Applications of Microprocessors", 2nd ed.,
+    1985), written from the book. It replaces the filter that came from
+    xemu's hw/xbox/mcpx/apu/vp/svf.h (GPLv2), which is no longer in the tree,
+    together with the unused DSP56300 core/DMA declarations from xemu's
+    GPL-2.0-or-later DSP headers. The input level sqrt(q/2 + 0.01) keeps the
+    loudness the old filter gave. Takedawn's xboxrecomp fork made the same
+    replacement first (its own MIT apu_lowpass.h); the idea is credited to
+    it, the code here is this tree's. tests/apu_lowpass compares the new
+    filter with stored outputs of the old one (tolerance in the test).
+
+  src/nv2a_gl/gl_vsh.c nv2a_ptsize, gl_vsh_ff.c, gl_psh.c u_psprite  (branch option-c)
+    Point size and point sprites: SET_POINT_SIZE, the SET_POINT_PARAMS
+    distance attenuation and SET_POINT_SMOOTH_ENABLE as the texture stage 3
+    point coordinate, after the hardware model in xemu's
+    hw/xbox/nv2a/pgraph/glsl/vsh-ff.c, vsh.c and psh.c (LGPL-2.1-or-later),
+    written for this tree's shaders, not copied.
+
+  Algorithms and hardware behaviour are not themselves copyrightable, and
+  these are our own implementations. They are listed here because the debt is
+  real and should be visible even where no licence obligation attaches. If
+  anyone believes either file crosses from "implements the same algorithm"
+  into "copies the expression", raise an issue and we will rewrite or
+  relicense it — getting the credit right matters more to us than the licence
+  label.
+
+
+Reference material (no code taken)
+-----------------------------------
+
+  xemu, Cxbx-Reloaded and xboxdevwiki were used as references for hardware
+  behaviour: register offsets, kernel export ordinals, structure layouts.
+  Those are functional facts rather than expression, and no code was copied
+  for them.
+
+
+Contributors to xboxrecomp itself are credited in CONTRIBUTORS.md.

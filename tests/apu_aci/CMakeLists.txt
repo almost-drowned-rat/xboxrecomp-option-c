@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(apu_aci_test C)
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../.. runtime)
+add_executable(apu_aci_test test_main.c)
+target_include_directories(apu_aci_test PRIVATE ../../src ../../src/apu)
+# The whole runtime: the model's wiring calls into the kernel's AC'97 trap and device bus.
+target_link_libraries(apu_aci_test PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME apu_aci COMMAND apu_aci_test)
