@@ -1333,6 +1333,7 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
     case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
     case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
+    case 0x28: return 0x17;                /* G8B8      -> LU_IMAGE_G8B8 */
     default:   return fmt;                 /* already linear, or unhandled */
     }
 }
@@ -1440,6 +1441,16 @@ static int sample_texture(const Texture *t, uint32_t u, uint32_t v, uint32_t *ar
     case 0x1F:                                      /* LIN_A8 */
         *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
         return 1;
+
+    /* 16-bit, two channels: G8B8 (SZ 0x28 / LU_IMAGE 0x17) - the bump maps of water (du / dv for BUMPENVMAP;
+     * Panzer Dragoon Orta's episode-2 river was decoded as nothing, magenta, so its reflection never moved).
+     * The hardware's channel routing as xemu has it (pgraph/gl/constants.h: RG8, swizzle R G R G): the low byte
+     * reads as red and blue, the high byte as green and alpha. Option-c, 2026-11-08. */
+    case 0x17: {
+        uint32_t lo = p[(size_t)u * 2], hi = p[(size_t)u * 2 + 1];
+        *argb = (hi << 24) | (lo << 16) | (hi << 8) | lo;
+        return 1;
+    }
 
     /* 4:2:2 packed YUV, two texels per four bytes.
      *

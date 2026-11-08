@@ -24,6 +24,7 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+#include "apu_xaudio2.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -447,6 +448,62 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
         gp_command_at_frame(d);
         apu_gp_frame(&m, mixbins, acc);
+        {
+            /* RECOMP_APU_SPKSTATS=1 (diagnosis, 2026-11-07; off by default): every 10 s the level of the
+             * GP's six speaker feeds (FL FR FC LFE SL SR, RMS / peak dBFS) - does a title mix more than stereo? */
+            static int spk_on = -1;
+            static double spk_sq[APU_GP_SPEAKERS];
+            static float spk_pk[APU_GP_SPEAKERS];
+            static uint32_t spk_frames;
+            if (spk_on < 0) {
+                const char *e = getenv("RECOMP_APU_SPKSTATS");
+                spk_on = e && *e && *e != '0';
+            }
+            if (spk_on) {
+                for (int c = 0; c < APU_GP_SPEAKERS; c++)
+                    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                        float v = acc[c][i], a = v < 0 ? -v : v;
+                        spk_sq[c] += (double)v * v;
+                        if (a > spk_pk[c]) spk_pk[c] = a;
+                    }
+                if (++spk_frames % (10u * 48000u / NUM_SAMPLES_PER_FRAME) == 0) {
+                    static const char *const nm[6] = { "FL", "FR", "FC", "LFE", "SL", "SR" };
+                    char line[256];
+                    int len = 0;
+                    for (int c = 0; c < APU_GP_SPEAKERS && c < 6; c++) {
+                        double rms = sqrt(spk_sq[c] / (10.0 * 48000.0));
+                        len += snprintf(line + len, sizeof line - (size_t)len, " %s:%.1f/%.1f", nm[c],
+                                        rms > 1e-9 ? 20.0 * log10(rms) : -180.0,
+                                        spk_pk[c] > 0.0f ? 20.0 * log10((double)spk_pk[c]) : -180.0);
+                        spk_sq[c] = 0.0;
+                        spk_pk[c] = 0.0f;
+                    }
+                    fprintf(stderr, "[APU-SPK] t=%us speaker feeds rms/peak dBFS:%s\n",
+                            (unsigned)(spk_frames / (48000u / NUM_SAMPLES_PER_FRAME)), line);
+                }
+            }
+        }
+        if (xa2_surround()) {
+            /* 5.1 output (option-c, 2026-11-08): the GP's own six speaker feeds go out as they are - no
+             * fold, no remix (the title mixes for six speakers itself when XC_AUDIO says Dolby Digital) */
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                static const int ch[6] = { FL, FR, FC, LFE, SL, SR };
+                int16_t s[6];
+                for (int k = 0; k < 6; k++) {
+                    float v = acc[ch[k]][i];
+                    if (v > 1.0f) v = 1.0f;
+                    if (v < -1.0f) v = -1.0f;
+                    s[k] = (int16_t)(v * 32767.0f);
+                }
+                d->monitor.frame_buf[off + i][0] = s[0];
+                d->monitor.frame_buf[off + i][1] = s[1];
+                for (int k = 0; k < 4; k++)
+                    d->monitor.frame_surr[off + i][k] = s[2 + k];
+            }
+            g_dbg.gp.cycles = 0;
+            g_dbg.ep.cycles = 0;
+            return;
+        }
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             float c = 0.70710678f * acc[FC][i];
             float left = acc[FL][i] + c + 0.70710678f * acc[SL][i];

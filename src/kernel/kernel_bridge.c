@@ -982,12 +982,17 @@ static void bridge_PsCreateSystemThreadEx(X86Ctx *ctx)
                     return;
                 }
 
-                stack_top = xbox_AllocThreadStack();
+                /* The stack the title asks for (KernelStackSize), not a fixed
+                 * 512 KB: Orta's episode 3 -> 4 loader keeps over 32 workers
+                 * alive, and at 512 KB each the pool ran dry (and ate 16 MB of
+                 * a 64 MB heap) - the next worker ran inline and its caller
+                 * hung (2026-11-08). */
+                stack_top = xbox_AllocThreadStackSized(STACK_ARG(2));
 
                 if (!stack_top) {
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: out of "
-                            "thread stacks, running worker 0x%08X inline\n",
-                            start_routine);
+                            "thread stacks (stack %u bytes asked), running worker 0x%08X inline\n",
+                            STACK_ARG(2), start_routine);
                     fflush(stderr);
                     bridge_run_thread_inline(ctx, fn, start_context1, start_context2);
                 } else {
@@ -995,8 +1000,8 @@ static void bridge_PsCreateSystemThreadEx(X86Ctx *ctx)
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top, obj);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
-                            "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
-                            start_routine, start_context1, stack_top);
+                            "worker 0x%08X (ctx=0x%08X, stack top 0x%08X, %u bytes asked)\n",
+                            start_routine, start_context1, stack_top, STACK_ARG(2));
                     fflush(stderr);
                     if (xbox_handle_ptr && th) {
                         bridge_write_handle(xbox_handle_ptr, th);

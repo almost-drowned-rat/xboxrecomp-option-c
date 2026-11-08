@@ -796,18 +796,24 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             }
         }
     } else {
-        /* OUT: the status stage of an IN control transfer, or rumble. Both
-         * are accepted and discarded -- but only the control pipe's ends a
-         * control transfer. A rumble packet on endpoint 2 used to clear the
-         * pending setup too, so a force-feedback write landing between a
-         * control request's stages broke that request; Burnout 3 starts its
-         * engine-rev rumble on the Crash countdown and then paused with the
-         * pad unresponsive. */
+        /* OUT: the status stage of an IN control transfer, or rumble -- the
+         * output report on endpoint 2, or the data stage of a SET_REPORT
+         * (21 09) on the control pipe. The motor speeds go to the host pad
+         * (usb_gamepad_output); everything else is accepted and discarded.
+         * Only the control pipe's OUT ends a control transfer. A rumble
+         * packet on endpoint 2 used to clear the pending setup too, so a
+         * force-feedback write landing between a control request's stages
+         * broke that request; Burnout 3 starts its engine-rev rumble on the
+         * Crash countdown and then paused with the pad unresponsive. */
         moved = len;
         if (endpoint == 0) {
+            if (g_setup_pending && g_setup.bmRequestType == 0x21 && g_setup.bRequest == 0x09 && len >= 6)
+                usb_gamepad_output(pad, guest_ptr(cbp, (uint32_t)len), len);
             g_setup_pending = 0;
             s_n_out_ep0++;
         } else {
+            if (len >= 6)
+                usb_gamepad_output(pad, guest_ptr(cbp, (uint32_t)len), len);
             s_n_out_other++;
         }
     }
@@ -1186,7 +1192,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
      * dereferences null before it executes a line of its own body. That is
      * what killed the process here, two interrupts in, with no fault report
      * because the fault was in the runtime rather than in the title. */
-    unsigned waited = 0;
+    unsigned waited = 0;                /* ms until the driver started the controller */
     int plugged = 0;
     uint32_t last_status = 0;
     unsigned repeats = 0;
@@ -1221,9 +1227,17 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
 
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
+        /* No giving up: this used to stop after 1500 passes, meant as 30 s
+         * (20 ms passes) but 6 s at the 4 ms tick, and a title that started
+         * its USB stack later -- Panzer Dragoon Orta behind a boot video
+         * (media\boot.mpg) -- never got a pad, keyboard included
+         * (2026-11-05). After 30 s the wait just slows to 100 ms passes. */
         if ((control & 0xC0u) != 0x80u) {
-            if (++waited > 1500)              /* 30 s and it never started */
-                break;
+            waited += OHCI_TICK_MS;
+            if (waited > 30000u) {
+                Sleep(100);
+                waited += 100u;
+            }
             continue;
         }
         if (!(enable & INTR_MIE))
@@ -1248,7 +1262,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             s_plugged_pads = 1;
             first_port = port;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
-                            "arriving on port 1\n", waited * 20);
+                            "arriving on port 1\n", waited);
             fflush(stderr);
         }
 

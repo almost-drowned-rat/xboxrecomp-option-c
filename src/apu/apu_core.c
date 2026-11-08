@@ -435,6 +435,7 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 #define OUT_RING_SAMPLES   8192u                /* power of two */
 #define OUT_RING_MAX       4096u                /* ~85 ms: above it the oldest samples are dropped */
 static int16_t  s_out_ring[OUT_RING_SAMPLES][2];
+static int16_t  s_out_surr[OUT_RING_SAMPLES][4];  /* 5.1 output only: FC LFE SL SR beside s_out_ring's FL FR */
 static unsigned s_out_w, s_out_r;               /* free-running sample counters */
 static unsigned s_out_dropped;
 
@@ -443,6 +444,17 @@ static void out_ring_take(int16_t (*dst)[2], unsigned n)
     for (unsigned i = 0; i < n; i++, s_out_r++) {
         dst[i][0] = s_out_ring[s_out_r % OUT_RING_SAMPLES][0];
         dst[i][1] = s_out_ring[s_out_r % OUT_RING_SAMPLES][1];
+    }
+}
+
+/* 5.1: interleaved FL FR FC LFE SL SR */
+static void out_ring_take6(int16_t (*dst)[6], unsigned n)
+{
+    for (unsigned i = 0; i < n; i++, s_out_r++) {
+        unsigned k = s_out_r % OUT_RING_SAMPLES;
+        dst[i][0] = s_out_ring[k][0];
+        dst[i][1] = s_out_ring[k][1];
+        memcpy(&dst[i][2], s_out_surr[k], sizeof s_out_surr[k]);
     }
 }
 
@@ -492,11 +504,19 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
     else
         mixer_render(d->monitor.frame_buf, MIXER_FRAME_SAMPLES);
-    for (int i = 0; i < MIXER_FRAME_SAMPLES; i++, s_out_w++) {
-        s_out_ring[s_out_w % OUT_RING_SAMPLES][0] = d->monitor.frame_buf[i][0];
-        s_out_ring[s_out_w % OUT_RING_SAMPLES][1] = d->monitor.frame_buf[i][1];
+    {
+        int surr = xa2_surround() && !g_audio_muted;
+        for (int i = 0; i < MIXER_FRAME_SAMPLES; i++, s_out_w++) {
+            s_out_ring[s_out_w % OUT_RING_SAMPLES][0] = d->monitor.frame_buf[i][0];
+            s_out_ring[s_out_w % OUT_RING_SAMPLES][1] = d->monitor.frame_buf[i][1];
+            if (surr)
+                memcpy(s_out_surr[s_out_w % OUT_RING_SAMPLES], d->monitor.frame_surr[i], sizeof d->monitor.frame_surr[i]);
+            else
+                memset(s_out_surr[s_out_w % OUT_RING_SAMPLES], 0, sizeof s_out_surr[0]);
+        }
     }
     memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+    memset(d->monitor.frame_surr, 0, sizeof(d->monitor.frame_surr));
     mcpx_aci_tick(MIXER_FRAME_SAMPLES);         /* the AC'97 channels play in step with this block */
     if (s_out_w - s_out_r > OUT_RING_MAX) {     /* the device fell behind: keep the latency bounded */
         unsigned drop = s_out_w - s_out_r - OUT_RING_MAX + 1024u;
@@ -508,12 +528,15 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     /* XAudio2 path: submit whole buffers while the ring has them and the queue takes them */
     if (xa2_is_active()) {
         unsigned buf_size = (unsigned)xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
+        static int16_t xa2_tmp[1024][6];  /* matches XA2_BUF_SAMPLES max; 2 or 6 channels used */
         if (buf_size > 1024u)
             buf_size = 1024u;
         while (s_out_w - s_out_r >= buf_size) {
             unsigned r = s_out_r;
-            out_ring_take(xa2_tmp, buf_size);
+            if (xa2_surround())
+                out_ring_take6(xa2_tmp, buf_size);
+            else
+                out_ring_take((int16_t (*)[2])xa2_tmp, buf_size);
             if (!xa2_submit_samples((const int16_t *)xa2_tmp, (int)buf_size)) {
                 s_out_r = r;                    /* queue full: try again after the next block */
                 break;

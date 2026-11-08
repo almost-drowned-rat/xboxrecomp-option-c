@@ -115,6 +115,18 @@ static const Nv2aRawBatch *s_batch;
 /* Hitch accounting, as in nv2a_gl. */
 static uint32_t s_hz_progs, s_hz_texs, s_hz_draws;
 static uint64_t s_hz_prog_ns, s_hz_tex_ns, s_hz_tex_bytes;
+/* A named screenshot (vk_flip, after the frame ring is submitted): GPU wait +
+ * read-back + BMP write on the render thread. Taken late in a flip, so it lands
+ * in the next interval's [hitch] line; it was the uncounted ~215 ms of Orta's
+ * every-90-s 233 ms frames (pad-script shots, 2026-11-08). */
+static uint64_t s_hz_shot_ns;
+/* Two more parts of the executor's ("translate") time that no counter saw:
+ * draw pipelines the driver builds (pipe_get; a known program with a new
+ * blend / depth / vertex key is not a "program compiled") and render-target
+ * images made or regrown (surf_get). Orta has rare 1.2-1.5 s "translate"
+ * frames with 0 programs and 0 textures (2026-11-08). */
+static uint32_t s_hz_pipes, s_hz_surfs;
+static uint64_t s_hz_pipe_ns, s_hz_surf_ns;
 static uint64_t hz_now(void)
 {
 #if defined(__SWITCH__)
@@ -205,6 +217,17 @@ static void display_hz_update(void)
         s_display_hz = hz;
         LOGE("display refresh: %.2f Hz\n", hz);
     }
+#if defined(_WIN32)
+    {
+        /* FRAME PACING Display: the kernel's clock binds to the display the
+         * window is on (at creation, on a display or mode change) */
+        extern void xbox_GuestDisplayPacing(void *native_window);
+        void *hwnd = s_win ? SDL_GetPointerProperty(SDL_GetWindowProperties(s_win),
+                                                    SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL) : NULL;
+        if (hwnd)
+            xbox_GuestDisplayPacing(hwnd);
+    }
+#endif
 }
 #endif
 
@@ -470,7 +493,14 @@ static void tex_mem_release(const TexMem *tm)
 /* ── Frames in flight ─────────────────────────────────────────────── */
 
 #define VK_FRAMES 2
-#define RING_BYTES (48u << 20)
+/* The per-frame ring (vertex data, constants, texture staging): RECOMP_VK_RING_MB=<8..48>, default 48. It is
+ * host-visible memory the driver keeps resident in full - two of them (frames in flight) were 96 MB of the
+ * process's working set even on a title screen (2026-11-08, Orta: working-set map of the title). A frame that
+ * needs more flushes mid-frame (ring_alloc), slower but correct; RECOMP_VK_RING_STATS=1 logs the peak use. */
+static VkDeviceSize s_ring_bytes = 48u << 20;
+#define RING_BYTES s_ring_bytes
+static VkDeviceSize s_ring_peak;         /* RECOMP_VK_RING_STATS: the highest ring_off of the window */
+static uint32_t s_ring_flushes;          /* mid-frame flushes of the window */
 
 typedef struct {
     VkImage image; VkImageView view; VkDeviceMemory mem; VkPipeline pipe;
@@ -526,7 +556,7 @@ extern long long xbox_ft_now(void);
 extern double xbox_ft_ms(long long since);
 /* a [hitch] line noted at the start of vk_flip, printed after xbox_ft_frame
  * closed that frame (with its split, file reads and sleeps) */
-static char s_hitch[256];
+static char s_hitch[384];
 extern int  xbox_RtWatchOn(void);
 extern void xbox_RtWatchArm(uint32_t gpu_va, uint32_t bytes);
 extern void xbox_SetContiguousFreeHook(void (*fn)(uint32_t addr, uint32_t size));
@@ -624,10 +654,17 @@ static VkDeviceSize ring_alloc(VkDeviceSize size, VkDeviceSize align, void **ptr
          * it, and start over in the same ring. Slow, but only in extremes. */
         static int warned;
         if (!warned++)
-            LOGE("frame ring (%u MB) full: flushing mid-frame\n", RING_BYTES >> 20);
+            LOGE("frame ring (%u MB) full: flushing mid-frame\n", (unsigned)(RING_BYTES >> 20));
+        if (at > s_ring_peak)
+            s_ring_peak = at;
+        s_ring_flushes++;
         flush_frame_wait();
         at = 0;
         if (size > RING_BYTES) {
+            static unsigned told;
+            if (told++ < 8)                 /* a texture / upload bigger than the whole ring: not drawn */
+                LOGE("frame ring (%u MB): one upload of %.1f MB does not fit - skipped (RECOMP_VK_RING_MB)\n",
+                     (unsigned)(RING_BYTES >> 20), (double)size / 1048576.0);
             *ptr = NULL;
             return 0;
         }
@@ -707,6 +744,13 @@ static int      s_square, s_square_env;
 static volatile int s_opt_scale_q, s_opt_wide;
 static int      s_scale_env;
 
+/* How many more columns a wide frame has than a 4:3 one: the gameplay
+ * aspect (xbox_video_aspect: 16:9, 16:10, 21:9) over 4:3 -- 4/3 at 16:9. */
+static double wide_xr(void)
+{
+    return xbox_video_aspect() * 0.75;
+}
+
 /* The port's "menus stretched" option (nv2a_vk_set_stretch_43): with 16:9
  * on, the frames the port marks 4:3 (menus, movies) fill the 16:9 window
  * instead of being pillarboxed, as the Xbox dashboard's widescreen setting
@@ -764,7 +808,7 @@ volatile int nv2a_vk_scale_pct;
  * by the device's image limits. */
 static void stored_size(uint32_t w, uint32_t h, uint32_t aa_sx, uint32_t *pw, uint32_t *ph)
 {
-    double kx = s_scale_x * (s_square && aa_sx <= 1 ? 4.0 / 3.0 : 1.0), ky = s_scale;
+    double kx = s_scale_x * (s_square && aa_sx <= 1 ? wide_xr() : 1.0), ky = s_scale;
     if (w * kx > (double)s_max_size || h * ky > (double)s_max_size) {
         static int told;
         if (!told++)
@@ -877,7 +921,7 @@ static void update_fit_mask(void)
         uint32_t m = 0;
         for (i = 0; i <= VK_SCALE_STEPS; i++) {
             double f = 1.0 + 0.25 * i;
-            if (scale_fits(f * (a ? 4.0 / 3.0 : 1.0), f))
+            if (scale_fits(f * (a ? wide_xr() : 1.0), f))
                 m |= 1u << i;
         }
         s_fit_mask[a] = m & ~s_fit_bad[a];
@@ -1228,6 +1272,7 @@ static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uin
 {
     VkSurf *s = surf_find(va), *victim = NULL;
     int i;
+    uint64_t t0;
 
     /* h is the surface clip, not the allocation (NFSU2's split screen clips
      * the back buffer to each player's half): keep the surface while the
@@ -1238,6 +1283,8 @@ static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uin
     }
     if (s && s->w == w && s->h > h)
         h = s->h;
+    s_hz_surfs++;
+    t0 = hz_now();
     if (!s) {
         for (i = 0; i < VK_MAX_SURF; i++) {
             if (!s_surf[i].image) { victim = &s_surf[i]; break; }
@@ -1273,10 +1320,12 @@ static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uin
                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                    VK_IMAGE_ASPECT_COLOR_BIT, &s->image, &s->view, &s->mem)) {
             memset(s, 0, sizeof *s);
+            s_hz_surf_ns += hz_now() - t0;
             return NULL;
         }
     }
     clear_image_color(s->image, 0, 0, 0, 1);
+    s_hz_surf_ns += hz_now() - t0;
     if (s_trace || debug_on())
         LOGE("surface 0x%08X %ux%u (aa %ux%u, stored %ux%u)\n", va, w, h, aa_sx, aa_sy,
              s->pw, s->ph);
@@ -2420,6 +2469,38 @@ static int tex_is_depth(uint32_t color)
 
 static VkDepthBuf *s_bound_depth[4];    /* the depth buffer stage i samples (bind_stage), or NULL */
 
+/* RECOMP_VK_TEXBIND_LOG=1 (diagnosis, off by default): each distinct binding
+ * (stage, address, colour format, rect, kind) once, with what it was bound
+ * to -- a depth buffer, a render surface (and its stored size + texcoord
+ * scale), a cached texture, or the dummy. For effects that sample a target
+ * the renderer made (Orta's red special: a staircase of blocks,
+ * 2026-11-08). At most 256 lines. */
+static void tex_bind_log(int stage, uint32_t va, uint32_t color, uint32_t format, uint32_t rect,
+                         const char *kind, uint32_t pw, uint32_t ph, const float scale[2])
+{
+    static int on = -1, n;
+    static uint32_t seen[256][4];
+    int k;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VK_TEXBIND_LOG");
+        on = e && *e == '1';
+    }
+    if (!on || n >= 256)
+        return;
+    for (k = 0; k < n; k++)
+        if (seen[k][0] == va && seen[k][1] == (color | (uint32_t)stage << 8 | (uint32_t)kind[0] << 16)
+            && seen[k][2] == rect && seen[k][3] == pw)
+            return;
+    seen[n][0] = va;
+    seen[n][1] = color | (uint32_t)stage << 8 | (uint32_t)kind[0] << 16;
+    seen[n][2] = rect;
+    seen[n][3] = pw;
+    n++;
+    fprintf(stderr, "[VK] texbind frame %u stage %d va 0x%08X color 0x%02X format 0x%08X rect %ux%u -> %s"
+                    " %ux%u, tc scale %g x %g\n", s_frame, stage, va, color, format, rect >> 16, rect & 0xFFFF,
+            kind, pw, ph, scale[0], scale[1]);
+}
+
 /* Stage i: its image view (a surface or a cached texture), sampler and
  * texcoord scale. Records uploads, so call it outside rendering or accept
  * that it ends the pass. */
@@ -2471,6 +2552,8 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
                 s_depth[k].used = s_frame;
                 break;
             }
+        tex_bind_log(i, va, color, format, regs[base + 7], k < VK_MAX_DEPTH ? "depth" : "depth MISSING (dummy)",
+                     k < VK_MAX_DEPTH ? s_depth[k].pw : 0, k < VK_MAX_DEPTH ? s_depth[k].ph : 0, scale);
         out->sampler = sampler_get(((regs[base + 2]) & 0xF0F) | 0x30000);    /* nearest */
         return;
     }
@@ -2541,12 +2624,15 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
         out->imageView = rt->view;
         *sampled = rt;
         rt_scale(w, h, rt->w, rt->h, rt->aa_sx, rt->aa_sy, scale);
+        tex_bind_log(i, va, color, format, regs[base + 7], "surface", rt->pw, rt->ph, scale);
     } else {
         uint32_t texs = s_hz_texs;
         uint64_t t0 = hz_now();
         out->imageView = tex_get(va, color, w, h, pitch, 0, levels);
         if (s_hz_texs != texs)
             s_hz_tex_ns += hz_now() - t0;
+        if (pitch)                              /* linear only: swizzled textures would fill the 256 lines */
+            tex_bind_log(i, va, color, format, regs[base + 7], "texture", w, h, scale);
     }
     addr = regs[base + 2];
     filter = regs[base + 5];
@@ -3292,9 +3378,15 @@ static VkPipeline pipe_get(const PipeKey *k)
     ci.layout = s_layout;
     VT("vkCreateGraphicsPipelines prog %d blend %u cmask %X depth %u topo %u\n", k->prog, k->blend,
        k->cmask, k->depth, k->topo);
-    if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &ci, NULL, &pipe) != VK_SUCCESS) {
-        LOGE("pipeline creation failed\n");
-        return VK_NULL_HANDLE;
+    {
+        uint64_t t0 = hz_now();
+        VkResult pr = vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &ci, NULL, &pipe);
+        s_hz_pipes++;
+        s_hz_pipe_ns += hz_now() - t0;
+        if (pr != VK_SUCCESS) {
+            LOGE("pipeline creation failed\n");
+            return VK_NULL_HANDLE;
+        }
     }
     if (s_npipes == VK_MAX_PIPE) {
         LOGE("pipeline table full\n");
@@ -3483,7 +3575,7 @@ static int create_swapchain(void)
     }
     s_sc_extent = caps.currentExtent;
     if (s_sc_extent.width == 0xFFFFFFFFu) {
-        s_sc_extent.width = xbox_video_widescreen() ? 1280 : 960;   /* the window's aspect (SDL_CreateWindow) */
+        s_sc_extent.width = (uint32_t)(720.0 * xbox_video_aspect() + 0.5);   /* the window's aspect (SDL_CreateWindow) */
         s_sc_extent.height = 720;
     }
     ci.surface = s_surface;
@@ -3804,7 +3896,7 @@ static int ready(void)
                  * when resized, so no bars are added around the picture. A
                  * rectangle the port saved (nv2a_vk_set_window_rect) keeps
                  * its height and position, the width follows the aspect. */
-                float aspect = xbox_video_widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;
+                float aspect = (float)xbox_video_aspect();   /* 4:3, 16:9, 16:10, 21:9 (2026-11-07) */
                 int wh = s_wr_have ? s_wr_want[3] : 720;
                 int ww = (int)(wh * aspect + 0.5f);
                 s_win = SDL_CreateWindow("NV2A (Vulkan)", ww, wh,
@@ -3924,7 +4016,7 @@ static int ready(void)
             s_square_env = 0, s_scale_env = 1;
         s_square = s_square_env && nv2a_vk_square;
         if (k > 0.0)
-            s_xratio = (k < 0.5 ? 0.5 : k > VK_SCALE_MAX * 4.0 / 3.0 ? VK_SCALE_MAX * 4.0 / 3.0 : k) / s_scale;
+            s_xratio = (k < 0.5 ? 0.5 : k > VK_SCALE_MAX * 64.0 / 27.0 * 0.75 ? VK_SCALE_MAX * 64.0 / 27.0 * 0.75 : k) / s_scale;
         s_xratio_env = s_xratio;
         s_scale_x = s_scale * s_xratio;
         if (s_scale != 1.0 || s_scale_x != 1.0 || s_square)
@@ -4160,6 +4252,17 @@ static int ready(void)
         vkCreateFence(s_dev, &fci, NULL, &f->fence);
         vkCreateSemaphore(s_dev, &sci, NULL, &f->acquired);
         vkCreateSemaphore(s_dev, &sci, NULL, &f->rendered);
+        {
+            static int read;
+            const char *e = getenv("RECOMP_VK_RING_MB");
+            if (!read++ && e && *e) {
+                long mb = strtol(e, NULL, 10);
+                if (mb >= 8 && mb <= 48) {
+                    s_ring_bytes = (VkDeviceSize)mb << 20;
+                    fprintf(stderr, "  [VK] frame ring %ld MB x %u (RECOMP_VK_RING_MB)\n", mb, s_nframes);
+                }
+            }
+        }
         bci.size = RING_BYTES;
         bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -4864,6 +4967,84 @@ static void vm_prepare(const Nv2aRawBatch *b)
     }
 }
 
+/* HUD un-stretch (THPS 2X maintainer, 2026-11-07: SCORE / SPECIAL to the
+ * edges at 16:9 / 16:10 / 21:9). A title that draws its 2D in the 640-wide
+ * logical space shows it stretched by the wide square-pixel surface. The port
+ * names its screen-space program (FNV hash of the transform program, as
+ * RECOMP_VK_DRAW_LOG prints it) and the stretch k (aspect / (4/3)); every draw
+ * with that program whose box is at most 60 % of the width is pressed back to
+ * its 4:3 width around an anchor by the box's centre: the left edge (left
+ * third), the right edge (right third), else the centre - x' = A + (x - A) / k.
+ * Only the ring copy of the vertices is changed, never the title's memory.
+ * nv2a_vk_set_hud_squash(0, 0) or k <= 1: off. */
+static volatile uint32_t s_sq_prog;
+static volatile float    s_sq_k;
+static int   s_sq_on;                   /* this draw: squash attribute 0's x */
+static float s_sq_a, s_sq_kd;           /* this draw's anchor and k */
+
+void nv2a_vk_set_hud_squash(uint32_t program_hash, double k)
+{
+    s_sq_prog = program_hash;
+    /* k < 1 too (option-c, 2026-11-07): a title with its own 16:9 HUD at 16:10 needs it widened back */
+    s_sq_k = (k > 1.001 || (k > 0.25 && k < 0.999)) ? (float)k : 0.0f;
+}
+
+static uint32_t vp_hash(const Nv2aRawBatch *b)
+{
+    uint32_t h = 2166136261u, sl;
+    int w;
+    if (b->xform != 2 || !b->vp_program)
+        return 0;
+    for (sl = b->vp_start; sl < b->vp_slots && sl < 136; sl++) {
+        for (w = 0; w < 4; w++)
+            h = (h ^ b->vp_program[sl][w]) * 16777619u;
+        if (b->vp_program[sl][3] & 1u)
+            break;
+    }
+    return h;
+}
+
+/* attribute 0's position x of vertex v (float data only); 0 if not readable */
+static int pos_x(const Nv2aRawBatch *b, uint32_t v, float *x)
+{
+    if (b->attr_direct & 1u) {
+        if (b->direct[0].type != 2 || b->direct[0].size < 2)
+            return 0;
+        memcpy(x, b->direct[0].ptr + (size_t)v * b->direct[0].stride, 4);
+        return 1;
+    }
+    if (!(b->attr_present & 1u))
+        return 0;
+    *x = b->attrs[((size_t)v * NV2A_RAW_ATTRS) * 4];
+    return 1;
+}
+
+/* 1 when this draw is squashed (anchor / k in s_sq_a / s_sq_kd); s_sq_on is
+ * set by the caller only around this draw's own upload */
+static int squash_decide(const Nv2aRawBatch *b)
+{
+    float k = s_sq_k, x0 = 1e30f, x1 = -1e30f, x;
+    uint32_t v;
+    if (!(k > 0.0f) || !s_sq_prog || !b->vertex_count || vp_hash(b) != s_sq_prog)
+        return 0;
+    for (v = 0; v < b->vertex_count; v++) {
+        if (!pos_x(b, v, &x))
+            return 0;
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+    }
+    if (x0 < -1.0f || x1 > 641.0f || x1 - x0 > 384.0f)
+        return 0;                        /* full-screen passes and the like stay */
+    {
+        /* by the box's centre: the left third -> the left edge (the SPECIAL
+         * bar, 39..199, reaches past 30 %), the right third -> the right edge */
+        float c = 0.5f * (x0 + x1);
+        s_sq_a = c < 640.0f / 3.0f ? 0.0f : c > 1280.0f / 3.0f ? 640.0f : 320.0f;
+    }
+    s_sq_kd = k;
+    return 1;
+}
+
 static int upload_vertices(const Nv2aRawBatch *b)
 {
     VRun run[NV2A_RAW_ATTRS];
@@ -4897,6 +5078,8 @@ static int upload_vertices(const Nv2aRawBatch *b)
     for (i = 0; i < nrun; i++) {
         uintptr_t gva = (uintptr_t)run[i].lo - (uintptr_t)xbox_GetMemoryOffset();
         run[i].buf = VK_NULL_HANDLE;
+        if (s_sq_on && (direct & 1u) && of_run[0] == (int)i)
+            gva = 0;                        /* HUD squash: a ring copy to change */
         if (gva >= VM_BASE && gva < VM_BASE + VM_WINDOW
             && vm_bind((uint32_t)gva, (uint32_t)(run[i].hi - run[i].lo), &run[i].buf, &run[i].boff, 0)) {
             s_vm_st_hit++;
@@ -4920,6 +5103,17 @@ static int upload_vertices(const Nv2aRawBatch *b)
     for (i = 0; i < nrun; i++)
         if (!run[i].buf)
             memcpy(dst + run[i].at, run[i].lo, (size_t)(run[i].hi - run[i].lo));
+    if (s_sq_on && (direct & 1u) && b->direct[0].type == 2) {
+        const VRun *r = &run[of_run[0]];
+        uint8_t *p0 = dst + r->at + (size_t)(b->direct[0].ptr - r->lo);
+        for (v = 0; v < nv; v++) {
+            float x;
+            uint8_t *q = p0 + (size_t)v * b->direct[0].stride;
+            memcpy(&x, q, 4);
+            x = s_sq_a + (x - s_sq_a) / s_sq_kd;
+            memcpy(q, &x, 4);
+        }
+    }
     if (np) {
         float *out = (float *)(dst + pack_at);
         for (v = 0; v < nv; v++)
@@ -4929,6 +5123,8 @@ static int upload_vertices(const Nv2aRawBatch *b)
                     attr_to_float4(b, slot[i], v, o);
                 else
                     memcpy(o, b->attrs + ((size_t)v * NV2A_RAW_ATTRS + slot[i]) * 4, 16);
+                if (s_sq_on && slot[i] == 0)       /* HUD squash, converted position */
+                    o[0] = s_sq_a + (o[0] - s_sq_a) / s_sq_kd;
             }
     }
     memcpy(dst + const_at, b->attr_const, NV2A_RAW_ATTRS * 16);
@@ -5043,6 +5239,8 @@ typedef struct {
     int32_t psprite;             /* point sprite: stage 3 reads gl_PointCoord (gl_psh.c) */
     int32_t mark;                /* RECOMP_VK_DRAW_MARK: solid magenta */
     float fogp[4];               /* nv2a_fog_params */
+    float bumpmat[4][4];         /* BUMPENVMAP (gl_psh.c): m00 m01 m10 m11 per stage */
+    float bumpls[4][4];          /* BUMPENVMAP_LUM: scale, offset */
 } FsBlock;
 
 /* ── Instancing ───────────────────────────────────────────────────────
@@ -5121,6 +5319,7 @@ static void pend_flush(void)
     if (!s_pend.on)
         return;
     s_pend.on = 0;
+    s_sq_on = 0;                                /* a pending batch is never a squashed one */
     if (s_pend.cb_gen != s_cb_gen)
         return;                                 /* cannot happen: flushes go first */
     vkCmdDrawIndexed(s_cb, s_pend.n, s_pend.count, 0, 0, 0);
@@ -5428,10 +5627,41 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     }
     {
         int changed = regs_changed(r);
-        if (!s_draw_mark_frame && pend_append(b, changed))
+        int sq = s_sq_k > 0.0f ? squash_decide(b) : 0;
+        {
+            /* RECOMP_VK_SQUASH_LOG=1 (option-c, 2026-11-07; option-c has no RECOMP_VK_DRAW_LOG): each new
+             * transform-program hash once, with the x / y box of its first draw - which program a title's HUD
+             * uses (nv2a_vk_set_hud_squash). Off by default; at most 64 lines. */
+            static int sl = -1;
+            static uint32_t seen[64], nseen;
+            if (sl < 0) {
+                const char *e = getenv("RECOMP_VK_SQUASH_LOG");
+                sl = e && *e && *e != '0';
+            }
+            if (sl && nseen < 64 && b->vertex_count) {
+                /* fixed-function draws have no program: keyed by transform mode, primitive and vertex count */
+                uint32_t h = vp_hash(b), i, v;
+                uint32_t key = h ? h : (0xF0000000u | (b->xform << 20) | (b->prim << 16) | (b->vertex_count & 0xFFFFu));
+                float x, x0 = 1e30f, x1 = -1e30f;
+                for (i = 0; i < nseen && seen[i] != key; i++) {}
+                if (i == nseen) {
+                    seen[nseen++] = key;
+                    for (v = 0; v < b->vertex_count && pos_x(b, v, &x); v++) {
+                        if (x < x0) x0 = x;
+                        if (x > x1) x1 = x;
+                    }
+                    fprintf(stderr, "[SQUASH] f %u program %08X xform %u prim %u n %u x %.1f..%.1f surf %ux%u\n",
+                            s_frame, h, b->xform, b->prim, b->vertex_count, x0, x1, b->surface.width,
+                            b->surface.height);
+                }
+            }
+        }
+        s_sq_on = 0;
+        if (!s_draw_mark_frame && !sq && pend_append(b, changed))
             return;
+        pend_flush();                            /* the pending batch: never squashed */
+        s_sq_on = sq;                            /* this draw's upload only */
     }
-    pend_flush();
     if (!prim_indices(b, &idx, &n, &topo, &cls) || !n)
         return;
     VT("draw: prim %u idx %u verts %u attrs %04X direct %04X xform %u surf %08X zeta %08X\n", b->prim, n,
@@ -5646,13 +5876,28 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
             fb->psprite = b->prim == 1 && r[0x031C / 4] != 0;
             fb->mark = s_draw_mark;
             nv2a_fog_params(r, b->xform, fb->fogp);
+            for (i = 1; i < 4; i++) {
+                /* SET_TEXTURE_SET_BUMP_ENV_MAT (0x1B28 + stage * 0x40): the words arrive as m00, m01, m11, m10 (xemu
+                 * pgraph.c swizzle); the shader's mat2 wants columns (m00 m01) (m10 m11). SCALE 0x1B38, OFFSET 0x1B3C. */
+                uint32_t bm = (0x1B28u + i * 0x40u) / 4;
+                memcpy(&fb->bumpmat[i][0], &r[bm + 0], 4);
+                memcpy(&fb->bumpmat[i][1], &r[bm + 1], 4);
+                memcpy(&fb->bumpmat[i][2], &r[bm + 3], 4);
+                memcpy(&fb->bumpmat[i][3], &r[bm + 2], 4);
+                memcpy(&fb->bumpls[i][0], &r[(0x1B38u + i * 0x40u) / 4], 4);
+                memcpy(&fb->bumpls[i][1], &r[(0x1B3Cu + i * 0x40u) / 4], 4);
+            }
             ub[1].buffer = s_f->ring;
             ub[1].offset = fat;
             ub[1].range = sizeof(FsBlock);
         }
     }
-    if (!upload_vertices(b))
-        return;
+    {
+        int ok = upload_vertices(b);
+        s_sq_on = 0;                               /* the HUD squash was for this upload only */
+        if (!ok)
+            return;
+    }
     {
         VkDeviceSize iat;
         if (b->vertex_count <= 65536) {
@@ -7386,6 +7631,20 @@ static void vk_flip(void)
         return;
     pend_flush();
     s_frame++;
+    {
+        /* RECOMP_VK_RING_STATS=1: the frame ring's peak use and mid-frame flushes, every 300 flips */
+        static int rs = -1;
+        if (rs < 0) { const char *e = getenv("RECOMP_VK_RING_STATS"); rs = e && *e == '1'; }
+        if (s_f && s_f->ring_off > s_ring_peak)
+            s_ring_peak = s_f->ring_off;
+        if (rs && s_frame % 300 == 0) {
+            fprintf(stderr, "[VK] frame ring: peak %.2f MB of %u MB, %u mid-frame flushes (frames %u-%u)\n",
+                    (double)s_ring_peak / 1048576.0, (unsigned)(RING_BYTES >> 20), s_ring_flushes, s_frame - 299,
+                    s_frame);
+            s_ring_peak = 0;
+            s_ring_flushes = 0;
+        }
+    }
     if (s_inst_alt)
         s_inst_on = s_frame & 1;
     {
@@ -7412,14 +7671,16 @@ static void vk_flip(void)
             if (now - window_ns > 10000000000ull) { window_ns = now; lines = 0; }
             if (dt > 50000000ull && lines++ < 30)
                 snprintf(s_hitch, sizeof s_hitch, "[hitch] frame %u: %.0f ms -- %u programs compiled (%.0f ms),"
-                         " %u textures %.1f MB (%.0f ms), %u draws", s_frame, dt / 1e6,
+                         " %u textures %.1f MB (%.0f ms), %u pipelines (%.0f ms), %u surfaces (%.0f ms), %u draws,"
+                         " screenshot %.0f ms", s_frame, dt / 1e6,
                          s_hz_progs, s_hz_prog_ns / 1e6, s_hz_texs,
-                         s_hz_tex_bytes / 1048576.0, s_hz_tex_ns / 1e6, s_hz_draws);
+                         s_hz_tex_bytes / 1048576.0, s_hz_tex_ns / 1e6, s_hz_pipes, s_hz_pipe_ns / 1e6,
+                         s_hz_surfs, s_hz_surf_ns / 1e6, s_hz_draws, s_hz_shot_ns / 1e6);
         }
         last_ns = now;
         xbox_ft_draws((int)s_hz_draws);
-        s_hz_progs = s_hz_texs = s_hz_draws = 0;
-        s_hz_prog_ns = s_hz_tex_ns = s_hz_tex_bytes = 0;
+        s_hz_progs = s_hz_texs = s_hz_draws = s_hz_pipes = s_hz_surfs = 0;
+        s_hz_prog_ns = s_hz_tex_ns = s_hz_tex_bytes = s_hz_shot_ns = s_hz_pipe_ns = s_hz_surf_ns = 0;
     }
     {
         /* [fps] every 5 s (v0.9.2: diagnostics for testers, e.g. the Steam
@@ -7576,7 +7837,7 @@ static void vk_flip(void)
             if (k < 0.5) k = 0.5;
             if (k > VK_SCALE_MAX) k = VK_SCALE_MAX;
             /* 16:9: 4/3 more columns, except on frames marked 4:3 (menus). */
-            xr = s_opt_wide && xbox_present_wide_mark() != 0 ? 4.0 / 3.0 : 1.0;
+            xr = s_opt_wide && xbox_present_wide_mark() != 0 ? wide_xr() : 1.0;
             sq = 0;                     /* the option's X already holds the 4/3 */
         } else {
             k = pct < 50 ? 0.0 : pct > 500 ? VK_SCALE_MAX : pct / 100.0;
@@ -7607,9 +7868,11 @@ static void vk_flip(void)
         const char *pre = xbox_getenv_utf8("RECOMP_SHOT_PREFIX");
         char path[320];
         snprintf(path, sizeof path, "%s%s.bmp", pre && *pre ? pre : "shot_", s_shot_name);
+        uint64_t t0 = hz_now();
         s_shot_pending = 0;
         dump_surface_as(s, path, 1);            /* native size: stills do not follow the render scale */
-        fprintf(stderr, "[VK] screenshot %s (frame %u)\n", path, s_frame);
+        s_hz_shot_ns += hz_now() - t0;
+        fprintf(stderr, "[VK] screenshot %s (frame %u, %.0f ms)\n", path, s_frame, (hz_now() - t0) / 1e6);
     }
     if (s && s_drew_any && dump_every && s_frame >= dump_from && s_frame <= dump_to
         && ((s_frame % (uint32_t)dump_every) == 0
@@ -7716,7 +7979,7 @@ static void vk_flip(void)
                  * pillarboxed. */
                 if (!s_boot_on                    /* the boot video keeps its own aspect */
                     && (xbox_present_wide() || (xbox_video_widescreen() && stretch_43())) && lw < lh * 1.5f)
-                    lw = lh * 16.0f / 9.0f;
+                    lw = lh * (float)xbox_video_aspect();
                 /* WINDOW CROP: the content rectangle fills the window, the margins fall outside it */
                 if (!s_boot_on && !shader && s_dm_cur == NV2A_VK_DISPLAY_WINDOWED && crop_on()) {
                     cmx = s_crop_mx;
@@ -7839,6 +8102,10 @@ static void vk_flip(void)
         xbox_ft_push(FT_PRESENT);
         pr = vkQueuePresentKHR(s_queue, &pi);
         xbox_ft_pop();
+        {
+            extern void xbox_GuestPresentNote(void);   /* RECOMP_PACING_STATS (FRAME PACING) */
+            xbox_GuestPresentNote();
+        }
         if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
             vkDeviceWaitIdle(s_dev);
             create_swapchain();
@@ -7922,8 +8189,31 @@ static void vk_flip(void)
 #if !defined(__SWITCH__)
     if (s_win) {
         SDL_Event e;
+        /* Mouse cursor auto-hide (THPS 2X maintainer, 2026-11-06; every
+         * port): hidden over the game window, shown while the mouse moves,
+         * hidden again after RECOMP_CURSOR_IDLE_MS (default 2000; 0 = never
+         * hide). SDL hides it only inside its own window. */
+        static int cur_init, cur_shown;
+        static uint64_t cur_idle_ns, cur_moved;
+        uint64_t now_c = hz_now();
+        if (!cur_init) {
+            const char *ev = getenv("RECOMP_CURSOR_IDLE_MS");
+            cur_init = 1;
+            cur_idle_ns = (uint64_t)(ev && *ev ? strtoul(ev, NULL, 10) : 2000ul) * 1000000ull;
+            cur_shown = 1;                         /* hidden below once idle */
+            cur_moved = now_c - cur_idle_ns;
+        }
         while (SDL_PollEvent(&e)) {
             switch (e.type) {
+            case SDL_EVENT_MOUSE_MOTION:
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            case SDL_EVENT_MOUSE_WHEEL:
+                cur_moved = now_c;
+                if (!cur_shown) {
+                    SDL_ShowCursor();
+                    cur_shown = 1;
+                }
+                break;
             case SDL_EVENT_KEY_DOWN:
             case SDL_EVENT_KEY_UP:
                 /* Edges only: auto-repeat would read as a held key anyway. */
@@ -7951,6 +8241,10 @@ static void vk_flip(void)
             default:
                 break;
             }
+        }
+        if (cur_shown && cur_idle_ns && now_c - cur_moved >= cur_idle_ns) {
+            SDL_HideCursor();
+            cur_shown = 0;
         }
         dm_apply();                                /* a DISPLAY MODE change from the port */
     }

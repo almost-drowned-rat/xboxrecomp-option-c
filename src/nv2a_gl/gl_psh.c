@@ -27,6 +27,7 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct {
@@ -281,6 +282,41 @@ static void tex_fetch(Out *o, int t, uint32_t mode, const Nv2aPshKey *k)
         emit(o, "    vec4 T%d = texture(t%d, T%d.%s);\n", t, t, input_stage(k, t),
              mode == 15 ? "ar" : "gb");
         break;
+    case 6:                                          /* BUMPENVMAP */
+    case 7:                                          /* BUMPENVMAP_LUM */
+        /* An earlier stage's texture holds signed offsets (du in blue, dv in green, luminance in red: X8L8V8U8),
+         * turned by the stage's 2x2 bump matrix and added to this stage's coordinates before its lookup; _LUM also
+         * scales the result by the luminance (bump scale / offset). The bytes are signed: they are converted per
+         * texel and only then filtered (bilinear by hand, repeat wrap) - converting after the sampler's filter turns
+         * every +127 / -128 edge into a wrong step, coarse blots instead of running water (Panzer Dragoon Orta's
+         * Pandora's Box background and river; xemu notes the same loss as a FIXME). Behaviour after xemu
+         * (pgraph/glsl/psh.c BUMPENVMAP, the register order in pgraph.c); written here. option-c, 2026-11-08. */
+        if (t == 0) {
+            emit(o, "    vec4 T%d = vec4(0.0);\n", t);
+            break;
+        }
+        {
+            /* RECOMP_PSH_NO_BUMP=1: the old plain 2D lookup - for side-by-side comparisons of the same frame */
+            static int nob = -1;
+            if (nob < 0) { const char *e = getenv("RECOMP_PSH_NO_BUMP"); nob = e && *e == '1'; }
+            if (nob) {
+                emit(o, "    vec4 T%d = texture(t%d, vT%d.xy * u_tscale[%d]);\n", t, t, t, t);
+                break;
+            }
+        }
+        {
+            int s = input_stage(k, t);
+            emit(o, "    vec4 T%d;\n"
+                    "    {\n"
+                    "        vec3 b3 = nv2a_bump_fetch(t%d, vT%d.xy * u_tscale[%d]);\n"
+                    "        vec2 dsdt = mat2(u_bumpmat[%d]) * b3.xy;\n"
+                    "        T%d = texture(t%d, (vT%d.xy + dsdt) * u_tscale[%d]);\n",
+                 t, s, s, s, t, t, t, t, t);
+            if (mode == 7)
+                emit(o, "        T%d *= u_bumpls[%d].x * b3.z + u_bumpls[%d].y;\n", t, t, t);
+            emit(o, "    }\n");
+        }
+        break;
     case 0:                                          /* NONE */
         emit(o, "    vec4 T%d = vec4(0.0);\n", t);
         break;
@@ -301,6 +337,19 @@ static void tex_fetch(Out *o, int t, uint32_t mode, const Nv2aPshKey *k)
             emit(o, "    vec4 T%d = vec4(0.0);\n", t);
         break;
     default: {                                       /* 2D (+ the rest, for now) */
+        if (mode != 1 && mode < 32) {
+            /* bump-map / dot-product modes (6..14, 17, 18) sampled as plain 2D: say so once per mode, so a play
+             * log shows WHERE a title needs them (option-c, 2026-11-08: missing-effects watch) */
+            static uint32_t seen;
+            static const char *const nm[32] = { [6] = "BUMPENVMAP", [7] = "BUMPENVMAP_LUM", [8] = "BRDF",
+                [9] = "DOT_ST", [10] = "DOT_ZW", [11] = "DOT_RFLCT_DIFF", [12] = "DOT_RFLCT_SPEC",
+                [13] = "DOT_STR_3D", [14] = "DOT_STR_CUBE", [17] = "DOT_PRODUCT", [18] = "DOT_RFLCT_SPEC_CONST" };
+            if (!(seen & (1u << mode))) {
+                seen |= 1u << mode;
+                fprintf(stderr, "  [PSH] texture mode %u (%s) on stage %d drawn as plain 2D - first seen\n", mode,
+                        nm[mode] ? nm[mode] : "?", t);
+            }
+        }
         emit(o, "    vec2 tc%d = (abs(vT%d.w) > 1e-8 && %d == 1) ? vT%d.xy / vT%d.w : vT%d.xy;\n",
              t, t, mode == 1 ? 1 : 0, t, t, t);
         emit(o, "    vec4 T%d = texture(t%d, tc%d * u_tscale[%d]);\n", t, t, t, t);
@@ -323,6 +372,27 @@ static void tex_fetch(Out *o, int t, uint32_t mode, const Nv2aPshKey *k)
     "    else f = u_fogp.x + exp2(-d * d * u_fogp.y * u_fogp.y * 32.0) - 1.5;\n" \
     "    if (m >= 3) f = abs(f);\n" \
     "    return clamp(f, 0.0, 1.0);\n" \
+    "}\n"
+
+/* BUMPENVMAP's source (tex_fetch case 6 / 7): a signed byte per channel -> -1..1; the bilinear filter by hand after
+ * the conversion. Returns (du, dv, luminance 0..1). */
+#define NV2A_BUMP_GLSL \
+    "float nv2a_s8(float x) {\n" \
+    "    x = floor(x * 255.0 + 0.5);\n" \
+    "    return x >= 128.0 ? (x - 256.0) / 127.0 : x / 127.0;\n" \
+    "}\n" \
+    "vec3 nv2a_bump_texel(sampler2D s, ivec2 p, ivec2 sz) {\n" \
+    "    vec4 c = texelFetch(s, ((p %% sz) + sz) %% sz, 0);\n" /* %%: this text goes through emit's printf */ \
+    "    return vec3(nv2a_s8(c.b), nv2a_s8(c.g), c.r);\n" \
+    "}\n" \
+    "vec3 nv2a_bump_fetch(sampler2D s, vec2 uv) {\n" \
+    "    ivec2 sz = textureSize(s, 0);\n" \
+    "    vec2 p = uv * vec2(sz) - 0.5;\n" \
+    "    ivec2 i = ivec2(floor(p));\n" \
+    "    vec2 f = p - floor(p);\n" \
+    "    vec3 a = mix(nv2a_bump_texel(s, i, sz), nv2a_bump_texel(s, i + ivec2(1, 0), sz), f.x);\n" \
+    "    vec3 b = mix(nv2a_bump_texel(s, i + ivec2(0, 1), sz), nv2a_bump_texel(s, i + ivec2(1, 1), sz), f.x);\n" \
+    "    return mix(a, b, f.y);\n" \
     "}\n"
 
 void nv2a_fog_params(const uint32_t *regs, uint32_t xform, float out[4])
@@ -388,9 +458,12 @@ int nv2a_gl_psh(const Nv2aPshKey *k, char *buf, size_t cap)
             "    int u_psprite;\n"   /* point sprite (SET_POINT_SMOOTH_ENABLE on a point draw): stage 3 reads the point */
             "    int u_mark;\n"      /* RECOMP_VK_DRAW_MARK: this draw solid magenta (nv2a_vk) */
             "    vec4 u_fogp;\n"
+            "    vec4 u_bumpmat[4];\n"   /* BUMPENVMAP: m00 m01 m10 m11 per stage (column-major mat2) */
+            "    vec4 u_bumpls[4];\n"    /* BUMPENVMAP_LUM: x scale, y offset */
             "};\n"
             "layout(location = 0) out vec4 fragColor;\n"
             NV2A_FOG_GLSL
+            NV2A_BUMP_GLSL
             "void main() {\n"
             "    vT3 = u_psprite != 0 ? vec4(gl_PointCoord, 1.0, 1.0) : vT3in;\n");
     } else
@@ -406,8 +479,10 @@ int nv2a_gl_psh(const Nv2aPshKey *k, char *buf, size_t cap)
         "uniform vec4 u_fogcolor;\n"
         "uniform int u_alpha_func; uniform float u_alpha_ref;\n"
         "uniform vec4 u_fogp;\n"
+        "uniform vec4 u_bumpmat[4]; uniform vec4 u_bumpls[4];\n"
         "out vec4 fragColor;\n"
         NV2A_FOG_GLSL
+        NV2A_BUMP_GLSL
         "void main() {\n");
     for (i = 0; i < 4; i++)
         tex_fetch(&o, (int)i, (k->shader_program >> (5 * i)) & 0x1F, k);

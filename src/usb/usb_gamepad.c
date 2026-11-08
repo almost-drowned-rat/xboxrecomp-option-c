@@ -289,3 +289,45 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     report_trace(pad, out);
     return 20;
 }
+
+/* The pad's output report: the two motors. Its fixed layout is report id 0,
+ * length 6, then the left (low-frequency) and right (high-frequency) motor
+ * speeds as little-endian 16-bit values. XAPI sends it on the interrupt OUT
+ * endpoint 0x02, or as SET_REPORT (21 09) on the control pipe - Burnout 3
+ * does the latter every frame. Both used to be accepted and dropped, so no
+ * title's rumble reached the host pad (Panzer Dragoon Orta worked around it
+ * in its port, 2026-11-05). Forwarded only when the speeds change: a title
+ * resending the same values every frame costs nothing, and the host keeps a
+ * setting until the next one (xbox_InputSetState holds it for 10 s). */
+static uint32_t s_motor[USB_GAMEPAD_MAX];       /* left << 16 | right, as last forwarded */
+static int      s_motor_sent[USB_GAMEPAD_MAX];
+
+void usb_gamepad_output(int pad, const uint8_t *data, int len)
+{
+    XBOX_VIBRATION v;
+    uint32_t both;
+
+    if (pad < 0 || pad >= USB_GAMEPAD_MAX || !data || len < 6 || data[0] != 0 || data[1] < 6)
+        return;
+    v.wLeftMotorSpeed  = (WORD)(data[2] | (data[3] << 8));
+    v.wRightMotorSpeed = (WORD)(data[4] | (data[5] << 8));
+    both = (uint32_t)v.wLeftMotorSpeed << 16 | v.wRightMotorSpeed;
+    if (s_motor_sent[pad] && both == s_motor[pad])
+        return;
+    s_motor[pad] = both;
+    s_motor_sent[pad] = 1;
+    {
+        /* RECOMP_USB_RUMBLE_TRACE=1: one line per change (through the logger thread, like all of xbox_usb). */
+        static int on = -1;
+        DWORD rc = xbox_InputSetState((DWORD)pad, &v);
+        if (on < 0) {
+            const char *e = getenv("RECOMP_USB_RUMBLE_TRACE");
+            on = e && *e && *e != '0';
+        }
+        if (on) {
+            fprintf(stderr, "  [USB] pad %d rumble left %u right %u -> %s\n", pad + 1, (unsigned)v.wLeftMotorSpeed,
+                    (unsigned)v.wRightMotorSpeed, rc == 0 ? "host pad" : "no host pad on that port");
+            fflush(stderr);
+        }
+    }
+}

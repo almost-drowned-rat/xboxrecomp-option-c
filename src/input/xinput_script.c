@@ -147,11 +147,48 @@ typedef struct {
     char shot[32];           /* "shot[=name]": a screenshot, no buttons */
     uint16_t key;            /* "key=<HID usage ID>": a physical key held (through
                                 the keyboard's binding, xinput_bind.h) */
+    unsigned long period;    /* "<at>/<period>-<until>:...": pressed for `hold` every
+                                `period` from `at` up to `until` (0 = a single step) */
+    unsigned long until;
 } PadStep;
+
+/* 1 while step st is held at time ts (its own base) */
+static int step_active(const PadStep *st, unsigned long ts)
+{
+    if (st->period) {
+        if (ts < st->at_ms || ts >= st->until)
+            return 0;
+        return (ts - st->at_ms) % st->period < st->hold_ms;
+    }
+    return ts >= st->at_ms && ts < st->at_ms + st->hold_ms;
+}
 
 static PadStep s_script[PAD_SCRIPT_MAX];
 static int     s_script_len = -1;
 static int     s_has_keys;   /* the script holds key steps */
+
+/* Pause switch (2026-11-08; maintainer: the script must be switchable off so the
+ * player can step into gameplay directly): while paused no script or live step is pressed - the real pad plays alone. Repeating
+ * steps keep their clock, so they go on in phase after "resume"; single steps that fall into the pause are skipped.
+ * Toggled by holding BACK on the real pad of port 1 for PAD_PAUSE_HOLD_MS (only while a script or a live file is
+ * set), or by a live-file line "pause" / "resume" / "toggle". xbox_InputScriptPaused() lets a port's own helper
+ * threads (e.g. a cheat that taps keys) stop too. */
+#define PAD_PAUSE_HOLD_MS 1500
+static volatile int s_paused;
+
+int xbox_InputScriptPaused(void)
+{
+    return s_paused;
+}
+
+static void pad_pause_set(int on, const char *why)
+{
+    if (s_paused == on)
+        return;
+    s_paused = on;
+    fprintf(stderr, "  PAD: script %s (%s)\n", on ? "PAUSED - the real pad plays alone" : "RESUMED", why);
+    fflush(stderr);
+}
 
 static int same_word(const char *a, const char *b, size_t n)
 {
@@ -250,6 +287,21 @@ static void pad_script_parse(const char *text, unsigned long base, const char *d
             p++;
         }
         st.at_ms = (st.base == STEP_MS ? base : 0) + strtoul(p, &end, 0);
+        if (end != p && *end == '/') {
+            /* a repeating step "<at>/<period>-<until>" (2026-11-08: a 10 h autoplay was 180,000 single
+             * steps - over PAD_SCRIPT_MAX and 2.8 MB of text) */
+            const char *q = end + 1;
+            st.period = strtoul(q, &end, 0);
+            if (end != q && *end == '-') {
+                q = end + 1;
+                st.until = (st.base == STEP_MS ? base : 0) + strtoul(q, &end, 0);
+            } else
+                st.until = (unsigned long)-1;
+            if (!st.period) {
+                fprintf(stderr, "  PAD: repeating step with period 0 at \"%.20s\"\n", p);
+                break;
+            }
+        }
         if (end == p || *end != ':') {
             fprintf(stderr, "  PAD: script entry without <ms>: at \"%.20s\"\n", p);
             break;
@@ -325,12 +377,19 @@ static void pad_script_file(const char *path, unsigned long base, int depth)
         fprintf(stderr, "  PAD: cannot open script %s\n", path);
         return;
     }
-    buf = (char *)malloc(65536);
-    if (!buf) {
-        fclose(f);
-        return;
+    {
+        /* the whole file: it was the first 64 KB only, so a long script stopped mid-line - a 10 h autoplay of
+         * Panzer Dragoon Orta ended after 983 s, "script entry without <ms>" (2026-11-08) */
+        long sz;
+        if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) < 0 || fseek(f, 0, SEEK_SET) != 0)
+            sz = 65535;
+        buf = (char *)malloc((size_t)sz + 1);
+        if (!buf) {
+            fclose(f);
+            return;
+        }
+        n = fread(buf, 1, (size_t)sz, f);
     }
-    n = fread(buf, 1, 65535, f);
     fclose(f);
     buf[n] = 0;
     slash = strrchr(path, '/');
@@ -370,9 +429,13 @@ static void pad_script_load(void)
 static void pad_script_compact(unsigned long t)
 {
     int i, n = 0;
-    for (i = 0; i < s_script_len; i++)
-        if (t < s_script[i].at_ms + s_script[i].hold_ms)
-            s_script[n++] = s_script[i];
+    for (i = 0; i < s_script_len; i++) {
+        const PadStep *st = &s_script[i];
+        /* only millisecond steps can be judged by t; repeating ones end at `until` */
+        int done = st->base == STEP_MS && (st->period ? t >= st->until : t >= st->at_ms + st->hold_ms);
+        if (!done)
+            s_script[n++] = *st;
+    }
     s_script_len = n;
 }
 
@@ -428,6 +491,13 @@ static void pad_live_poll(unsigned long t)
                          && pending[2] == '-' ? pending[1] - '1' : 0;
                 unsigned long at = t > next_free[pd] ? t : next_free[pd];
                 pending[npending] = 0;
+                if (same_word(pending, "pause", 6) || same_word(pending, "resume", 7)
+                    || same_word(pending, "toggle", 7)) {
+                    pad_pause_set(pending[0] == 'p' || pending[0] == 'P' ? 1
+                                  : pending[0] == 'r' || pending[0] == 'R' ? 0 : !s_paused, "live file");
+                    npending = 0;
+                    continue;
+                }
                 snprintf(line, sizeof line, "%lu:%s", at, pending);
                 if (s_script_len >= PAD_SCRIPT_MAX - 1)
                     pad_script_compact(t);
@@ -502,12 +572,12 @@ int xbox_InputScriptKeyDown(int scancode)
     unsigned long t;
     int i;
 
-    if (!s_has_keys || s_script_len <= 0 || !s_t0)
+    if (!s_has_keys || s_script_len <= 0 || !s_t0 || s_paused)
         return 0;
     t = (unsigned long)GetTickCount() - s_t0;
     for (i = 0; i < s_script_len; i++) {
         PadStep *st = &s_script[i];
-        if (st->key == scancode && t >= st->at_ms && t < st->at_ms + st->hold_ms) {
+        if (st->key == scancode && step_active(st, t)) {
             if (!st->announced) {
                 st->announced = 1;
                 fprintf(stderr, "  PAD: t=%lu ms step %d (key %u)\n", t, i, (unsigned)st->key);
@@ -539,12 +609,30 @@ static void pad_script_apply(int pad, XBOX_GAMEPAD *g)
     tb[STEP_FRAMES] = (unsigned long)(xbox_InputFrameClock() - f0);
     pad_live_poll(t);
     script_ports_update();
+    /* The pause switch: BACK held on the real pad (g holds only the host pad here, the script is ORed in below) */
+    if (pad == 0 && s_script_len >= 0) {
+        static unsigned long back_since;
+        static int back_done;
+        if (g->wButtons & 0x20) {
+            if (!back_since)
+                back_since = t ? t : 1;
+            else if (!back_done && t - back_since >= PAD_PAUSE_HOLD_MS) {
+                back_done = 1;
+                pad_pause_set(!s_paused, "BACK held");
+            }
+        } else {
+            back_since = 0;
+            back_done = 0;
+        }
+    }
+    if (s_paused)
+        return;
     for (i = 0; i < s_script_len; i++) {
         PadStep *st = &s_script[i];
         unsigned long ts = tb[st->base];
         if (st->pad != pad || st->key)   /* key steps: xbox_InputScriptKeyDown */
             continue;
-        if (ts < st->at_ms || ts >= st->at_ms + st->hold_ms)
+        if (!step_active(st, ts))
             continue;
         if (!st->announced) {
             st->announced = 1;

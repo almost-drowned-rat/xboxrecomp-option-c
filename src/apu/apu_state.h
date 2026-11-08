@@ -282,6 +282,7 @@ struct MCPXAPUState {
     struct {
         McpxApuDebugMonitorPoint point;
         int16_t frame_buf[256][2];
+        int16_t frame_surr[256][4];   /* 5.1 output only (xa2_surround): the GP's FC LFE SL SR; FL FR stay in frame_buf */
         void *stream; /* SDL_AudioStream* - stubbed */
         int queued_bytes_low, queued_bytes_high;
     } monitor;

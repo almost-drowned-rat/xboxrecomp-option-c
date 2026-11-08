@@ -277,6 +277,52 @@ int main(int argc, char **argv)
               "three freed neighbours merge into one 192-byte block", d);
     }
 
+    /* 2b. A freed block at the top of the heap goes back to the bump pointer,
+     * so a request bigger than the block (but within block + top room) fits
+     * there (Orta's end-of-episode-3 cut scene, 2026-11-08). */
+    if (reclaim) {
+        uint32_t lo = xbox_HeapAlloc(64, 16);
+        uint32_t t1 = xbox_HeapAlloc(0x20000, 16);
+        uint32_t t2 = xbox_HeapAlloc(0x20000, 16);
+        uint32_t big;
+
+        (void)lo;
+        xbox_HeapFree(t2);
+        xbox_HeapFree(t1);       /* merges with t2, both back to the bump pointer */
+        big = xbox_HeapAlloc(0x60000, 16);
+        snprintf(d, sizeof d, "got 0x%08X, expected 0x%08X", big, t1);
+        check(t2 == t1 + 0x20000 && big == t1,
+              "a top free block and the room above it serve one larger request", d);
+        xbox_HeapFree(big);
+    }
+
+    /* 2c. Worker stacks are sized as asked (floor 128 KB, 0 = 512 KB), more
+     * than 32 can live at once, and a freed sized stack goes back whole
+     * (Orta's episode 3 -> 4 loader, hang, 2026-11-08). */
+    if (reclaim) {
+        uint32_t tops[40], s64, s0, again;
+        int i, all = 1;
+
+        s64 = xbox_AllocThreadStackSized(64 * 1024);
+        s0  = xbox_AllocThreadStackSized(0);
+        snprintf(d, sizeof d, "64 KB ask -> %u bytes, 0 -> %u bytes",
+                 xbox_HeapBlockSize(s64 + 16 - 128 * 1024), xbox_HeapBlockSize(s0 + 16 - 512 * 1024));
+        check(s64 && s0 && xbox_HeapBlockSize(s64 + 16 - 128 * 1024) == 128 * 1024
+                    && xbox_HeapBlockSize(s0 + 16 - 512 * 1024) == 512 * 1024,
+              "a worker stack takes the size asked, at least 128 KB; 0 keeps 512 KB", d);
+        xbox_FreeThreadStack(s0);
+        xbox_FreeThreadStack(s64);
+        check(xbox_HeapBlockSize(s64 + 16 - 128 * 1024) == 0, "a sized stack is freed whole", NULL);
+        for (i = 0; i < 40; i++)
+            all &= (tops[i] = xbox_AllocThreadStackSized(16 * 1024)) != 0;
+        check(all, "40 workers get a stack at once (the cap was 32)", NULL);
+        for (i = 0; i < 40; i++)
+            xbox_FreeThreadStack(tops[i]);
+        again = xbox_AllocThreadStackSized(16 * 1024);
+        check(again != 0, "the pool is whole again after they end", NULL);
+        xbox_FreeThreadStack(again);
+    }
+
     /* 3. Releasing NtAllocateVirtualMemory memory returns it. */
     if (reclaim) {
         const uint32_t size = 2u * 1024 * 1024;

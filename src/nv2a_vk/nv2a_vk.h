@@ -86,6 +86,15 @@ void nv2a_vk_set_gamma_ramp(const uint8_t r[256], const uint8_t g[256], const ui
  * Any thread. RECOMP_VK_WINDOW_CROP=0|1 overrides it. Real 4:3 / 16:9 through the title comes at the end. */
 void nv2a_vk_set_window_crop(int on);
 
+/* HUD un-stretch (2026-11-07): draws with the transform program whose FNV
+ * hash is program_hash (RECOMP_VK_SQUASH_LOG=1 prints the screen-space ones)
+ * and a box of at most 60 % of the 640 logical width get their width divided
+ * by k around the left edge, the centre or the right edge (THPS 2X: k =
+ * aspect / (4/3); a title with its own 16:9 HUD: k = aspect / (16/9), which is
+ * below 1 at 16:10 - widened back). Any thread; per frame. k == 1 or hash 0:
+ * off. */
+void nv2a_vk_set_hud_squash(uint32_t program_hash, double k);
+
 /* ANTIALIASING (porting_guide.md M6): OFF, FXAA (the present pass, the default
  * -- the picture as before the option), SMAA (iryoku/smaa, three passes at the
  * presented surface's size before it is scaled into the window), MSAA 2X / 4X

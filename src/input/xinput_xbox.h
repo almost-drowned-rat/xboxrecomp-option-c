@@ -112,6 +112,9 @@ unsigned xbox_InputScriptPorts(void);
 /* A "key=<HID usage ID>" step holds that key now (read with the keyboard,
  * so it goes through the keyboard's binding). */
 int xbox_InputScriptKeyDown(int scancode);
+/* 1 while the script is paused (BACK held 1.5 s on the real pad, or "pause" in RECOMP_PAD_LIVE): a port's own
+ * input helpers stop too, the real pad plays alone. */
+int xbox_InputScriptPaused(void);
 
 /* ---- pad recorder (xinput_record.c) ----------------------------------
  * RECOMP_PAD_RECORD=1|<file> [RECOMP_PAD_RECORD_BASE=r|f|ms]: every held state the title reads, as a pad script

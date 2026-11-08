@@ -131,6 +131,44 @@ Findings that shaped the runtime:
 - **ARM64 memory ordering** (before the first ARM64 build): a compiler barrier does not order accesses across
   threads there. Spin-waits and lock-free flags in game code (plain accesses + `RECOMP_BACKEDGE`) need
   acquire/release semantics on ARM64.
-- **AC97 refill needs the EP DSP** - only for digital / 5.1 output, not for stereo, which the VP mix carries.
+- **AC97 refill needs the EP DSP** - only for the console's own digital (AC97) output path, not for stereo, which
+  the VP mix carries, and not for the 5.1 output below, which takes the GP's six speaker feeds directly.
 - **Menu CPU load:** Panzer Dragoon Orta's 2D menus cost slightly more CPU on option-c than the other Orta
   recompilation does in some menu phases (gameplay and movies are clearly lower) - to be investigated.
+
+## 5. Changes since the v0.6.0-beta snapshot (Orta Recompiled v0.9.0)
+
+Defaults are unchanged for a port that sets none of the switches below, except where a line says otherwise.
+
+- **Frame pacing.** On a steady 120 / 180 / 240 Hz display the guest vblank follows the display's own vblank
+  (`src/platform/host_vblank.c`; Windows only, loaded at run time) instead of a 60 Hz timer, so every game frame
+  stays on screen the same number of refreshes. Variable refresh and other rates keep the timer;
+  `RECOMP_FRAME_PACING=timer` forces it. `RECOMP_PACING_STATS=1` logs refreshes per presented frame.
+- **Aspect ratio as a value.** `RECOMP_WIDESCREEN` takes `4:3`, `16:9` (or `1`), `16:10` and `21:9` (= 64:27);
+  `xbox_video_aspect()` returns it. Unset, a title told widescreen by its console settings is shown at 16:9 as
+  before. `nv2a_vk_set_hud_squash` lets a port press its screen-space HUD draws back to 4:3 width around the left
+  edge, centre or right edge (only the renderer's copy of the vertices changes).
+- **5.1 output.** `RECOMP_AUDIO_51=1` sends the APU's six GP speaker feeds to a device with 5.1 speakers (stereo
+  otherwise, as before); the console settings then report Dolby Digital so the title mixes for six speakers.
+  Diagnostics: `RECOMP_APU_SPKSTATS`, `RECOMP_XBOX_AUDIO`.
+- **Rumble and late pads.** The pad's output report reaches the host controller (rumble), and the USB controller
+  thread no longer stops waiting for a pad after a few seconds (a long boot video left the title without input).
+- **Mouse cursor** hidden over the game window after `RECOMP_CURSOR_IDLE_MS` (default 2000, `0` = never).
+- **Frame ring size.** `RECOMP_VK_RING_MB=<8..48>` (default 48, unchanged); `RECOMP_VK_RING_STATS=1` logs peak use.
+- **Texture modes.** `BUMPENVMAP` / `BUMPENVMAP_LUM` (signed offsets converted per texel, then filtered) and the
+  G8B8 format (swizzled 0x28, linear 0x17) are implemented; other bump / dot-product modes are still drawn as plain
+  2D and named once in the log (`[PSH] ... first seen`). `RECOMP_PSH_NO_BUMP=1` restores the plain lookup for
+  comparisons.
+- **Pad scripts** (testing): the whole script file is read (it stopped at 64 KB), repeating steps
+  `<at>/<period>-<until>`, and a pause switch - BACK held 1.5 s on the real pad, or `pause` / `resume` / `toggle`
+  in `RECOMP_PAD_LIVE` - so a player can take over from a running script.
+- **Guest heap.** A freed block at the top of the heap goes back to the free room above it, so one large request
+  no longer fails while a free block and that room together would hold it. The out-of-memory line names live
+  bytes, free bytes, the largest free block and the top room.
+- **Worker thread stacks.** A worker created with `PsCreateSystemThreadEx` gets the stack size it asks for
+  (page-rounded, 128 KB to 512 KB; `0` = 512 KB, as before) instead of a fixed 512 KB, and up to 128 workers can be
+  alive at once (was 32). A title that kept more than 32 loader workers alive hung, because the next worker ran on
+  its caller's thread; at 512 KB each the stacks had also taken 16 MB of a 64 MB title's heap.
+- **Diagnostics.** `[hitch]` lines (long frames) also count driver pipeline builds, render-target images made and
+  named screenshots; `RECOMP_VK_TEXBIND_LOG=1` logs each distinct depth / render-target / linear texture binding
+  once with what it was bound to.

@@ -15,6 +15,9 @@
 #include <string.h>
 #include <stdio.h>
 
+/* 1 while the APU's 5.1 output runs (set by apu_xaudio2.c's xa2_init): XC_AUDIO then reports Dolby Digital */
+volatile int g_xbox_audio_surround;
+
 /* ============================================================================
  * Exported Data Objects
  *
@@ -202,22 +205,39 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
 void (*g_xbox_screenshot_hook)(const char *name) = NULL;
 void (*volatile g_xbox_nv2a_idle_hook)(void) = NULL;
 
-/* Native 16:9 (2026-11-01; maintainer: a title's own 16:9 wins over any patch): when the title is TOLD
- * widescreen - the widescreen bit of the console settings' video word (XC_VIDEO, xbox_settings.h), which also reaches
- * D3D through the AV capability word - it renders 640x480 anamorphic, and the window has to show that at 16:9. So the
- * settings bit turns the back end's 16:9 on as well. RECOMP_WIDESCREEN=1 / 0 still forces it on / off (a title
- * without native 16:9 widened by the port's own projection/HUD work keeps using it). */
+/* The gameplay aspect ratio (THPS 2X maintainer, 2026-11-07: 16:10 and 21:9
+ * next to 4:3 / 16:9; every port): RECOMP_WIDESCREEN 0 / 4:3 = 4:3, 1 or
+ * 16:9, 16:10, 21:9 (= 64:27, the 2560x1080 / 5120x2160 panels; 3440x1440 is
+ * 43:18, under 1 % narrower).
+ * option-c (2026-11-01; maintainer: a title's own 16:9 wins over any
+ * patch): with RECOMP_WIDESCREEN unset, a title TOLD widescreen - the
+ * widescreen bit of the console settings' video word (XC_VIDEO,
+ * xbox_settings.h), which also reaches D3D through the AV capability word -
+ * renders 640x480 anamorphic, and the window shows that at 16:9. A port that
+ * widens such a title further (Panzer Dragoon Orta 16:10 / 21:9) sets
+ * RECOMP_WIDESCREEN to the value as well. */
+double xbox_video_aspect(void)
+{
+    static double a = 0.0;
+    if (a == 0.0) {
+        const char *e = getenv("RECOMP_WIDESCREEN");
+        if (!e || !*e)
+            a = (xbox_settings()->video & XBOX_VIDEO_WIDESCREEN) ? 16.0 / 9.0 : 4.0 / 3.0;
+        else if (!strcmp(e, "0") || !strcmp(e, "4:3"))
+            a = 4.0 / 3.0;
+        else if (!strcmp(e, "16:10"))
+            a = 16.0 / 10.0;
+        else if (!strcmp(e, "21:9"))
+            a = 64.0 / 27.0;
+        else
+            a = 16.0 / 9.0;                       /* "1", "16:9" */
+    }
+    return a;
+}
+
 int xbox_video_widescreen(void)
 {
-    static int ws = -1;
-    if (ws < 0) {
-        const char *e = getenv("RECOMP_WIDESCREEN");
-        if (e && (e[0] == '1' || e[0] == '0'))
-            ws = e[0] == '1';
-        else
-            ws = (xbox_settings()->video & XBOX_VIDEO_WIDESCREEN) != 0;
-    }
-    return ws;
+    return xbox_video_aspect() > 4.0 / 3.0 + 0.01;
 }
 
 /* A title without native 16:9 (aspect-ratio rule, porting_guide.md): only
@@ -274,9 +294,17 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     case XC_AUDIO:
         /* Stereo PCM matches the two-channel host output. 1 means mono;
-         * advertising AC3 requires an encoded-output path. */
+         * advertising AC3 requires an encoded-output path.
+         * RECOMP_XBOX_AUDIO=<hex> (diagnosis, 2026-11-07): another
+         * value, e.g. 10000 = Dolby Digital enabled - a title then mixes its
+         * GP image for six speakers (checked with RECOMP_APU_SPKSTATS). */
+        /* 5.1 output running (apu_xaudio2.c sets g_xbox_audio_surround once the device has six speakers): the
+         * Dolby Digital bit 0x00010000 - the title mixes for six speakers itself (Orta: FC dialogue, SL / SR at
+         * front level). */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 0x00000000;
+            const char *ea = getenv("RECOMP_XBOX_AUDIO");
+            *(PULONG)Value = (ea && *ea) ? (ULONG)strtoul(ea, NULL, 16)
+                                         : g_xbox_audio_surround ? 0x00010000u : 0x00000000u;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
