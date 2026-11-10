@@ -30,6 +30,10 @@
  *      storage MmGetPhysicalAddress handed it out for: contiguous pages inside
  *      the image range through the window, RAM pages below the contiguous
  *      high-water mark as RAM (Burnout 3's noise and silence).
+ *   8. (every mode but ext-vma) A new thread's TIB starts at PASSIVE_LEVEL
+ *      (fs:[0x24] = 0) although it is a copy of the main TIB made while the
+ *      main thread is at DISPATCH_LEVEL (Orta issue #1); its NtTib.Self is
+ *      itself and the KPCR area up to 0x100 (fs:[0x58]) is zero, not TLS data.
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
  *                 above the RAM mirrors gets it, can commit inside it and use
@@ -389,25 +393,62 @@ int main(int argc, char **argv)
         uint32_t lo = g_xbox_image_lo, hi = g_xbox_image_hi;
         uint32_t c = xbox_ContiguousAlloc(0x2000, 4096);
         uint32_t p = (uint32_t)xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)c);   /* owner: contiguous */
-        uint32_t pool = p + 0x1000;     /* the same physical numbers, handed out again as RAM */
+        uint32_t pool = p + 0x1000;     /* a pool VA with the same number as a contiguous page */
         uint32_t unknown = p + 0x3000;  /* never asked about */
+        /* Pool memory gets a number of its own (VA + XBOX_HEAP_PHYS_BIAS) - it no longer has to win the page. */
+        uint32_t pool_phys;
 
-        xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)pool);
+        xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)(c + 0x1000));          /* the block's 2nd page: contiguous */
+        pool_phys = (uint32_t)xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)pool);
         g_apu_ram_ptr = base;
         g_xbox_image_lo = p & ~0xFFFFu; /* the image covers all three */
         g_xbox_image_hi = (p & ~0xFFFFu) + 0x100000u;
         snprintf(d, sizeof d, "contiguous 0x%08X -> +0x%08X", p, (uint32_t)(mcpx_apu_phys(p) - base));
         check(mcpx_apu_phys(p) == base + 0x80000000u + p,
               "APU: a contiguous page inside the image range is read through the window", d);
-        snprintf(d, sizeof d, "pool 0x%08X -> +0x%08X", pool, (uint32_t)(mcpx_apu_phys(pool) - base));
-        check(mcpx_apu_phys(pool) == base + pool,
-              "APU: a page MmGetPhysicalAddress called RAM is read as RAM", d);
+        snprintf(d, sizeof d, "pool 0x%08X (phys 0x%08X) -> +0x%08X", pool, pool_phys,
+                 (uint32_t)(mcpx_apu_phys(pool_phys) - base));
+        check(mcpx_apu_phys(pool_phys) == base + pool,
+              "APU: a pool buffer's MmGetPhysicalAddress number is read as that pool memory", d);
+        snprintf(d, sizeof d, "contiguous 0x%08X -> +0x%08X", p + 0x1000, (uint32_t)(mcpx_apu_phys(p + 0x1000) - base));
+        check(mcpx_apu_phys(p + 0x1000) == base + 0x80000000u + p + 0x1000,
+              "APU: the contiguous page with the pool VA's number stays the window's", d);
         snprintf(d, sizeof d, "unknown 0x%08X -> +0x%08X", unknown, (uint32_t)(mcpx_apu_phys(unknown) - base));
         check(mcpx_apu_phys(unknown) == base + unknown,
               "APU: a page nobody asked about inside the image stays the image", d);
         g_apu_ram_ptr = saved;
         g_xbox_image_lo = lo;
         g_xbox_image_hi = hi;
+    }
+
+    /* 8. A new thread's TIB starts at PASSIVE_LEVEL (fs:[0x24] = 0) even when the main thread is raised as it is
+     *    made (Orta issue #1: the copy of the main TIB carried its IRQL byte 2 into loader workers - the XDK CRT
+     *    bug-checked 0xA as they ended, and DirectSound skipped its lock). The rest of the copy is kept. */
+    if (!ext) {
+        uint32_t tmpl = xbox_HeapAlloc(64, 16), tib;
+        uint8_t *main_irql = (uint8_t *)G(XBOX_TIB_MAIN + 0x24);
+        uint8_t saved = *main_irql;
+        uint32_t saved_08 = *G(XBOX_TIB_MAIN + 0x08);
+
+        memset(G(tmpl), 0x5A, 64);
+        xbox_TestSetTlsTemplate(tmpl, 32);
+        *main_irql = 2;                            /* the main thread at DISPATCH_LEVEL */
+        *G(XBOX_TIB_MAIN + 0x08) = 0x00ABCDEFu;     /* a field the copy must keep (stack limit) */
+        tib = xbox_AllocThreadTib();
+        snprintf(d, sizeof d, "tib 0x%08X, fs:[0x24] = %u", tib, tib ? *(uint8_t *)G(tib + 0x24) : 0xFFu);
+        check(tib && *(uint8_t *)G(tib + 0x24) == 0,
+              "a thread made while main is at DISPATCH starts at PASSIVE", d);
+        check(tib && *G(tib + 0x08) == 0x00ABCDEFu && *G(tib) == 0xFFFFFFFFu,
+              "the rest of the main TIB is inherited, own SEH chain", NULL);
+        snprintf(d, sizeof d, "self 0x%08X, fs:[0x58] 0x%08X", tib ? *G(tib + 0x18) : 0, tib ? *G(tib + 0x58) : 0);
+        check(tib && *G(tib + 0x18) == tib, "NtTib.Self (fs:[0x18]) is the new TIB", d);
+        check(tib && *G(tib + 0x58) == 0 && *G(tib + 0xFC) == 0,
+              "the KPCR area past 0x40 is zero, not TLS data (fs:[0x58] DpcRoutineActive)", d);
+        check(tib && *G(*G(tib + 0x04) - 28) == 0x5A5A5A5Au && *G(tib + 0x04) - 32 >= tib + 0x100,
+              "fs:[4] still points just past this thread's TLS copy, behind the KPCR area", NULL);
+        *main_irql = saved;
+        *G(XBOX_TIB_MAIN + 0x08) = saved_08;
+        xbox_TestSetTlsTemplate(0, 0);
     }
 
     /* 4. Above the RAM mirrors: [0x74000000, 0x7FFE0000) at 64 MB. */

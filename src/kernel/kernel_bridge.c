@@ -509,6 +509,7 @@ struct bridge_thread_start {
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
 static HANDLE bridge_resolve_handle(uint32_t token);
+static void bridge_note_thread_token(uint32_t token, uint32_t ctx1, uint32_t ctx2, int spawn);
 
 /* Guest thread objects (2026-11-01).
  *
@@ -1006,6 +1007,8 @@ static void bridge_PsCreateSystemThreadEx(X86Ctx *ctx)
                     if (xbox_handle_ptr && th) {
                         bridge_write_handle(xbox_handle_ptr, th);
                         thread_obj_register(obj, BRIDGE_MEM32(xbox_handle_ptr), th);
+                        bridge_note_thread_token(BRIDGE_MEM32(xbox_handle_ptr), start_context1,
+                                                 start_context2, g_thread_call_count);
                     }
                 }
             }
@@ -1190,8 +1193,12 @@ static void bridge_MmFreeContiguousMemory(X86Ctx *ctx)
     uint32_t addr = STACK_ARG(0);
     /* Contiguous blocks come from their own arena, not the heap: passing
      * them to xbox_HeapFree found nothing, so none ever came back. */
-    if (!xbox_ContiguousFree(addr))
+    int contig = xbox_ContiguousFree(addr);
+    if (!contig)
         xbox_HeapFree(addr);
+    if (xbox_PhysDiag())
+        fprintf(stderr, "[PHYS] MmFreeContiguousMemory 0x%08X (%s)\n", addr,
+                contig ? "contiguous block" : "not contiguous - heap free");
     g_eax = 0;
 }
 
@@ -2265,11 +2272,38 @@ static void bridge_KeDelayExecutionThread(X86Ctx *ctx)
  * carried on into whatever the bug check was there to prevent, so the real
  * failure surfaced later somewhere unrelated. Report the code and stop
  * pretending the call succeeded.
+ *
+ * Who asked, in one more line (Orta issue #1: 0xA = IRQL_NOT_LESS_OR_EQUAL from the XDK CRT, which reads
+ * fs:[0x24] itself): the guest call site, the next stack dwords (the caller's caller of a frameless check), the
+ * thread (host id, its spawned-thread entry, its register set, its TIB), the IRQL byte the guest read beside the IRQL the
+ * kernel keeps for that thread, and whether a host ISR/DPC delivery runs on this thread (with the routine). Rare,
+ * so always on.
  */
+static void bugcheck_who(X86Ctx *ctx, int nargs)
+{
+    extern uint32_t xbox_GateOwnerWhat(void);
+    uint32_t sp = g_esp + (uint32_t)nargs * 4;      /* past the arguments */
+    int irql = -1, gate = 0;
+    unsigned fs_irql = g_fs_base ? (unsigned)*(volatile uint8_t *)XBOX_TO_NATIVE(g_fs_base + 0x24) : 0xFFu;
+
+    xbox_IrqlThreadState(&irql, &gate);
+    fprintf(stderr, "  [KERNEL]     bug check from guest 0x%08X, stack above %08X %08X %08X %08X; tid %lu %s "
+            "thread entry %d ctx %p fs 0x%08X; fs:[0x24] = %u, kernel IRQL %d%s; %s",
+            g_xbox_kernel_caller, BRIDGE_MEM32(sp), BRIDGE_MEM32(sp + 4), BRIDGE_MEM32(sp + 8),
+            BRIDGE_MEM32(sp + 12), (unsigned long)GetCurrentThreadId(),
+            g_is_spawned_thread ? "worker" : "main/host", g_thread_obj, (void *)ctx, g_fs_base, fs_irql, irql,
+            (int)fs_irql != irql ? " (DIFFER)" : "",
+            gate ? "inside a host ISR/DPC delivery" : "not in an ISR/DPC delivery");
+    if (gate)
+        fprintf(stderr, " (routine 0x%08X)", xbox_GateOwnerWhat());
+    fputc('\n', stderr);
+}
+
 static void bridge_KeBugCheck(X86Ctx *ctx)
 {
     fprintf(stderr, "  [KERNEL] *** KeBugCheck: code=0x%08X ***\n",
             STACK_ARG(0));
+    bugcheck_who(ctx, 1);
     fflush(stderr);
     g_eax = 0;
 }
@@ -2280,6 +2314,7 @@ static void bridge_KeBugCheckEx(X86Ctx *ctx)
             "(0x%08X, 0x%08X, 0x%08X, 0x%08X) ***\n",
             STACK_ARG(0), STACK_ARG(1), STACK_ARG(2),
             STACK_ARG(3), STACK_ARG(4));
+    bugcheck_who(ctx, 5);
     fflush(stderr);
     g_eax = 0;
 }
@@ -3603,7 +3638,13 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
 #define BRIDGE_HANDLE_TAG  0x48000000u
 #define BRIDGE_HANDLE_MASK 0x00FFFFFFu
 #define BRIDGE_HANDLE_MAX  16384
-static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
+/* Every guest thread creates and closes handles, on host threads of their own and at the same time, so a slot
+ * changes hands only by compare-and-swap; a read is one aligned pointer load. Panzer Dragoon Orta, stage 7
+ * (issue #1): the stream threads created their events while the main thread
+ * created a worker pool's, both scans found slot 0xEF free and both stored into it. One stream event and the
+ * pool's quit event shared token 0x480000EF; the stream closed its event, the slot went empty, the main thread's
+ * NtSetEvent(quit) found nothing, and it waited for ever for a worker that never woke up. */
+static HANDLE volatile s_handle_table[BRIDGE_HANDLE_MAX];
 /* A slot whose host handle was closed behind the table's back: resolves to nothing, but stays taken until the
  * title closes its token (NtClose) - so that token is never handed to a new object (see bridge_handle_token). */
 static char s_handle_stale_marker;
@@ -3612,6 +3653,23 @@ static HANDLE bridge_slot(uint32_t i)
 {
     HANDLE h = (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
     return h == BRIDGE_HANDLE_STALE ? NULL : h;
+}
+
+/* Swap slot i from `from` to `to`; true if it held `from`. */
+static int bridge_slot_swap(uint32_t i, HANDLE from, HANDLE to)
+{
+    return InterlockedCompareExchangePointer((PVOID volatile *)&s_handle_table[i], to, from) == from;
+}
+
+/* Empty slot i and return what it held (BRIDGE_HANDLE_STALE included). Two threads closing the same token get
+ * the handle once: the other one sees the slot already empty. */
+static HANDLE bridge_slot_clear(uint32_t i)
+{
+    for (;;) {
+        HANDLE h = s_handle_table[i];
+        if (!h || bridge_slot_swap(i, h, NULL))
+            return h;
+    }
 }
 
 /* A token for a host handle the caller has just been handed (every caller creates, opens or duplicates one).
@@ -3623,22 +3681,27 @@ static HANDLE bridge_slot(uint32_t i)
  * before it (0x48000012, host 0x5B8; 2026-11-01), and its CRT polled that token as the thread for ever.
  * Now the stale entry is marked dead - it resolves to nothing and keeps its slot until the title closes it, so the
  * token is not handed out again meanwhile - and the new handle gets a slot of its own. */
+static volatile LONG s_handle_claim_races;
 static uint32_t bridge_handle_token(HANDLE h)
 {
     int i;
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == h) {
-            static int logged;
-            if (logged++ < 8)
+        if (s_handle_table[i] == h && bridge_slot_swap((uint32_t)i, h, BRIDGE_HANDLE_STALE)) {
+            static volatile LONG logged;
+            if (InterlockedIncrement(&logged) <= 8)
                 fprintf(stderr, "  [BRIDGE] host handle %p reused while token 0x%08X still held it: "
                         "marked that token dead\n", h, BRIDGE_HANDLE_TAG | (uint32_t)i);
-            s_handle_table[i] = BRIDGE_HANDLE_STALE;
         }
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
         if (s_handle_table[i] == NULL) {
-            s_handle_table[i] = h;
-            return BRIDGE_HANDLE_TAG | (uint32_t)i;
+            if (bridge_slot_swap((uint32_t)i, NULL, h))
+                return BRIDGE_HANDLE_TAG | (uint32_t)i;
+            /* Another thread took this slot between the look and the swap: it keeps it, this handle goes on to
+             * the next free one (the shared token of issue #1 stage 7). */
+            if (InterlockedIncrement(&s_handle_claim_races) <= 8)
+                fprintf(stderr, "  [BRIDGE] two threads reached handle slot 0x%08X at once: "
+                        "the later one takes the next free slot\n", BRIDGE_HANDLE_TAG | (uint32_t)i);
         }
     fprintf(stderr, "  [BRIDGE] handle table full\n");
     return 0;
@@ -3707,12 +3770,38 @@ static HANDLE bridge_take_handle(uint32_t token)
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         if (i > 0 && i < BRIDGE_HANDLE_MAX) {
-            HANDLE h = bridge_slot(i);            /* a dead slot: freed, nothing to close */
-            s_handle_table[i] = NULL;
-            return h;
+            HANDLE h = bridge_slot_clear(i);
+            return h == BRIDGE_HANDLE_STALE ? NULL : h;   /* a dead slot: freed, nothing to close */
         }
     }
     return NULL;   /* untagged -> not a table handle, do not close */
+}
+
+/* Which thread a slot last held, for the NtResumeThread diagnostic: PsCreateSystemThreadEx's start contexts and
+ * spawn number. Kept when the token closes, so a failure on a closed token still names the thread. */
+static struct { uint32_t ctx1, ctx2; int spawn; } s_slot_thread[BRIDGE_HANDLE_MAX];
+static void bridge_note_thread_token(uint32_t token, uint32_t ctx1, uint32_t ctx2, int spawn)
+{
+    uint32_t i = token & BRIDGE_HANDLE_MASK;
+    if ((token & 0xFF000000u) != BRIDGE_HANDLE_TAG || !i || i >= BRIDGE_HANDLE_MAX)
+        return;
+    s_slot_thread[i].ctx1 = ctx1;
+    s_slot_thread[i].ctx2 = ctx2;
+    s_slot_thread[i].spawn = spawn;
+}
+
+/* A token's slot in words: what NtResumeThread found behind it. */
+static const char *bridge_token_state(uint32_t token)
+{
+    uint32_t i = token & BRIDGE_HANDLE_MASK;
+    HANDLE h;
+    if ((token & 0xFF000000u) != BRIDGE_HANDLE_TAG)
+        return token ? "untagged value, not a table token" : "NULL handle";
+    if (!i || i >= BRIDGE_HANDLE_MAX)
+        return "slot out of range";
+    h = s_handle_table[i];
+    return !h ? "slot empty (token closed)" : h == BRIDGE_HANDLE_STALE ? "slot dead (host handle closed behind it)"
+                                                                       : "slot live";
 }
 
 /* Build a native OBJECT_ATTRIBUTES wrapping the translated Xbox path. */
@@ -5104,8 +5193,26 @@ static void bridge_KeCancelTimer(X86Ctx *ctx)
 }
 
 /* ── KeDisconnectInterrupt (ordinal 100, 1 arg) */
+/* It takes the interrupt object out of the table the device models deliver from (g_connected_isr, see
+ * KeConnectInterrupt). It used to leave it there: after a title released its DirectSound object, the APU went on
+ * calling that object's service routine with the freed object as its context until a new one was connected - Orta
+ * makes a new DirectSound object at every stage load (issue #1 (b), stage 6). */
 static void bridge_KeDisconnectInterrupt(X86Ctx *ctx)
 {
+    uint32_t interrupt_va = STACK_ARG(0);
+
+    if (interrupt_va) {
+        uint32_t vector = BRIDGE_MEM32(interrupt_va + 8);
+        if (vector < XBOX_MAX_VECTORS && g_connected_isr[vector] == interrupt_va) {
+            g_connected_isr[vector] = 0;
+            fprintf(stderr, "  [KERNEL] KeDisconnectInterrupt: vector %u (routine 0x%08X context 0x%08X)\n",
+                    vector, BRIDGE_MEM32(interrupt_va + 0), BRIDGE_MEM32(interrupt_va + 4));
+        } else {
+            fprintf(stderr, "  [KERNEL] KeDisconnectInterrupt: 0x%08X (vector %u) was not the connected one\n",
+                    interrupt_va, vector);
+        }
+        fflush(stderr);
+    }
     g_eax = (uint32_t)xbox_KeDisconnectInterrupt(
         (PXBOX_KINTERRUPT)XBOX_TO_NATIVE(STACK_ARG(0)));
 }
@@ -5249,9 +5356,26 @@ static void bridge_NtSuspendThread(X86Ctx *ctx)
 /* ── NtResumeThread (ordinal 224, 2 args) */
 static void bridge_NtResumeThread(X86Ctx *ctx)
 {
-    g_eax = (uint32_t)xbox_NtResumeThread(
-        bridge_resolve_handle(STACK_ARG(0)),
-        (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
+    uint32_t token = STACK_ARG(0);
+    HANDLE h = bridge_resolve_handle(token);
+    g_eax = (uint32_t)xbox_NtResumeThread(h, (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
+    /* Rare (once a run in Orta's stages 6-7, kernel log "ResumeThread failed (error 6)"): say which handle it was,
+     * what its slot holds, which thread had it and who asked. The XAPI wrapper (ResumeThread) keeps a frame, so
+     * [ebp+4] is its caller. */
+    if ((int32_t)g_eax < 0) {
+        static volatile LONG logged;
+        if (InterlockedIncrement(&logged) <= 16) {
+            uint32_t i = token & BRIDGE_HANDLE_MASK, ebp = g_ebp;
+            int known = (token & 0xFF000000u) == BRIDGE_HANDLE_TAG && i && i < BRIDGE_HANDLE_MAX
+                        && s_slot_thread[i].spawn;
+            fprintf(stderr, "  [KERNEL] NtResumeThread(0x%08X) failed: %s (host %p); slot's last thread: "
+                    "spawn #%d ctx1 0x%08X ctx2 0x%08X%s; guest return 0x%08X, its caller 0x%08X\n",
+                    token, bridge_token_state(token), h,
+                    known ? s_slot_thread[i].spawn : 0, known ? s_slot_thread[i].ctx1 : 0,
+                    known ? s_slot_thread[i].ctx2 : 0, known ? "" : " (none recorded)",
+                    g_xbox_kernel_caller, bridge_va_mapped(ebp, 8) ? BRIDGE_MEM32(ebp + 4) : 0);
+        }
+    }
 }
 
 /* ── ObfDereferenceObject (ordinal 250, fastcall: object in ecx)
@@ -6145,7 +6269,7 @@ static void bridge_NtDuplicateObject(X86Ctx *ctx)
         if ((t & 0xFF000000u) == BRIDGE_HANDLE_TAG && (t & BRIDGE_HANDLE_MASK) > 0
                 && (t & BRIDGE_HANDLE_MASK) < BRIDGE_HANDLE_MAX
                 && BRIDGE_MEM32(target_va) != t)
-            s_handle_table[t & BRIDGE_HANDLE_MASK] = NULL;   /* the host closed it */
+            bridge_slot_clear(t & BRIDGE_HANDLE_MASK);   /* the host closed it */
     }
     g_eax = 0;
 }

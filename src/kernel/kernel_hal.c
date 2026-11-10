@@ -344,6 +344,15 @@ void xbox_GateLeave(void)
     }
 }
 
+/* For a report about the calling thread (KeBugCheck): its own IRQL as the kernel keeps it - fs:[0x24] is what the
+ * guest read, and the two disagree when something wrote that byte behind irql_publish's back - and whether this
+ * thread is a host ISR/DPC deliverer right now (the gate depth it holds; 0 = an ordinary guest thread). */
+void xbox_IrqlThreadState(int *irql, int *gate_depth)
+{
+    *irql = (int)g_current_irql;
+    *gate_depth = t_gate_owner;
+}
+
 /* The guest routine (ISR/DPC) the gate holder runs now, named in the warnings. */
 void xbox_GateNote(uint32_t routine)
 {

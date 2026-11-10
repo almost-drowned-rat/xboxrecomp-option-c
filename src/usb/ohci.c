@@ -511,6 +511,11 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * again, forever. */
 static uint32_t bus_resolve(uint32_t addr)
 {
+    /* A number the kernel gave out for heap / pool / image memory (XBOX_HEAP_PHYS_BIAS, kernel_memory.c): that VA,
+     * no guessing - THPS 2X's pool report buffer and Burnout 3's .data buffer both come through MmGetPhysicalAddress. */
+    uint32_t heap_va;
+    if (xbox_PhysHeapVA(addr, &heap_va))
+        return heap_va;
     /* Whatever the kernel's owner table says this page is, it is - FIRST, before the image rule below: pool memory
      * (THPS 2X's report buffer at 0x01C0F52A) below the contiguous high-water mark is still RAM, and contiguous
      * memory is the window even where its physical numbers fall inside the image span. This runtime's contiguous

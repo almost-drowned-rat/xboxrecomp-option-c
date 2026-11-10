@@ -121,18 +121,21 @@ static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     return *(uint8_t *)mcpx_apu_phys(addr);
 }
 
+/* The same for a write: with RECOMP_APU_DIAG, the first write into each page per route is logged (apu_core.c). */
+uint8_t *mcpx_apu_phys_w(uint64_t addr);
+
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
     (void)as;
-    *(uint32_t *)mcpx_apu_phys(addr) = val;
+    *(uint32_t *)mcpx_apu_phys_w(addr) = val;
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
     (void)as;
-    *(uint16_t *)mcpx_apu_phys(addr) = val;
+    *(uint16_t *)mcpx_apu_phys_w(addr) = val;
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
     (void)as;
-    *(uint8_t *)mcpx_apu_phys(addr) = val;
+    *(uint8_t *)mcpx_apu_phys_w(addr) = val;
 }
 
 /* Stub address space - just passed to ldl_le_phys etc. (ignored) */

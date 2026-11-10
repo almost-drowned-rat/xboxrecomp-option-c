@@ -734,6 +734,7 @@ uint32_t xbox_AllocThreadStackSized(uint32_t want);
 /* A TIB and TLS block for a newly spawned guest thread, copied from the
  * template the loader built. Returns the new TIB's Xbox VA, or 0. */
 uint32_t xbox_AllocThreadTib(void);
+void xbox_TestSetTlsTemplate(uint32_t template_va, uint32_t total);   /* tests only: a TLS template without an XBE TLS directory */
 
 /**
  * Return a worker's stack when the worker ends. Takes the value

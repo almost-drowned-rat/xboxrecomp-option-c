@@ -764,6 +764,14 @@ void xbox_PhysNoteOwner(uint32_t phys, int owner);
  * page some MmGetPhysicalAddress already answered keeps that answer. */
 void xbox_PhysNoteRange(uint32_t phys, uint32_t size, int owner);
 int  xbox_PhysOwner(uint32_t phys);
+/* RECOMP_PHYS_DIAG=1 or RECOMP_APU_DIAG=1: "[PHYS]" lines (kernel_memory.c). */
+int  xbox_PhysDiag(void);
+/* MmGetPhysicalAddress of a non-contiguous VA v answers v + XBOX_HEAP_PHYS_BIAS (kernel_memory.c), so a physical
+ * number never means two bytes; RECOMP_PHYS_BIAS=0 turns it off. xbox_PhysHeapVA: 1 and the VA when phys is such a
+ * number - every bus master (APU, OHCI, NV2A) asks it first. */
+#define XBOX_HEAP_PHYS_BIAS 0x10000000u
+int  xbox_PhysBias(void);
+int  xbox_PhysHeapVA(uint32_t phys, uint32_t *va);
 
 VOID    __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist);
 ULONG   __stdcall xbox_MmQueryAddressProtect(PVOID VirtualAddress);
@@ -952,6 +960,7 @@ uint32_t xbox_GateOwnerWhat(void);
  * A depth that is non-zero while this stops moving is stuck, not busy. */
 int     xbox_IrqlTransitions(void);
 void    xbox_IrqlDumpHolders(void);
+void    xbox_IrqlThreadState(int *irql, int *gate_depth);   /* this thread: kernel IRQL, host ISR/DPC gate depth */
 VOID    __fastcall xbox_KfLowerIrql(X86Ctx *ctx, KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(X86Ctx *ctx);
 

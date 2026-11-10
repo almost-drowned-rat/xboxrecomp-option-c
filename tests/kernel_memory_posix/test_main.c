@@ -200,7 +200,9 @@ int main(void)
             { 0x80001000u, 0x00001000u, "inside the contiguous window" },
             { 0x83FFFFFFu, 0x03FFFFFFu, "last byte of the window" },
             { 0x84000000u, 0x84000000u, "just past the window is unchanged" },
-            { 0x00040000u, 0x00040000u, "an ordinary guest VA is unchanged" },
+            /* Heap / image / stack VAs get a number of their own above every contiguous one (XBOX_HEAP_PHYS_BIAS,
+             * Orta issue #1 stage 6): the same number for both used to send bus masters to the wrong copy. */
+            { 0x00040000u, 0x10040000u, "an ordinary guest VA gets VA + 256 MB" },
         };
         for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
             ULONG_PTR got =

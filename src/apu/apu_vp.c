@@ -131,6 +131,9 @@ static volatile int s_idle_pending;
 
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    if (mcpx_apu_diag())
+        fprintf(stderr, "[APUDIAG] voice %u goes off (state %08X)\n", v,
+                voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFFu));
     s_idle_pending = 1;
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
@@ -184,13 +187,68 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
  * Front-End method dispatch
  * ============================================================ */
 
+/* FEDECMETH / FEDECPARAM: the method the front end decoded - and, while it is trapped, the trapped one, which
+ * DirectSound's service routine reads to learn which voice went idle (SE2FE_IDLE_VOICE, argument = the voice).
+ *
+ * On the hardware the front end decodes nothing while it is trapped: the title's PIO methods wait in the FIFO until
+ * the service routine resumes it, so the two registers hold the trap until then. Here fe_method runs at once on the
+ * title's thread (mcpx_apu_vp_write, no d->lock) and wrote both registers for every method, while the frame thread
+ * wrote them for the trap: a title stopping voices (Orta's pause SAVE & QUIT, issue #1) overwrote the trapped pair
+ * before the deferred service routine read it. Half of it mixed - METH 0x8000 from the trap, PARAM from a title's
+ * method (0 there) - made the routine handle "voice 0 went idle" and read voice 0's empty DirectSound slot
+ * ([0+0x64] in Orta 0x002C2F33, the reporter's crash); the other half lost the trap (no idle report, the voice
+ * never acknowledged). Now the pair is written under one small lock with the trap state: a title's method updates
+ * it only while the front end is not trapped, the trap only when it is not trapped already (vp_frame met several
+ * idle voices in one walk and each overwrote the last; the next idle scan reports the others). Diagnostic line
+ * "[APU] trap kept" the first times a title's method arrives while trapped. */
+static volatile LONG s_fedec_lock;
+
+static void fedec_lock(void)
+{
+    while (InterlockedCompareExchange(&s_fedec_lock, 1, 0) != 0)
+        SwitchToThread();               /* held for a few register writes; give way if its holder was preempted */
+}
+
+static void fedec_unlock(void)
+{
+    InterlockedExchange(&s_fedec_lock, 0);
+}
+
+static int fe_trapped(MCPXAPUState *d)
+{
+    return (qatomic_read(&d->regs[NV_PAPU_FECTL]) & NV_PAPU_FECTL_FEMETHMODE) == NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
+}
+
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
     unsigned int slot;
 
-    d->regs[NV_PAPU_FEDECMETH] = method;
-    d->regs[NV_PAPU_FEDECPARAM] = argument;
+    if (method != SE2FE_IDLE_VOICE) {
+        int kept;
+        fedec_lock();
+        kept = fe_trapped(d);
+        if (!kept) {
+            d->regs[NV_PAPU_FEDECMETH] = method;
+            d->regs[NV_PAPU_FEDECPARAM] = argument;
+        }
+        fedec_unlock();
+        if (kept) {
+            static volatile LONG n;
+            LONG k = InterlockedIncrement(&n);
+            if (k <= 8 || !(k & (k - 1)))
+                fprintf(stderr, "[APU] trap kept: title method 0x%04X (0x%08X) while the front end is trapped on "
+                                "0x%04X (0x%08X) - %ld times\n", method, argument,
+                        d->regs[NV_PAPU_FEDECMETH], d->regs[NV_PAPU_FEDECPARAM], (long)k);
+        }
+    }
     unsigned int selected_handle, list;
+
+    if (mcpx_apu_diag() && (method == NV1BA0_PIO_VOICE_ON || method == NV1BA0_PIO_VOICE_OFF
+                            || method == NV1BA0_PIO_VOICE_RELEASE))
+        fprintf(stderr, "[APUDIAG] title %s %u (arg %08X, FEAV %08X, FECTL %08X)\n",
+                method == NV1BA0_PIO_VOICE_ON ? "VOICE_ON" : method == NV1BA0_PIO_VOICE_OFF ? "VOICE_OFF"
+                : "VOICE_RELEASE", argument & 0xFFFFu, argument, d->regs[NV_PAPU_FEAV],
+                qatomic_read(&d->regs[NV_PAPU_FECTL]));
 
     switch (method) {
     case NV1BA0_PIO_VOICE_LOCK:
@@ -499,11 +557,23 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
              * write steps lost a guest write that landed between them and
              * let the guest read a half-set mode. */
             uint32_t fectl, trapped;
+            fedec_lock();
+            if (fe_trapped(d)) {            /* one trap at a time; this voice is found again (see fe_method) */
+                fedec_unlock();
+                s_idle_pending = 1;
+                break;
+            }
+            d->regs[NV_PAPU_FEDECMETH] = method;
+            d->regs[NV_PAPU_FEDECPARAM] = argument;
             do {
                 fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
                 trapped = (fectl & ~(NV_PAPU_FECTL_FEMETHMODE | NV_PAPU_FECTL_FETRAPREASON))
                           | NV_PAPU_FECTL_FEMETHMODE_TRAPPED | NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
             } while (qatomic_cmpxchg32(&d->regs[NV_PAPU_FECTL], fectl, trapped) != fectl);
+            fedec_unlock();
+            if (mcpx_apu_diag())
+                fprintf(stderr, "[APUDIAG] trap on idle voice %u (FECTL %08X -> %08X, ISTS %08X)\n", argument,
+                        fectl, trapped, qatomic_read(&d->regs[NV_PAPU_ISTS]));
             /* The trap interrupt is latched here, once per trap, like every
              * other status bit: the ISTS write clears it (update_irq no longer
              * derives it from FECTL - see there). */
@@ -1291,9 +1361,78 @@ static void voice_process(MCPXAPUState *d,
  * voice is already silent, so the audio is the same. Returns 1 when it
  * trapped, 0 when nothing went off or no listed voice is idle, -1 when the
  * front end is already trapped (tried again on the next call). */
+/* Idle voices waiting for their trap, in the order the VP met them (one trap at a time, see fe_method).
+ *
+ * The hardware VP walks on after an idle voice and posts SE2FE_IDLE_VOICE for each one it meets; the front end
+ * takes them one by one, a trap each, as the service routine resumes it. Here a walk met several and could trap
+ * on one only. Taking the last one (the old overwrite) or the first one both starve the rest when one idle voice
+ * stays idle in its list for good: DirectSound's own submix voice 0x40 in Orta, at the head of the list, which the
+ * routine ignores - with "first wins" (option-c 15dd3d4) every trap went to 0x40, the voices the title had just
+ * stopped were never reported, and its SAVE & QUIT waited for them for ever (pause state 10). So the walk queues
+ * every idle voice it meets (once each), and each free moment of the front end traps on the oldest one that is
+ * still idle. */
+static uint16_t s_idle_q[MCPX_HW_MAX_VOICES];
+static uint8_t s_idle_inq[MCPX_HW_MAX_VOICES];
+static int s_idle_qh, s_idle_qn;
+
+static void idle_enqueue(uint16_t v)
+{
+    if (v >= MCPX_HW_MAX_VOICES || s_idle_inq[v] || s_idle_qn >= MCPX_HW_MAX_VOICES)
+        return;
+    s_idle_inq[v] = 1;
+    s_idle_q[(s_idle_qh + s_idle_qn) % MCPX_HW_MAX_VOICES] = v;
+    s_idle_qn++;
+}
+
+int mcpx_apu_vp_idle_queued(void)
+{
+    return s_idle_qn;
+}
+
+/* Whether the voice is still linked in one of the three lists - the hardware VP only ever meets those. */
+static int voice_listed(MCPXAPUState *d, uint16_t v)
+{
+    for (int list = 0; list < 3; list++) {
+        uint32_t h = d->regs[voice_list_regs[list].top];
+        for (int i = 0; h != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
+            if (h == v)
+                return 1;
+            h = voice_get_mask(d, (uint16_t)h, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+        }
+    }
+    return 0;
+}
+
+/* Trap on the oldest queued voice that is still idle and still listed, if the front end is free. 1 = trapped.
+ *
+ * Still listed: the queue outlives the walk that filled it. A voice the service routine has meanwhile taken out
+ * of its list - and DirectSound then freed, its slot [this+0x2C0+v*4] cleared - was reported later all the same,
+ * and the routine read the empty slot ([0+0x64] in Orta 0x002C2F33); the hardware never reports a voice it no
+ * longer walks. */
+static int idle_dispatch(MCPXAPUState *d)
+{
+    while (s_idle_qn && !fe_trapped(d)) {
+        uint16_t v = s_idle_q[s_idle_qh];
+        s_idle_qh = (s_idle_qh + 1) % MCPX_HW_MAX_VOICES;
+        s_idle_qn--;
+        s_idle_inq[v] = 0;
+        if (voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+            continue;                       /* turned on again meanwhile: nothing to report */
+        if (!voice_listed(d, v)) {
+            if (mcpx_apu_diag())
+                fprintf(stderr, "[APUDIAG] queued idle voice %u no longer listed - not reported\n", v);
+            continue;
+        }
+        fe_method(d, SE2FE_IDLE_VOICE, v);
+        return fe_trapped(d);               /* 0: the title does not trap idle voices */
+    }
+    return 0;
+}
+
 int mcpx_apu_vp_idle_scan(MCPXAPUState *d)
 {
-    if (!s_idle_pending)
+    if (!s_idle_pending && !s_idle_qn)
         return 0;
     if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
             == NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
@@ -1301,24 +1440,21 @@ int mcpx_apu_vp_idle_scan(MCPXAPUState *d)
     /* Once per VOICE_OFF: a voice the service routine leaves in the list
      * until its DPC must not trap again and again here (se_frame keeps
      * finding it at the frame rate, as the hardware would). */
-    s_idle_pending = 0;
-    for (int list = 0; list < 3; list++) {
-        uint32_t h = d->regs[voice_list_regs[list].top];
-        for (int i = 0; h != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
-            uint16_t v = (uint16_t)h;
-            if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                fe_method(d, SE2FE_IDLE_VOICE, v);
-                if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
-                        == NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
-                    return 1;
-                return 0;   /* the title does not trap idle voices */
+    if (s_idle_pending) {
+        s_idle_pending = 0;
+        for (int list = 0; list < 3; list++) {
+            uint32_t h = d->regs[voice_list_regs[list].top];
+            for (int i = 0; h != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
+                uint16_t v = (uint16_t)h;
+                if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+                    idle_enqueue(v);
+                h = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                   NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
             }
-            h = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
-                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
         }
     }
-    return 0;
+    return idle_dispatch(d);
 }
 
 /* ============================================================
@@ -1347,12 +1483,26 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             }
 
             uint16_t v = (uint16_t)d->regs[current];
+            /* A handle past the 256 voices ends the list. The link is a 16-bit field in guest memory, and the
+             * per-voice state here is host arrays of 256 (filters, SSL, debug) - the asserts that guarded them are
+             * compiled out. Orta's stage-6 load: the lists still ran through the voice block of the DirectSound
+             * object it had just released, the freed memory gave garbage voices ("Unknown envelope state 0xc /
+             * 0xd / 0xf") and a garbage link, and its handle indexed the host heap: access violation in this
+             * function (Orta, stage-6 load). */
+            if (v >= MCPX_HW_MAX_VOICES) {
+                static volatile LONG said;
+                if (InterlockedIncrement(&said) <= 8)
+                    fprintf(stderr, "[APU] voice list %d runs into handle 0x%04X (>= %d voices; VPVADDR %08X, "
+                                    "head %04X) - list cut there\n", list, v, MCPX_HW_MAX_VOICES,
+                            d->regs[NV_PAPU_VPVADDR], d->regs[top]);
+                break;
+            }
             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                fe_method(d, SE2FE_IDLE_VOICE, v);
+                idle_enqueue(v);            /* reported in turn (idle_dispatch below) */
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
@@ -1360,6 +1510,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             d->regs[current] = d->regs[next];
         }
     }
+    idle_dispatch(d);
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {

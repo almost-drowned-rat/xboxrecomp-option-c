@@ -172,3 +172,43 @@ Defaults are unchanged for a port that sets none of the switches below, except w
 - **Diagnostics.** `[hitch]` lines (long frames) also count driver pipeline builds, render-target images made and
   named screenshots; `RECOMP_VK_TEXBIND_LOG=1` logs each distinct depth / render-target / linear texture binding
   once with what it was bound to.
+
+## 6. Changes since the v0.9.0 snapshot (Orta Recompiled v1.0.0)
+
+Defaults are unchanged for a port that sets none of the switches below, except where a line says otherwise.
+
+- **Physical addresses mean one byte.** `MmGetPhysicalAddress` of heap, pool, image or stack memory now answers
+  VA + 256 MB (`XBOX_HEAP_PHYS_BIAS`), so it no longer shares a number with the contiguous window. The APU, the
+  USB host controller and the pushbuffer executor resolve such numbers first (`xbox_PhysHeapVA`). Before, a
+  number could mean either copy and the bus masters guessed through a per-page owner table. Panzer Dragoon Orta's
+  sound engine re-created per stage then wrote into a collision mesh (crash in stage 6) and missed its own data.
+  `RECOMP_PHYS_BIAS=0` restores the old answer. This changes every option-c title's bus masters: a title that ORs
+  0x80000000 onto a heap physical address now faults instead of reading the wrong copy.
+- **Handle table is thread-safe.** Its slots change hands by compare-and-swap. Two threads creating handles at
+  the same moment could get the same token, and closing one killed the other (Orta's stage-7 cut-scene hang: a
+  worker's quit event was gone). A near miss is logged once (`[BRIDGE] two threads reached handle slot ...`). A
+  failed `NtResumeThread` logs the token, its slot and the thread it last held.
+- **APU.**
+  - A trapped front end keeps its decoded method until the service routine resumes it; a title's PIO methods
+    no longer overwrite it.
+  - Idle voices are reported in turn, only while still listed, so one voice that stays idle no longer starves
+    the rest.
+  - A voice-list handle past the 256 voices ends the list instead of indexing host memory.
+  - `KeDisconnectInterrupt` removes the routine from the delivery table, so a title that re-creates DirectSound
+    per stage gets its interrupts on the new object. Before, it got none, and the old object's routine ran on
+    freed memory.
+  - `RECOMP_APU_DIAG=1` / `RECOMP_PHYS_DIAG=1` log register writes, traps, deliveries, a once-a-second state line,
+    where APU writes land, and physical pages that change hands.
+- **Threads.**
+  - A new thread's TIB starts at PASSIVE_LEVEL; the main TIB's IRQL byte is no longer copied. Workers that read
+    it as raised took the CRT's bug check path.
+  - The TIB keeps the KPCR area to 0x100 zeroed and has its own `NtTib.Self`.
+  - `KeBugCheck` / `KeBugCheckEx` report the call site, stack, thread and IRQL.
+- **21:9 is the display's exact ratio** (all ports), not a fixed 64:27.
+- **Render surfaces sampled without alpha.** A render surface sampled through a format without alpha
+  (R5G6B5 / X1R5G5B5 / X8R8G8B8) reads alpha 1.
+- **Diagnostics and testing.**
+  - `RECOMP_VK_SURF_LOG=<from>-<to>` logs the render surfaces' life over a flip window.
+  - A live-file line `stop` drops the running pad script for good, and later live lines still press.
+- **New tests:** `apu_fe_trap`, `phys_resolve`, `pad_live_stop`, `video_aspect`; `kernel_regressions` case 6 is
+  the concurrent handle-table check.

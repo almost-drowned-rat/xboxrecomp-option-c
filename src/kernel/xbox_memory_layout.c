@@ -4405,7 +4405,11 @@ uint32_t xbox_AllocThreadTib(void)
 {
     /* XBOX_VA is scoped to the loader; the same arithmetic, spelled here. */
     #define TIB_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
-    const uint32_t tib_size = 0x40;
+    /* The main TIB's first 0x40 bytes are copied, and the block reserves the KPCR area behind them (0x40..0x100)
+     * zeroed. The TLS block used to start at +0x40, so KPCR fields the XDK reads past it landed in thread data:
+     * fs:[0x58] (KPRCB.DpcRoutineActive, which DirectSound reads to decide whether it runs in a DPC - Orta
+     * 0x002BE17A / 0x002BE19F) was the worker's LastError slot in Orta, nonzero after any failed file open. */
+    const uint32_t tib_copy = 0x40, tib_size = 0x100;
     uint32_t tib, block, thread_data, total;
 
     if (!g_tls_total)
@@ -4419,17 +4423,35 @@ uint32_t xbox_AllocThreadTib(void)
     thread_data = block + total;
 
     /* The TIB itself, copied so stack bounds and the fields the title filled
-     * in are inherited, then the two that must not be. */
-    memcpy(TIB_VA(tib), TIB_VA(XBOX_TIB_MAIN), tib_size);
+     * in are inherited, then the ones that must not be. */
+    memcpy(TIB_VA(tib), TIB_VA(XBOX_TIB_MAIN), tib_copy);
+    memset(TIB_VA(tib + tib_copy), 0, tib_size - tib_copy);
     memcpy(TIB_VA(block), TIB_VA(g_tls_template_va), total);
     memset(TIB_VA(thread_data), 0, g_tls_thread_size);
 
     *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
     *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
+    *(uint32_t *)TIB_VA(tib + 0x18) = tib;           /* NtTib.Self: this TIB, not the main one */
+    /* KPCR.Irql, fs:[0x24]: a new thread starts at PASSIVE_LEVEL, which is also where the kernel's own per-thread
+     * level starts (kernel_hal.c g_current_irql). The copy brought the main thread's byte along, and that byte is 2
+     * whenever the main thread is raised as the thread is made. Only an
+     * IRQL change rewrites it, so the new thread read DISPATCH_LEVEL until its first raise: the XDK CRT's per-thread
+     * data check (Orta 0x002926D9 / 0x0029275B) called KeBugCheck(0xA) on it as a loader worker ended, and
+     * DirectSound's lock - which reads this byte and skips its critical section at raised IRQL - ran unlocked
+     * beside the APU service routine (Orta issue #1: a freed voice read in the ISR, [0+0x64]). */
+    *(uint8_t *)TIB_VA(tib + 0x24) = 0;
 
     return tib;
     #undef TIB_VA
+}
+
+/* Tests only: the synthetic XBE (tools/conformance) has no TLS directory, and without one xbox_AllocThreadTib has
+ * nothing to copy and returns 0. This gives it a template block as the loader would. */
+void xbox_TestSetTlsTemplate(uint32_t template_va, uint32_t total)
+{
+    g_tls_template_va = template_va;
+    g_tls_total = total;
 }
 
 uint32_t xbox_AllocThreadStack(void)

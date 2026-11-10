@@ -85,10 +85,16 @@ void mcpx_debug_end_frame(void) {}
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 extern uint32_t xbox_ContiguousAllocatedBytes(void);
 extern int xbox_PhysOwner(uint32_t phys);   /* kernel.h: 0 unknown, 1 RAM, 2 contiguous */
+extern int xbox_PhysHeapVA(uint32_t phys, uint32_t *va);   /* kernel.h: a biased heap number -> its VA */
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
-    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    uint32_t a, heap_va;
+    /* A number the kernel gave out for heap / pool / image memory (MmGetPhysicalAddress, XBOX_HEAP_PHYS_BIAS): no
+     * guessing, that VA. Before the 28-bit mask below, which would fold it onto a contiguous number. */
+    if (xbox_PhysHeapVA((uint32_t)addr, &heap_va))
+        return g_apu_ram_ptr + heap_va;
+    a = (uint32_t)addr & 0x0FFFFFFFu;
     switch (xbox_PhysOwner(a)) {
     case 1:                                 /* XBOX_PHYS_RAM */
         return g_apu_ram_ptr + (a & 0x03FFFFFFu);
@@ -104,6 +110,31 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
     if (a < xbox_ContiguousAllocatedBytes())
         return g_apu_ram_ptr + 0x80000000u + a;
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+}
+
+/* RECOMP_APU_DIAG: where the APU's writes go. Physical page numbers are shared here between the contiguous window
+ * and identity-mapped heap memory (kernel_memory.c, xbox_PhysOwner); a write meant for a DirectSound block in the
+ * window that is routed to the heap lands in whatever the heap gave out at that VA (Orta stage 6: a collision
+ * triangle at 0x014F3A90 inside DirectSound's new GP range 0x014EC000..0x014F8FFF lost a vertex pointer). The first
+ * write into each page per route is logged: "[APUDIAG] write phys P -> heap VA / contiguous VA / image / fallback". */
+uint8_t *mcpx_apu_phys_w(uint64_t addr)
+{
+    uint8_t *p = mcpx_apu_phys(addr);
+    if (mcpx_apu_diag()) {
+        static volatile uint8_t seen[(64u << 20) >> 12];
+        static volatile LONG lines;
+        uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+        uint32_t va = (uint32_t)(p - g_apu_ram_ptr);
+        int route = va >= 0x80000000u ? 1 : (va >= g_xbox_image_lo && va < g_xbox_image_hi) ? 2 : 4;
+        uint32_t pg = (a >> 12) & ((sizeof seen) - 1u);
+        if (!(seen[pg] & route)) {
+            seen[pg] |= (uint8_t)route;
+            if (InterlockedIncrement(&lines) <= 2000)
+                fprintf(stderr, "[APUDIAG] write phys %08X -> %s VA %08X (page owner %d)\n", a,
+                        route == 1 ? "contiguous" : route == 2 ? "image" : "heap", va, xbox_PhysOwner(a));
+        }
+    }
+    return p;
 }
 
 /* The interrupt line, as the frame thread sees it. update_irq used to call
@@ -140,6 +171,74 @@ static void update_irq(MCPXAPUState *d)
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
         InterlockedExchange(&s_irq_line, 0);
     }
+}
+
+/* ---- RECOMP_APU_DIAG ---------------------------------------------------
+ *
+ * Orta issue #1 (b): from the stage-6 load on no APU interrupt reached the title any more (the counter stood still
+ * for minutes; ~1-6/s before), the pause sounds looped and SAVE & QUIT crashed in the service routine of the
+ * DirectSound object the stage load had just made. RECOMP_APU_DIAG=1 writes what the interrupt and front-end path
+ * do, through the logger thread like all of this module: the title's writes of ISTS / IEN / FECTL / SECTL /
+ * FETFORCE0/1 / the list heads / the voice, SGE, SSL, notifier and GP base addresses (old -> new), each trap, VOICE_ON / OFF / RELEASE, each delivery (routine, context,
+ * the state before and after) and once a second the state (front end, line, queue, VP frames run / skipped). */
+int mcpx_apu_diag(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_DIAG");
+        on = e && *e && *e != '0';
+        if (on)
+            fprintf(stderr, "[APUDIAG] on (RECOMP_APU_DIAG)\n");
+    }
+    return on;
+}
+
+static const char *diag_reg_name(hwaddr addr)
+{
+    switch (addr) {
+    case NV_PAPU_ISTS:      return "ISTS";
+    case NV_PAPU_IEN:       return "IEN";
+    case NV_PAPU_FECTL:     return "FECTL";
+    case NV_PAPU_SECTL:     return "SECTL";
+    case NV_PAPU_FETFORCE0: return "FETFORCE0";
+    case NV_PAPU_FETFORCE1: return "FETFORCE1";
+    case NV_PAPU_TVL2D:     return "TVL2D";
+    case NV_PAPU_TVL3D:     return "TVL3D";
+    case NV_PAPU_TVLMP:     return "TVLMP";
+    case NV_PAPU_VPVADDR:   return "VPVADDR";
+    case NV_PAPU_VPSGEADDR: return "VPSGEADDR";
+    case NV_PAPU_VPSSLADDR: return "VPSSLADDR";
+    case NV_PAPU_FENADDR:   return "FENADDR";
+    case NV_PAPU_GPSADDR:   return "GPSADDR";
+    default:                return NULL;
+    }
+}
+
+extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+
+/* The service routine connected on the APU's vector 5 (0 = none). */
+static uint32_t diag_isr(void)
+{
+    uint32_t kint = xbox_GetConnectedInterrupt(5);
+    return kint ? *(uint32_t *)(g_apu_ram_ptr + kint + 0) : 0;
+}
+
+/* VP frames since the last state line: run, and skipped because the front end was trapped / halted. */
+static volatile LONG s_diag_frames_run, s_diag_frames_trapped, s_diag_frames_halted;
+
+static void diag_state_line(MCPXAPUState *d, const char *why)
+{
+    fprintf(stderr, "[APUDIAG] state (%s): FECTL %08X SECTL %08X ISTS %08X IEN %08X line %ld FEDEC %04X/%08X "
+                    "FETFORCE1 %08X lists %04X/%04X/%04X queue %d frames run %ld trapped %ld halted %ld "
+                    "delivered %ld isr 0x%08X\n", why,
+            qatomic_read(&d->regs[NV_PAPU_FECTL]), qatomic_read(&d->regs[NV_PAPU_SECTL]),
+            qatomic_read(&d->regs[NV_PAPU_ISTS]), qatomic_read(&d->regs[NV_PAPU_IEN]),
+            (long)InterlockedCompareExchange(&s_irq_line, 0, 0),
+            d->regs[NV_PAPU_FEDECMETH], d->regs[NV_PAPU_FEDECPARAM], d->regs[NV_PAPU_FETFORCE1],
+            d->regs[NV_PAPU_TVL2D], d->regs[NV_PAPU_TVL3D], d->regs[NV_PAPU_TVLMP], mcpx_apu_vp_idle_queued(),
+            (long)InterlockedExchange(&s_diag_frames_run, 0), (long)InterlockedExchange(&s_diag_frames_trapped, 0),
+            (long)InterlockedExchange(&s_diag_frames_halted, 0), (long)s_irq_delivered,
+            diag_isr());
 }
 
 /* ---- delivering it ---------------------------------------------------- */
@@ -187,8 +286,15 @@ static void apu_deliver_irq(X86Ctx *ctx, MCPXAPUState *d)
         return;                                 /* without the gate (RECOMP_DPC_GATE=0): the old hold-off */
     held_off = 0;
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
-    if (!kint)
+    if (!kint) {
+        static int said;
+        if (mcpx_apu_diag() && !said) {
+            said = 1;
+            fprintf(stderr, "[APUDIAG] line up, no service routine connected (ISTS %08X FECTL %08X) - held\n",
+                    qatomic_read(&d->regs[NV_PAPU_ISTS]), qatomic_read(&d->regs[NV_PAPU_FECTL]));
+        }
         return;
+    }
     routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
     context = *(uint32_t *)(g_apu_ram_ptr + kint + 4);
     fn = routine ? recomp_lookup(routine) : NULL;
@@ -212,6 +318,14 @@ static void apu_deliver_irq(X86Ctx *ctx, MCPXAPUState *d)
     }
     xbox_GateNote(routine);
 
+    uint32_t diag_ists = 0, diag_fectl = 0, diag_meth = 0, diag_param = 0;
+    if (mcpx_apu_diag()) {
+        diag_ists = qatomic_read(&d->regs[NV_PAPU_ISTS]);
+        diag_fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+        diag_meth = d->regs[NV_PAPU_FEDECMETH];
+        diag_param = d->regs[NV_PAPU_FEDECPARAM];
+    }
+
     qemu_mutex_unlock(&d->lock);
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
@@ -223,6 +337,14 @@ static void apu_deliver_irq(X86Ctx *ctx, MCPXAPUState *d)
     xbox_worker_stack_free(slot);
     xbox_GateLeave();
     qemu_mutex_lock(&d->lock);
+
+    if (mcpx_apu_diag())
+        fprintf(stderr, "[APUDIAG] deliver #%ld 0x%08X ctx 0x%08X: before ISTS %08X FECTL %08X FEDEC %04X/%08X -> "
+                        "%s, after ISTS %08X FECTL %08X FEDEC %04X/%08X line %ld\n",
+                (long)s_irq_delivered, routine, context, diag_ists, diag_fectl, diag_meth, diag_param,
+                (g_eax & 1) ? "claimed" : "declined", qatomic_read(&d->regs[NV_PAPU_ISTS]),
+                qatomic_read(&d->regs[NV_PAPU_FECTL]), d->regs[NV_PAPU_FEDECMETH], d->regs[NV_PAPU_FEDECPARAM],
+                (long)InterlockedCompareExchange(&s_irq_line, 0, 0));
 
     {
         static unsigned n;
@@ -272,6 +394,14 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
      *         (unsigned long long)addr, size, (unsigned long long)val);
      */
     (void)size;
+
+    if (mcpx_apu_diag()) {
+        const char *name = diag_reg_name(addr);
+        if (name)
+            fprintf(stderr, "[APUDIAG] title writes %s: %08X -> %08X (FECTL %08X ISTS %08X)\n", name,
+                    qatomic_read(&d->regs[addr]), (uint32_t)val, qatomic_read(&d->regs[NV_PAPU_FECTL]),
+                    qatomic_read(&d->regs[NV_PAPU_ISTS]));
+    }
 
     switch (addr) {
     case NV_PAPU_ISTS:
@@ -725,6 +855,21 @@ static void *mcpx_apu_frame_thread(void *arg)
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+
+        if (mcpx_apu_diag()) {
+            static int64_t next_state;
+            int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME) / 1000;
+            if (apu_active)
+                InterlockedIncrement(&s_diag_frames_run);
+            else if ((fectl & NV_PAPU_FECTL_FEMETHMODE) == NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+                InterlockedIncrement(&s_diag_frames_trapped);
+            else if (fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED)
+                InterlockedIncrement(&s_diag_frames_halted);
+            if (now >= next_state) {
+                next_state = now + 1000;
+                diag_state_line(d, "1 s");
+            }
+        }
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */

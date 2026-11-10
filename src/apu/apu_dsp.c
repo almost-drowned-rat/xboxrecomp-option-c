@@ -168,7 +168,7 @@ static void gp_mem_write(void *ctx, uint32_t off, const uint32_t *words, int n)
             return;
         page = *(const uint32_t *)mcpx_apu_phys(sge + (off >> 12) * 8);
         if (page && !(page & 0xFFF))
-            memcpy(mcpx_apu_phys(page) + (off & 0xFFF), words, (size_t)k * 4u);
+            memcpy(mcpx_apu_phys_w(page) + (off & 0xFFF), words, (size_t)k * 4u);
         off += (uint32_t)k * 4u;
         words += k;
         n -= k;
@@ -383,7 +383,7 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
                     bell, qatomic_read(&d->regs[NV_PAPU_GPSADDR]), bell - APU_DSP_DOORBELL_OFFSET);
             s_dsp_auto_bell = bell;
         }
-        slot = (volatile uint32_t *)mcpx_apu_phys(bell);
+        slot = (volatile uint32_t *)mcpx_apu_phys_w(bell);
         cmd = *slot;
         if (cmd) {
             if (shown++ < 3)

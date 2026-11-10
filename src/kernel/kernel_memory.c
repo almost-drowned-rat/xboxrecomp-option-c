@@ -10,6 +10,8 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
+#include <stdlib.h>
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -183,8 +185,46 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
                  (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
     uint32_t phys = contig ? va - XBOX_CONTIG_BASE : va;
 
+    /* Heap, pool, image and stacks: a number of their own (xbox_PhysBias below), so it can never be taken for a
+     * contiguous page. Nothing to note - the number says what it is. */
+    if (!contig && xbox_PhysBias() && va < XBOX_HEAP_PHYS_BIAS)
+        return (ULONG_PTR)(va + XBOX_HEAP_PHYS_BIAS);
     xbox_PhysNoteOwner(phys, contig ? XBOX_PHYS_CONTIG : XBOX_PHYS_RAM);
     return (ULONG_PTR)phys;
+}
+
+/* Physical numbers for memory outside the contiguous window (Orta issue #1 stage 6, option-c).
+ *
+ * The heap, pool, image and stacks are identity-mapped low RAM here and the contiguous window is separate storage,
+ * so MmGetPhysicalAddress used to answer the same number P for heap VA P and for contiguous VA 0x80000000 + P, and a
+ * bus master handed P had to guess through the owner table below. The table is per page and sticky: DirectSound's
+ * heap buffers flipped pages 0x01463000..0x01582000 to "heap" (MmGetPhysicalAddress per page for their SGE entries),
+ * the stage-6 DirectSound object then got contiguous blocks with those numbers (GP scratch 0x014EC000..0x014F8FFF),
+ * the APU read and wrote them in the heap - over a collision mesh the stage had loaded there (NULL vertex pointer,
+ * crash in sub_0028CB40 1-2 min into stage 6) - and DirectSound never saw its own data (no music).
+ *
+ * Now a non-contiguous VA v answers v + XBOX_HEAP_PHYS_BIAS (256 MB): every number below 64 MB is contiguous, every
+ * number from 256 MB on is heap / image / stack memory at VA P - 256 MB. Above every RAM size and contiguous window
+ * here, so no address a title computes itself from a VA (D3D's surface offsets, DirectSound's voice offsets from a
+ * contiguous base) can look like one. RECOMP_PHYS_BIAS=0: the old identity answer and owner guessing. */
+int xbox_PhysBias(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PHYS_BIAS");
+        on = !(e && *e == '0');
+        if (!on)
+            fprintf(stderr, "[PHYS] RECOMP_PHYS_BIAS=0: heap physical addresses are identity again (owner guessing)\n");
+    }
+    return on;
+}
+
+int xbox_PhysHeapVA(uint32_t phys, uint32_t *va)
+{
+    if (phys < XBOX_HEAP_PHYS_BIAS || phys - XBOX_HEAP_PHYS_BIAS >= XBOX_HEAP_PHYS_BIAS || !xbox_PhysBias())
+        return 0;
+    *va = phys - XBOX_HEAP_PHYS_BIAS;
+    return 1;
 }
 
 /* Which storage a physical page number was handed out for.
@@ -208,10 +248,34 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
 #define PHYS_PAGES ((64u * 1024u * 1024u) >> 12)
 static volatile uint8_t s_phys_owner[PHYS_PAGES];
 
+/* RECOMP_PHYS_DIAG=1 (or RECOMP_APU_DIAG=1): "[PHYS]" lines where a page number changes hands between the
+ * contiguous window and the heap - an explicit MmGetPhysicalAddress that flips a page's owner, and a contiguous
+ * block handed out over pages already noted as heap (they keep the heap answer, so a bus master reading the block
+ * reads the heap). Orta issue #1 stage 6: a collision triangle in the heap at 0x014F3A90 lost a vertex pointer
+ * inside DirectSound's new GP range 0x014EC000..0x014F8FFF. */
+int xbox_PhysDiag(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *a = getenv("RECOMP_PHYS_DIAG"), *b = getenv("RECOMP_APU_DIAG");
+        on = (a && *a && *a != '0') || (b && *b && *b != '0');
+    }
+    return on;
+}
+
 void xbox_PhysNoteOwner(uint32_t phys, int owner)
 {
-    if ((phys >> 12) < PHYS_PAGES)
+    if ((phys >> 12) < PHYS_PAGES) {
+        uint8_t was = s_phys_owner[phys >> 12];
         s_phys_owner[phys >> 12] = (uint8_t)owner;
+        if (was != XBOX_PHYS_UNKNOWN && was != (uint8_t)owner && xbox_PhysDiag()) {
+            static volatile LONG n;
+            if (InterlockedIncrement(&n) <= 500)
+                fprintf(stderr, "[PHYS] MmGetPhysicalAddress flips page %08X: %s -> %s\n", phys & ~0xFFFu,
+                        was == XBOX_PHYS_CONTIG ? "contiguous" : "heap",
+                        owner == XBOX_PHYS_CONTIG ? "contiguous" : "heap");
+        }
+    }
 }
 
 int xbox_PhysOwner(uint32_t phys)
@@ -237,9 +301,23 @@ void xbox_PhysNoteRange(uint32_t phys, uint32_t size, int owner)
     last = (phys + size - 1u) >> 12;
     if (last < (phys >> 12))
         last = PHYS_PAGES - 1u;                     /* wrapped: clip at the top */
-    for (p = phys >> 12; p <= last && p < PHYS_PAGES; p++)
-        if (s_phys_owner[p] == XBOX_PHYS_UNKNOWN)
-            s_phys_owner[p] = (uint8_t)owner;
+    {
+        uint32_t clash = 0, first = 0;
+        for (p = phys >> 12; p <= last && p < PHYS_PAGES; p++) {
+            if (s_phys_owner[p] == XBOX_PHYS_UNKNOWN)
+                s_phys_owner[p] = (uint8_t)owner;
+            else if (s_phys_owner[p] != (uint8_t)owner && !clash++)
+                first = p << 12;
+        }
+        if (xbox_PhysDiag()) {
+            static volatile LONG n, c;
+            /* every block that clashes (up to 2000), the others only for the first 300 */
+            if (clash ? InterlockedIncrement(&c) <= 2000 : InterlockedIncrement(&n) <= 300)
+                fprintf(stderr, "[PHYS] %s block phys %08X + %u: %u page(s) already noted the other way%s%08X\n",
+                        owner == XBOX_PHYS_CONTIG ? "contiguous" : "heap", phys, size, clash,
+                        clash ? ", first " : "", clash ? first : 0u);
+        }
+    }
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)

@@ -3,12 +3,12 @@
  *
  * Bus masters (APU, USB host) resolve a physical address through it: the contiguous window and identity-mapped
  * pool memory share physical numbers here. Checked:
- *   - MmGetPhysicalAddress notes the page it answers (window or RAM), the last answer wins;
+ *   - MmGetPhysicalAddress notes the window pages it answers; a pool / heap VA gets a number of its own
+ *     (VA + XBOX_HEAP_PHYS_BIAS) and notes nothing;
  *   - xbox_PhysNoteRange (the contiguous allocators, 2026-11-01) notes every page of a block, so a page
  *     inside it that nobody asked about resolves to the window (Panzer Dragoon Orta: DirectSound computes voice
  *     0x44 at physical 0x28A200 from its base without asking; the APU read the XBE image copy there);
- *   - but a page some MmGetPhysicalAddress already answered keeps that answer (THPS 2X's pad buffer in pool memory
- *     shares its page number with a contiguous block handed out later);
+ *   - THPS 2X's pad buffer in pool memory no longer shares its number with a contiguous block handed out later;
  *   - a block reaching past 64 MB is clipped, a zero size notes nothing.
  * No guest memory is touched; the kernel functions are called directly.
  */
@@ -44,16 +44,20 @@ int main(void)
     check(xbox_PhysOwner(0x28BFFF) == XBOX_PHYS_CONTIG, "range: last byte's page is contiguous");
     check(xbox_PhysOwner(0x28C000) == XBOX_PHYS_UNKNOWN, "range: the page after the block stays unknown");
 
-    /* THPS 2X: a pool buffer's page answered as RAM first, a contiguous block covering it handed out later. */
-    xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)0x01C0F52Au);
-    check(xbox_PhysOwner(0x01C0F52A) == XBOX_PHYS_RAM, "MmGetPhysicalAddress(pool VA) notes RAM");
+    /* THPS 2X: a pool buffer's number asked first, a contiguous block on the same page numbers handed out later.
+     * The pool buffer now has a number of its own (VA + XBOX_HEAP_PHYS_BIAS) and leaves the table alone, so the
+     * block keeps every page (Orta issue #1 stage 6: the sticky RAM note sent the APU into the heap). */
+    {
+        uint32_t phys = (uint32_t)xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)0x01C0F52Au), va = 0;
+        check(phys == 0x01C0F52Au + XBOX_HEAP_PHYS_BIAS, "MmGetPhysicalAddress(pool VA) = VA + 256 MB");
+        check(xbox_PhysHeapVA(phys, &va) && va == 0x01C0F52Au, "that number resolves to the pool VA");
+        check(xbox_PhysOwner(0x01C0F52A) == XBOX_PHYS_UNKNOWN, "and notes nothing in the table");
+    }
     xbox_PhysNoteRange(0x01C00000, 0x20000, XBOX_PHYS_CONTIG);
-    check(xbox_PhysOwner(0x01C0F52A) == XBOX_PHYS_RAM, "range keeps a page already answered as RAM");
+    check(xbox_PhysOwner(0x01C0F52A) == XBOX_PHYS_CONTIG, "a contiguous block over that page number owns it");
     check(xbox_PhysOwner(0x01C10000) == XBOX_PHYS_CONTIG, "range notes the block's other pages");
 
-    /* An explicit answer still overrides a range note (last answer wins). */
-    xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)0x0028A000u);
-    check(xbox_PhysOwner(0x28A000) == XBOX_PHYS_RAM, "MmGetPhysicalAddress overrides a range note");
+    /* An explicit window answer notes contiguous. */
     xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)0x8028A000u);
     check(xbox_PhysOwner(0x28A000) == XBOX_PHYS_CONTIG, "MmGetPhysicalAddress(window VA) notes contiguous");
 

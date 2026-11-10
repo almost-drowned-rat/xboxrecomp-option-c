@@ -694,6 +694,12 @@ typedef struct {
      * none. Only the presented surface gets one. */
     VkImage ms_image; VkImageView ms_view; VkDeviceMemory ms_mem;
     uint32_t ms;
+    /* The same image with alpha read as 1 (surf_view_a1): for a stage that samples this surface through a texture
+     * format without alpha. Made on first use, dropped with the image (a1_drop). */
+    VkImageView view_a1;
+    uint32_t cframe, wframe;   /* RECOMP_VK_SURF_LOG: flip it was made at, last flip a draw or clear wrote it (0 never) */
+    int sampled_logged;        /* RECOMP_VK_SURF_LOG: its first sampling was logged */
+    uint32_t logged_gen;       /* RECOMP_VK_SURF_LOG: gen of the last "old contents" line (one per write state) */
 } VkSurf;
 
 /* the boot animation's frame (nv2a_vk_boot_frame): presented in place of a
@@ -1237,6 +1243,60 @@ static void ms_drop(VkSurf *s)
     s->ms = 0;
 }
 
+/* a surface's alpha-one view goes (with its image) */
+static void a1_drop(VkSurf *s)
+{
+    if (s->view_a1)
+        garbage_add(VK_NULL_HANDLE, s->view_a1, VK_NULL_HANDLE);
+    s->view_a1 = VK_NULL_HANDLE;
+}
+
+/* The surface read through a texture format that has no alpha (R5G6B5, X1R5G5B5, X8R8G8B8): the hardware samples
+ * alpha 1 there, whatever the draws into the surface left in our BGRA8 image (xemu swizzles alpha to ONE for these
+ * formats too). Panzer Dragoon Orta's red special samples a 512x384 R5G6B5 copy of the scene in stages 1-3 and
+ * weights the tint by its alpha: the scene's own alpha (rock textures with block-wise DXT alpha) left near rock
+ * grey behind a staircase of blocks (GitHub #12, 2026-11-08). RECOMP_VK_RT_ALPHA_ONE=0: the old read. Falls back to
+ * the plain view if the extra one cannot be made. */
+static int tex_color_no_alpha(uint32_t color)
+{
+    switch (color) {
+    case 0x03: case 0x05: case 0x07:            /* SZ_X1R5G5B5, SZ_R5G6B5, SZ_X8R8G8B8 */
+    case 0x11: case 0x1C: case 0x1E:            /* LU_IMAGE_R5G6B5, _X1R5G5B5, _X8R8G8B8 */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static VkImageView surf_view_a1(VkSurf *s)
+{
+    static int on = -1;
+    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VK_RT_ALPHA_ONE");
+        on = !(e && *e == '0');
+    }
+    if (!on)
+        return s->view;
+    if (s->view_a1)
+        return s->view_a1;
+    vi.image = s->image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = VK_FORMAT_B8G8R8A8_UNORM;
+    vi.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+    vi.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+    vi.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+    vi.components.a = VK_COMPONENT_SWIZZLE_ONE;
+    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(s_dev, &vi, NULL, &s->view_a1) != VK_SUCCESS) {
+        s->view_a1 = VK_NULL_HANDLE;
+        return s->view;
+    }
+    return s->view_a1;
+}
+
 /* a multisampled 2D image (samples 2 / 4) */
 static int make_image_ms(uint32_t w, uint32_t h, uint32_t samples, VkFormat fmt, VkImageUsageFlags usage,
                          VkImageAspectFlags aspect, VkImage *img, VkImageView *view, VkDeviceMemory *mem)
@@ -1249,6 +1309,50 @@ static int make_image_ms(uint32_t w, uint32_t h, uint32_t samples, VkFormat fmt,
 }
 
 /* ── Surfaces ─────────────────────────────────────────────────────── */
+
+/* RECOMP_VK_SURF_LOG=<from>-<to> (flips; "1" = the whole run; diagnosis, off by default; Orta issue #1 (c), a
+ * smear < 1 s at the first appearance of episode 2's worm): the life of the render surfaces in that window -
+ * each one made or regrown (and the surface it pushed out of the 32 slots, with how long ago that one was used),
+ * each flip a stage samples a surface (its age: made / last written, flagged when nothing wrote it since it was
+ * made black), and a texture read from guest memory at an address a surface was pushed out of (the GPU's
+ * pixels never reached guest RAM, so the texture is stale there). At most 4000 lines. */
+static int surf_log_on(void)
+{
+    static int on = -1;
+    static uint32_t from, to;
+    static int n;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VK_SURF_LOG");
+        on = 0;
+        if (e && *e && *e != '0') {
+            char *end;
+            from = (uint32_t)strtoul(e, &end, 10);
+            to = (*end == '-') ? (uint32_t)strtoul(end + 1, NULL, 10) : 0xFFFFFFFFu;
+            if (from == 1 && *end != '-')
+                from = 0;                       /* "1": the whole run */
+            on = 1;
+            fprintf(stderr, "[SURF] log flips %u..%u\n", from, to);
+        }
+    }
+    if (!on || s_frame < from || s_frame > to)
+        return 0;
+    if (++n > 4000) {
+        if (n == 4001)
+            fprintf(stderr, "[SURF] 4000 lines - no more\n");
+        return 0;
+    }
+    return 1;
+}
+
+/* Surfaces pushed out of their slot (surf_get), for the stale-texture line: va, bytes, flip. */
+static struct { uint32_t va, bytes, frame; } s_evicted[64];
+static int s_evicted_n;
+
+static void surf_written(VkSurf *s)
+{
+    s->gen++;
+    s->wframe = s_frame ? s_frame : 1;
+}
 
 static VkSurf *surf_find(uint32_t va)
 {
@@ -1292,15 +1396,35 @@ static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uin
         }
         s = victim;
     }
+    if (surf_log_on()) {
+        if (s->image && s->va != va)
+            fprintf(stderr, "[SURF] frame %u make 0x%08X %ux%u (aa %ux%u) - pushes out 0x%08X %ux%u (made %u, last "
+                            "used %u, last written %u)\n", s_frame, va, w, h, aa_sx, aa_sy, s->va, s->w, s->h,
+                    s->cframe, s->used, s->wframe);
+        else if (s->image)
+            fprintf(stderr, "[SURF] frame %u regrow 0x%08X %ux%u -> %ux%u (contents dropped: made black again)\n",
+                    s_frame, va, s->w, s->h, w, h);
+        else
+            fprintf(stderr, "[SURF] frame %u make 0x%08X %ux%u (aa %ux%u) in a free slot\n", s_frame, va, w, h,
+                    aa_sx, aa_sy);
+    }
     if (s->image) {
+        if (s->va != va) {                  /* remembered for the stale-texture line in bind_stage */
+            int k = s_evicted_n++ % 64;
+            s_evicted[k].va = s->va;
+            s_evicted[k].bytes = s->bytes ? s->bytes : s->w * 4u * s->h;
+            s_evicted[k].frame = s_frame;
+        }
         if (s_rt == s) end_rendering(), s_rt = NULL;
         if (s_last == s) s_last = NULL;
         if (s_scan == s) s_scan = NULL;
         garbage_add(s->image, s->view, s->mem);
+        a1_drop(s);
         ms_drop(s);
     }
     memset(s, 0, sizeof *s);
     s->va = va; s->w = w; s->h = h; s->used = s_frame;
+    s->cframe = s_frame ? s_frame : 1;
     s->aa_sx = aa_sx; s->aa_sy = aa_sy;
     stored_size(w, h, aa_sx, &s->pw, &s->ph);
     if (!make_image(s->pw, s->ph, VK_FORMAT_B8G8R8A8_UNORM,
@@ -1391,6 +1515,7 @@ static void rescale_surfaces(double k)
         vkCmdBlitImage(s_cb, s->image, VK_IMAGE_LAYOUT_GENERAL, img,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
         garbage_add(s->image, s->view, s->mem);
+        a1_drop(s);
         ms_drop(s);                     /* MSAA: made again at the new size at the next flip */
         s->image = img; s->view = view; s->mem = mem;
         s->pw = pw; s->ph = ph;
@@ -1555,6 +1680,7 @@ static void drain_frees(void)
         if (s_last == s) s_last = NULL;
         if (s_scan == s) s_scan = NULL;
         garbage_add(s->image, s->view, s->mem);
+        a1_drop(s);
         ms_drop(s);
         memset(s, 0, sizeof *s);
         s_drop_surf++;
@@ -2621,13 +2747,47 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
             }
         }
     } else if (rt) {
-        out->imageView = rt->view;
+        out->imageView = tex_color_no_alpha(color) ? surf_view_a1(rt) : rt->view;
         *sampled = rt;
         rt_scale(w, h, rt->w, rt->h, rt->aa_sx, rt->aa_sy, scale);
         tex_bind_log(i, va, color, format, regs[base + 7], "surface", rt->pw, rt->ph, scale);
+        {
+            /* RECOMP_VK_SURF_LOG: the first sampling of each surface, and once per write state when it is sampled
+             * while nothing wrote it since it was made or since before the last flip */
+            int odd = !rt->wframe || rt->wframe + 1 < s_frame;
+            if ((!rt->sampled_logged || (odd && rt->logged_gen != rt->gen + 1u)) && surf_log_on()) {
+                rt->sampled_logged = 1;
+                if (odd)
+                    rt->logged_gen = rt->gen + 1u;      /* +1: gen 0 (never written) counts as a state too */
+                fprintf(stderr, "[SURF] frame %u stage %d samples 0x%08X %ux%u as %ux%u color 0x%02X: made %u, "
+                                "last written %u%s\n", s_frame, i, va, rt->w, rt->h, w, h, color, rt->cframe,
+                        rt->wframe, !rt->wframe ? " - NOTHING WROTE IT since it was made (black)"
+                        : rt->wframe + 1 < s_frame ? " (older than the last flip)" : "");
+            }
+        }
     } else {
         uint32_t texs = s_hz_texs;
         uint64_t t0 = hz_now();
+        {
+            /* RECOMP_VK_SURF_LOG: a texture read from guest memory where a surface was pushed out - the GPU's
+             * pixels are gone, the texture is what guest RAM held. Once per address. */
+            int k, m = s_evicted_n < 64 ? s_evicted_n : 64;
+            static uint32_t told[32];
+            static int ntold;
+            for (k = 0; k < m; k++)
+                if (va >= s_evicted[k].va && va < s_evicted[k].va + s_evicted[k].bytes) {
+                    int t;
+                    for (t = 0; t < ntold && told[t] != va; t++)
+                        ;
+                    if (t == ntold && ntold < 32 && surf_log_on()) {
+                        told[ntold++] = va;
+                        fprintf(stderr, "[SURF] frame %u stage %d reads 0x%08X %ux%u color 0x%02X as a TEXTURE "
+                                        "from guest RAM - surface 0x%08X was pushed out there at flip %u (stale)\n",
+                                s_frame, i, va, w, h, color, s_evicted[k].va, s_evicted[k].frame);
+                    }
+                    break;
+                }
+        }
         out->imageView = tex_get(va, color, w, h, pitch, 0, levels);
         if (s_hz_texs != texs)
             s_hz_tex_ns += hz_now() - t0;
@@ -3896,8 +4056,22 @@ static int ready(void)
                  * when resized, so no bars are added around the picture. A
                  * rectangle the port saved (nv2a_vk_set_window_rect) keeps
                  * its height and position, the width follows the aspect. */
-                float aspect = (float)xbox_video_aspect();   /* 4:3, 16:9, 16:10, 21:9 (2026-11-07) */
+                float aspect;
                 int wh = s_wr_have ? s_wr_want[3] : 720;
+                {
+                    /* 21:9 = the display's exact ratio (THPS 2X maintainer,
+                     * 2026-11-08; xbox_video_aspect_fit): the display the
+                     * saved window sits on, else the primary one */
+                    SDL_Point pt = { s_wr_want[0] + 16, s_wr_want[1] + 16 };
+                    SDL_DisplayID did = s_wr_have ? SDL_GetDisplayForPoint(&pt) : 0;
+                    const SDL_DisplayMode *dm;
+                    if (!did)
+                        did = SDL_GetPrimaryDisplay();
+                    dm = did ? SDL_GetDesktopDisplayMode(did) : NULL;
+                    if (dm && dm->w > 0 && dm->h > 0)
+                        xbox_video_aspect_fit((double)dm->w / (double)dm->h);
+                }
+                aspect = (float)xbox_video_aspect();   /* 4:3, 16:9, 16:10, 21:9 (2026-11-07) */
                 int ww = (int)(wh * aspect + 0.5f);
                 s_win = SDL_CreateWindow("NV2A (Vulkan)", ww, wh,
                                          SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
@@ -5741,7 +5915,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     s->dirty = 1;
     if (d)
         d->dirty = 1;
-    s->gen++;
+    surf_written(s);
     if (pipe != cur_pipe || cur_pipe_gen != s_cb_gen || s_pipe_foreign) {
         vkCmdBindPipeline(s_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         cur_pipe = pipe;
@@ -6125,7 +6299,7 @@ static void vk_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
             s_dyn_valid = 0;                    /* and resets its dynamic state */
             s_cb_gen++;                         /* incl. vertex input (cached per gen) */
             s->dirty = 1;
-            s->gen++;
+            surf_written(s);
         }
     }
     if (!nca)
@@ -6136,7 +6310,7 @@ static void vk_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     vkCmdClearAttachments(s_cb, nca, ca, 1, &rect);
     VT("  cleared\n");
     s->dirty = 1;
-    s->gen++;
+    surf_written(s);
 }
 
 static void dump_bmp(const char *path, const uint8_t *bgra, uint32_t w, uint32_t h)

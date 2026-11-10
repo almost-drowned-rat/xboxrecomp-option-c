@@ -1,5 +1,5 @@
 /*
- * Kernel regressions: three fixes, each checked against the bug it fixed.
+ * Kernel regressions: fixes, each checked against the bug it fixed (6: concurrent handle tokens, see race_check).
  *
  * Like tests/kernel_bridge, this calls the kernel through the thunk dispatcher
  * -- the path a title's kernel calls take -- with a plain buffer standing in
@@ -95,6 +95,88 @@ static uint32_t call(int slot, int nargs, const uint32_t *args)
     g_eax = 0xDEADBEEFu;
     RECOMP_CALL_GUEST(resolve(slot));
     return g_eax;
+}
+
+/* 6. Handle tokens created on several threads at once (Panzer Dragoon Orta issue #1 stage 7: two threads took the
+ *    same free table slot, one closed its event and the other's token went dead). Each thread has its own register
+ *    set and guest stack, creates RACE_EVENTS events per round and keeps them; after every round all live tokens
+ *    must be different and resolve to different host handles, then each thread closes its own. */
+#define RACE_THREADS 8
+#define RACE_EVENTS  24
+#define RACE_ROUNDS  150
+extern void *xbox_bridge_host_handle(uint32_t token);
+static uint32_t s_race_tok[RACE_THREADS][RACE_EVENTS];
+static HANDLE s_race_go[RACE_THREADS], s_race_done[RACE_THREADS];
+static volatile LONG s_race_stop;
+
+static uint32_t call_on(X86Ctx *c, uint32_t stack_va, int slot, int nargs, const uint32_t *args)
+{
+    uint32_t *sp = (uint32_t *)(mem + stack_va);
+    int i;
+    sp[0] = 0xBEEF0001u;
+    for (i = 0; i < nargs; i++)
+        sp[1 + i] = args[i];
+    c->r_esp = stack_va;
+    c->r_eax = 0xDEADBEEFu;
+    resolve(slot)(c, RECOMP_GUEST_BASE);
+    return c->r_eax;
+}
+
+static DWORD WINAPI race_thread(LPVOID arg)
+{
+    int t = (int)(intptr_t)arg, k;
+    X86Ctx c = X86CTX_INIT;
+    uint32_t area = 0x100000u + 0x10000u * (uint32_t)t, out = area + 0x100, stack = area + 0x8000;
+    for (;;) {
+        WaitForSingleObject(s_race_go[t], INFINITE);
+        if (s_race_stop)
+            return 0;
+        for (k = 0; k < RACE_EVENTS; k++) {            /* close last round's, create this round's */
+            uint32_t a[4] = { out, 0, 1, 0 };
+            if (s_race_tok[t][k]) { uint32_t h = s_race_tok[t][k]; call_on(&c, stack, S_CLOSE, 1, &h); }
+            call_on(&c, stack, S_CREATE_EVENT, 4, a);
+            s_race_tok[t][k] = *(uint32_t *)(mem + out);
+        }
+        SetEvent(s_race_done[t]);
+    }
+}
+
+static int race_check(char *d, size_t dn)
+{
+    int t, u, v, r;
+    for (t = 0; t < RACE_THREADS; t++) {
+        s_race_go[t] = CreateEventW(NULL, FALSE, FALSE, NULL);
+        s_race_done[t] = CreateEventW(NULL, FALSE, FALSE, NULL);
+        CloseHandle(CreateThread(NULL, 0, race_thread, (LPVOID)(intptr_t)t, 0, NULL));
+    }
+    snprintf(d, dn, "%d rounds of %d threads x %d events: every token separate", RACE_ROUNDS, RACE_THREADS,
+             RACE_EVENTS);
+    for (r = 0; r < RACE_ROUNDS; r++) {
+        for (t = 0; t < RACE_THREADS; t++) SetEvent(s_race_go[t]);
+        WaitForMultipleObjects(RACE_THREADS, s_race_done, TRUE, INFINITE);
+        for (u = 0; u < RACE_THREADS * RACE_EVENTS; u++) {
+            uint32_t a = s_race_tok[u / RACE_EVENTS][u % RACE_EVENTS];
+            void *ha = xbox_bridge_host_handle(a);
+            if (!a || !ha) {
+                snprintf(d, dn, "round %d: token 0x%08X resolves to nothing", r, a);
+                goto bad;
+            }
+            for (v = u + 1; v < RACE_THREADS * RACE_EVENTS; v++) {
+                uint32_t b = s_race_tok[v / RACE_EVENTS][v % RACE_EVENTS];
+                if (a == b || ha == xbox_bridge_host_handle(b)) {
+                    snprintf(d, dn, "round %d: two live events share token 0x%08X / host %p", r, a, ha);
+                    goto bad;
+                }
+            }
+        }
+    }
+    s_race_stop = 1;
+    for (t = 0; t < RACE_THREADS; t++) SetEvent(s_race_go[t]);
+    return 1;
+bad:
+    s_race_stop = 1;
+    for (t = 0; t < RACE_THREADS; t++) SetEvent(s_race_go[t]);
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -230,6 +312,9 @@ int main(int argc, char **argv)
             printf("  (Windows did not reuse a handle number in 64 tries: stale-token check not exercised)\n");
         check(!bad, "stale token after a host-side close: new object separate, survives the old close", d);
     }
+
+    /* 6. Concurrent handle creation (see race_check). */
+    check(race_check(d, sizeof d), "handle tokens created on 8 threads at once never collide", d);
 
     /* 3. No call logging past 2^31 kernel calls (slow; opt-in). */
     if (argc > 1 && !strcmp(argv[1], "wrap")) {

@@ -150,6 +150,7 @@ typedef struct {
     unsigned long period;    /* "<at>/<period>-<until>:...": pressed for `hold` every
                                 `period` from `at` up to `until` (0 = a single step) */
     unsigned long until;
+    uint8_t live;            /* from a RECOMP_PAD_LIVE line (kept by "stop") */
 } PadStep;
 
 /* 1 while step st is held at time ts (its own base) */
@@ -171,7 +172,7 @@ static int     s_has_keys;   /* the script holds key steps */
  * player can step into gameplay directly): while paused no script or live step is pressed - the real pad plays alone. Repeating
  * steps keep their clock, so they go on in phase after "resume"; single steps that fall into the pause are skipped.
  * Toggled by holding BACK on the real pad of port 1 for PAD_PAUSE_HOLD_MS (only while a script or a live file is
- * set), or by a live-file line "pause" / "resume" / "toggle". xbox_InputScriptPaused() lets a port's own helper
+ * set), or by a live-file line "pause" / "resume" / "toggle" ("stop": see pad_script_stop). xbox_InputScriptPaused() lets a port's own helper
  * threads (e.g. a cheat that taps keys) stop too. */
 #define PAD_PAUSE_HOLD_MS 1500
 static volatile int s_paused;
@@ -187,6 +188,21 @@ static void pad_pause_set(int on, const char *why)
         return;
     s_paused = on;
     fprintf(stderr, "  PAD: script %s (%s)\n", on ? "PAUSED - the real pad plays alone" : "RESUMED", why);
+    fflush(stderr);
+}
+
+/* Live-file line "stop" (2026-11-10): every remaining step of the script (RECOMP_PAD_SCRIPT, repeating
+ * autoplay steps included) is dropped for good, while later live lines are still pressed - unlike "pause", which
+ * holds both. For an unattended run that autoplays up to a point and then drives a menu by hand. */
+static void pad_script_stop(void)
+{
+    int i, n = 0, dropped;
+    for (i = 0; i < s_script_len; i++)
+        if (s_script[i].live)
+            s_script[n++] = s_script[i];
+    dropped = s_script_len - n;
+    s_script_len = n;
+    fprintf(stderr, "  PAD: script STOPPED (live file): %d script step(s) dropped, live lines go on\n", dropped);
     fflush(stderr);
 }
 
@@ -498,10 +514,20 @@ static void pad_live_poll(unsigned long t)
                     npending = 0;
                     continue;
                 }
+                if (same_word(pending, "stop", 5)) {
+                    pad_script_stop();
+                    npending = 0;
+                    continue;
+                }
                 snprintf(line, sizeof line, "%lu:%s", at, pending);
                 if (s_script_len >= PAD_SCRIPT_MAX - 1)
                     pad_script_compact(t);
-                pad_script_parse(line, 0, NULL, 0);
+                {
+                    int before = s_script_len > 0 ? s_script_len : 0, k;
+                    pad_script_parse(line, 0, NULL, 0);
+                    for (k = before; k < s_script_len; k++)
+                        s_script[k].live = 1;
+                }
                 if (s_script_len > 0)
                     next_free[pd] = at + s_script[s_script_len - 1].hold_ms + 200;
                 fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);

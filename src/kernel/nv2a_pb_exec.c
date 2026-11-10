@@ -107,6 +107,11 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
 static uint32_t dma_resolve(uint32_t offset)
 {
     extern uint32_t xbox_ContiguousAllocatedBytes(void);
+    uint32_t heap_va;
+
+    /* A number the kernel gave out for heap / pool / image memory (XBOX_HEAP_PHYS_BIAS, kernel_memory.c): that VA. */
+    if (xbox_PhysHeapVA(offset, &heap_va))
+        return heap_va;
 
     /* This kernel's arena starts at XBOX_CONTIG_BASE and only grows, so the
      * contiguous allocations are exactly [0, allocated bytes) physical
