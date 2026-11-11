@@ -342,6 +342,17 @@ static SDL_Mutex     *g_lock;
 static int            g_kbd_port = -2;   /* -2 unread, -1 merged on port 0 */
 static unsigned       g_forced;           /* RECOMP_PADS */
 
+/* Pad modes (2026-11-11; maintainer: a handheld docked with an external pad).
+ * XBOX_PADS_MERGE (single-player titles, xbox_InputSetPadMode or RECOMP_PADS_MERGE=1): every host pad is player 1
+ * - their states merged on port 0, as the keyboard already is - so the built-in pad of a handheld, a touch pad and
+ * an external pad all steer the game, whichever was attached first. XBOX_PADS_PER_PORT (default): one port per pad.
+ * The priority callback (xbox_InputSetPadPriority, e.g. Android: built-in and virtual pads low, external high)
+ * sorts the pads onto the ports whenever one comes or goes: higher first, otherwise the order they came in; a
+ * manual xbox_InputSwapPorts holds until the next change. Without a callback the ports behave as before. */
+static int            g_pad_mode = -1;     /* -1 unread: RECOMP_PADS_MERGE, else the title's xbox_InputSetPadMode */
+static int          (*g_pad_prio)(const char *name);
+static unsigned long  g_pad_seq[XBOX_MAX_CONTROLLERS], g_seq_next;
+
 static void read_config(void)
 {
     const char *e;
@@ -351,6 +362,9 @@ static void read_config(void)
     e = getenv("RECOMP_KEYBOARD_PORT");
     if (e && *e >= '0' && *e <= '3')
         g_kbd_port = *e - '0';
+    e = getenv("RECOMP_PADS_MERGE");
+    if (e && (*e == '0' || *e == '1'))
+        g_pad_mode = *e - '0';
     e = getenv("RECOMP_PADS");
     if (e) {
         int n = atoi(e);
@@ -359,10 +373,61 @@ static void read_config(void)
     }
 }
 
+static void lock(void);
+static void unlock(void);
+
+static int pad_prio(int p)
+{
+    const char *n = g_pads[p] ? SDL_GetGamepadName(g_pads[p]) : NULL;
+    return g_pad_prio ? g_pad_prio(n ? n : "") : 0;
+}
+
+static void swap_slots(int a, int b)
+{
+    SDL_Gamepad *c = g_pads[a]; SDL_JoystickID id = g_pad_id[a]; char guid[33]; XboxBindMap own = g_pad_own[a];
+    unsigned long seq = g_pad_seq[a];
+    memcpy(guid, g_pad_guid[a], sizeof guid);
+    g_pads[a] = g_pads[b]; g_pad_id[a] = g_pad_id[b]; memcpy(g_pad_guid[a], g_pad_guid[b], sizeof guid);
+    g_pad_own[a] = g_pad_own[b]; g_pad_seq[a] = g_pad_seq[b];
+    g_pads[b] = c; g_pad_id[b] = id; memcpy(g_pad_guid[b], guid, sizeof guid); g_pad_own[b] = own; g_pad_seq[b] = seq;
+}
+
+/* With a priority callback: the pads onto the free ports (not the keyboard's own) by priority, then arrival. */
+static void sort_pads(void)
+{
+    int ports[XBOX_MAX_CONTROLLERS], n = 0, i, j, p;
+    if (!g_pad_prio)
+        return;
+    for (p = 0; p < XBOX_MAX_CONTROLLERS; p++)
+        if (p != g_kbd_port)
+            ports[n++] = p;
+    for (i = 0; i < n; i++) {               /* selection sort over the usable ports: best pad first */
+        int best = -1;
+        for (j = i; j < n; j++) {
+            int q = ports[j];
+            if (!g_pads[q])
+                continue;
+            if (best < 0 || pad_prio(q) > pad_prio(best) ||
+                (pad_prio(q) == pad_prio(best) && g_pad_seq[q] < g_pad_seq[best]))
+                best = q;
+        }
+        if (best < 0)
+            break;
+        if (best != ports[i])
+            swap_slots(best, ports[i]);
+    }
+    for (p = 0; p < XBOX_MAX_CONTROLLERS; p++)
+        if (g_pads[p])
+            fprintf(stderr, "  INPUT: port %d = \"%s\" (priority %d)\n", p,
+                    SDL_GetGamepadName(g_pads[p]) ? SDL_GetGamepadName(g_pads[p]) : "?", pad_prio(p));
+    fflush(stderr);
+}
+
 /* Open new pads and drop removed ones, at most every 500 ms: a title polls
  * every frame, and enumerating each time would cost more than the read. */
 static void refresh_pads(void)
 {
+    int changed = 0;
     static Uint64 last;
     Uint64 now;
     SDL_JoystickID *ids;
@@ -380,6 +445,7 @@ static void refresh_pads(void)
             SDL_CloseGamepad(g_pads[p]);
             g_pads[p] = NULL;
             g_pad_id[p] = 0;
+            changed = 1;
         }
 
     ids = SDL_GetGamepads(&n);
@@ -399,6 +465,8 @@ static void refresh_pads(void)
         if (g_pads[p]) {
             char env_key[48], store_key[48];
             g_pad_id[p] = ids[i];
+            g_pad_seq[p] = ++g_seq_next;
+            changed = 1;
             SDL_GUIDToString(SDL_GetGamepadGUIDForID(ids[i]), g_pad_guid[p], (int)sizeof g_pad_guid[p]);
             fprintf(stderr, "  INPUT: pad \"%s\" on port %d, GUID %s\n",
                     SDL_GetGamepadName(g_pads[p]) ? SDL_GetGamepadName(g_pads[p]) : "?", p, g_pad_guid[p]);
@@ -409,6 +477,41 @@ static void refresh_pads(void)
         }
     }
     SDL_free(ids);
+    if (changed)
+        sort_pads();
+}
+
+static int pads_merged(void) { return g_pad_mode == XBOX_PADS_MERGE; }
+
+int xbox_InputPadsMerged(void) { read_config(); return pads_merged(); }
+
+void xbox_InputSetPadMode(int mode)
+{
+    read_config();
+    if (getenv("RECOMP_PADS_MERGE"))        /* the environment wins (tests) */
+        return;
+    g_pad_mode = mode;
+    fprintf(stderr, "  INPUT: pad mode %s\n", mode == XBOX_PADS_MERGE ? "merge (every pad is player 1)" : "one port per pad");
+}
+
+void xbox_InputSetPadPriority(int (*prio)(const char *name))
+{
+    xbox_InputInit();
+    lock();
+    g_pad_prio = prio;
+    sort_pads();
+    unlock();
+}
+
+int xbox_InputSwapPorts(int a, int b)
+{
+    if (a < 0 || b < 0 || a >= XBOX_MAX_CONTROLLERS || b >= XBOX_MAX_CONTROLLERS || a == b)
+        return -1;
+    lock();
+    swap_slots(a, b);
+    fprintf(stderr, "  INPUT: ports %d and %d swapped by hand\n", a, b);
+    unlock();
+    return 0;
 }
 
 void xbox_InputInit(void)
@@ -437,7 +540,7 @@ unsigned xbox_InputConnectedMask(void)
     m = g_forced | xbox_InputScriptPorts();
     for (p = 0; p < XBOX_MAX_CONTROLLERS; p++)
         if (g_pads[p])
-            m |= 1u << p;
+            m |= 1u << (pads_merged() ? 0 : p);
     if (keyboard_enabled())
         m |= 1u << (g_kbd_port >= 0 ? g_kbd_port : 0);
     unlock();
@@ -559,6 +662,19 @@ static void input_diag(const XBOX_INPUT_STATE *s, DWORD rc)
     fflush(stderr);
 }
 
+/* XBOX_PADS_MERGE: buttons or-ed, analog buttons the strongest, each stick axis the one furthest from centre */
+static void merge_pad(XBOX_GAMEPAD *to, const XBOX_GAMEPAD *g)
+{
+    int i;
+    to->wButtons |= g->wButtons;
+    for (i = 0; i < 8; i++)
+        if (g->bAnalogButtons[i] > to->bAnalogButtons[i])
+            to->bAnalogButtons[i] = g->bAnalogButtons[i];
+#define MERGE_AXIS(a) if (abs(g->a) > abs(to->a)) to->a = g->a
+    MERGE_AXIS(sThumbLX); MERGE_AXIS(sThumbLY); MERGE_AXIS(sThumbRX); MERGE_AXIS(sThumbRY);
+#undef MERGE_AXIS
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     unsigned mask;
@@ -570,8 +686,18 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     memset(pState, 0, sizeof(*pState));
 
     lock();
-    if (g_pads[dwPort])
+    if (pads_merged()) {
+        int p;
+        for (p = 0; dwPort == 0 && p < XBOX_MAX_CONTROLLERS; p++)
+            if (g_pads[p]) {
+                XBOX_GAMEPAD one;
+                memset(&one, 0, sizeof one);
+                pad_state(g_pads[p], &g_pad_own[p], &one);
+                merge_pad(&pState->Gamepad, &one);
+            }
+    } else if (g_pads[dwPort]) {
         pad_state(g_pads[dwPort], &g_pad_own[dwPort], &pState->Gamepad);
+    }
     unlock();
     if (keyboard_enabled() && (int)dwPort == (g_kbd_port >= 0 ? g_kbd_port : 0))
         keyboard_merge(pState);
@@ -608,7 +734,14 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     lock();
     /* SDL rumble runs for a duration; the title sets the motors again when it
      * changes them, so hold each setting until the next (or 10 s). */
-    if (g_pads[dwPort]) {
+    if (pads_merged()) {                    /* player 1's rumble on every pad */
+        int p;
+        for (p = 0; dwPort == 0 && p < XBOX_MAX_CONTROLLERS; p++)
+            if (g_pads[p]) {
+                SDL_RumbleGamepad(g_pads[p], pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed, 10000);
+                rc = ERROR_SUCCESS;
+            }
+    } else if (g_pads[dwPort]) {
         SDL_RumbleGamepad(g_pads[dwPort], pVibration->wLeftMotorSpeed,
                           pVibration->wRightMotorSpeed, 10000);
         rc = ERROR_SUCCESS;

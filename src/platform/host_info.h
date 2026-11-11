@@ -6,7 +6,9 @@
  *   host: Wine 9.0 (wine-9.0 Proton...) on Linux 6.1.52-valve16; Steam Deck, Gamescope
  *
  * The release name comes from <install root>\tools\release.txt (written by the
- * release launcher when it unpacks its files; "dev build" without it), the
+ * release launcher when it unpacks its files), else <install root>/data/release.txt
+ * (the launcher writes it after a build from a read-only bundle: an AppImage);
+ * "dev build" without either. The
  * commits from the build (cmake/build_info.cmake: the game repo and the
  * toolkit, "-dirty" with uncommitted changes). The host line names Windows
  * with its build, or Wine / Proton with the Unix system under it, plus what

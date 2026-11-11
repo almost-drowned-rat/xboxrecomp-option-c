@@ -43,18 +43,33 @@ target_include_directories(xbox_nv2a_vk PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 # NOTICE). The library itself (MPL-2.0 / GPLv3) is the user's file next to the
 # exe, loaded at run time with SDL_LoadObject -- never linked, built or shipped.
 
-find_package(glslang CONFIG REQUIRED)
-find_package(SDL3 CONFIG REQUIRED)
+if(NOT TARGET glslang::glslang)           # a consumer's own targets (add_subdirectory) win
+    find_package(glslang CONFIG REQUIRED)
+endif()
+if(NOT TARGET SDL3::SDL3)
+    find_package(SDL3 CONFIG REQUIRED)
+endif()
 find_package(Vulkan REQUIRED)
 target_link_libraries(xbox_nv2a_vk PUBLIC
     glslang::glslang glslang::glslang-default-resource-limits
     SDL3::SDL3 Vulkan::Vulkan)
 set(_nv2a_vk_cxx_rt "")
-foreach(_lib IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
-    if(_lib MATCHES "^(c[+][+]|c[+][+]abi|stdc[+][+]|unwind)$")
-        list(APPEND _nv2a_vk_cxx_rt ${_lib})
-    endif()
-endforeach()
+get_target_property(_nv2a_vk_glslang_type glslang::glslang TYPE)
+if(_nv2a_vk_glslang_type STREQUAL "SHARED_LIBRARY")
+    # glslang as a shared library that carries its own C++ runtime (Android: libxr_glslang.so,
+    # tools/android/xr_glslang): nv2a_vk itself is C, so a C consumer needs no C++ runtime at all.
+elseif(XR_LINUX_CXX_STATIC_LIBS)
+    # the Linux release toolchain (cmake/linux-sysroot.cmake): libc++ / libc++abi / libunwind as static archives.
+    # clang's implicit list names only "c++" (with -stdlib=libc++ the driver adds the ABI library itself, which a
+    # C-driver link of a C game never gets), so the toolchain file's own list is taken whole.
+    set(_nv2a_vk_cxx_rt ${XR_LINUX_CXX_STATIC_LIBS})
+else()
+    foreach(_lib IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
+        if(_lib MATCHES "^(c[+][+]|c[+][+]abi|stdc[+][+]|unwind)$")
+            list(APPEND _nv2a_vk_cxx_rt ${_lib})
+        endif()
+    endforeach()
+endif()
 message(STATUS "nv2a_vk: C++ runtime for C consumers: ${_nv2a_vk_cxx_rt}")
 target_link_libraries(xbox_nv2a_vk PUBLIC ${_nv2a_vk_cxx_rt})
 

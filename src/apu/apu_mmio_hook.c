@@ -15,12 +15,11 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
-/* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux the
- * equivalent goes through sigaction + ucontext_t (Stage 2 / main.c). For
- * now the whole body is Windows-only so apu_emu links on Debian. */
-#if defined(_WIN32)
-#include <windows.h>
+/* The MMIO hook is an instruction decoder (x86-64, or arm64 via mmio_decode_a64.h) run from a vectored exception
+ * handler: the system's VEH on
+ * Windows, the compat layer's signal handler on x86-64 Linux (win32_compat.c). Other hosts: no hook. */
 #include "../platform/mmio_decode.h"
+#if defined(MMIO_DECODE_AVAILABLE)
 
 /* APU MMIO base in Xbox VA space */
 #define APU_MMIO_BASE  0xFE800000u
@@ -53,7 +52,7 @@ static void apu_wr(void *dev, uint32_t off, uint64_t val, int size)
 
 static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
 {
-    const uint8_t *ip = (const uint8_t *)ctx->Rip;
+    const uint8_t *ip = (const uint8_t *)(uintptr_t)MMIO_CTX_PC(ctx);
     (void)is_write;
     if (!g_apu_state) return false;
     if (mmio_emulate(ctx, mmio_offset, g_apu_state, apu_rd, apu_wr))
@@ -62,8 +61,8 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
     /* Unrecognized */
     g_apu_mmio_decode_fail++;
     if (g_apu_mmio_decode_fail <= 20) {
-        fprintf(stderr, "[APU] MMIO decode fail at RIP=%p offset=0x%X: %02X %02X %02X %02X %02X %02X\n",
-                (void*)ctx->Rip, mmio_offset, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5]);
+        fprintf(stderr, "[APU] MMIO decode fail at PC=%p offset=0x%X: %02X %02X %02X %02X %02X %02X\n",
+                (void *)(uintptr_t)MMIO_CTX_PC(ctx), mmio_offset, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5]);
         fflush(stderr);
     }
     return false;
@@ -99,4 +98,4 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     return ok;
 }
 
-#endif /* _WIN32 */
+#endif /* MMIO_DECODE_AVAILABLE */

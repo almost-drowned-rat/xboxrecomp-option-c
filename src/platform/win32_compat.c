@@ -37,6 +37,20 @@
 #else
 #include <sys/sysinfo.h>
 #endif
+/* bionic's memfd_create wrapper exists from API 30 (Android 11); before it, the system call (Linux 3.17).
+ * -DXR_COMPAT_MEMFD_SYSCALL forces that path on glibc for tests/compat_bionic. */
+#if defined(__ANDROID__) && defined(__ANDROID_API__) && __ANDROID_API__ < 30 && !defined(XR_COMPAT_MEMFD_SYSCALL)
+#define XR_COMPAT_MEMFD_SYSCALL 1
+#endif
+#if defined(XR_COMPAT_MEMFD_SYSCALL)
+#include <sys/syscall.h>
+#endif
+
+/* bionic (Android) has no pthread_cancel; glibc / musl / Darwin do. A port build can force the bionic path
+ * on glibc with -DXR_COMPAT_NO_PTHREAD_CANCEL (tests/compat_bionic does). */
+#if defined(__ANDROID__) && !defined(XR_COMPAT_NO_PTHREAD_CANCEL)
+#define XR_COMPAT_NO_PTHREAD_CANCEL 1
+#endif
 
 /* ===================================================================== */
 /* Last-error (thread-local)                                             */
@@ -266,6 +280,16 @@ typedef struct w32_object {
     /* event */
     int             signaled;
     int             manual_reset;
+    /* Wakeups that hold even when the event is reset before the woken thread runs (2026-11-11): Windows
+     * releases the waiters AT SetEvent / PulseEvent; testing only `signaled` after the wakeup lost them whenever
+     * another thread reset the event first (D3D resets its vblank event by writing 0, ke_guest_event_prepare
+     * follows that) and made PulseEvent release nobody - Orta's movie stalls of 0.7-3.9 s on Linux / Android:
+     * the main thread and two CRI threads waiting on D3D's vblank event 0x002BD0E4 for 700+ ms while the vblank
+     * DPC kept setting it. ev_gen: a manual-reset set or pulse releases every thread waiting at that moment;
+     * ev_tokens: an auto-reset set / pulse with a waiter releases exactly one, the event itself stays reset. */
+    unsigned        ev_gen;
+    int             ev_tokens;
+    int             ev_waiters;
 
     /* semaphore */
     long            sem_count;
@@ -465,11 +489,18 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
     pthread_mutex_lock(&o->lock);
     DWORD result = WAIT_OBJECT_0;
+    unsigned gen0 = o->ev_gen;
+    int took_token = 0;
+    if (o->kind == K_EVENT) o->ev_waiters++;
 
     for (;;) {
         int ready = 0;
         switch (o->kind) {
-        case K_EVENT:  ready = o->signaled; break;
+        case K_EVENT:
+            if (o->signaled) ready = 1;
+            else if (o->manual_reset && o->ev_gen != gen0) ready = 1;              /* set / pulsed while we waited */
+            else if (!o->manual_reset && o->ev_tokens > 0) { o->ev_tokens--; took_token = 1; ready = 1; }
+            break;
         case K_THREAD: ready = o->exited;   break;
         case K_SEM:    ready = (o->sem_count > 0); break;
         case K_MUTEX:
@@ -497,9 +528,16 @@ static DWORD wait_single(w32_object *o, DWORD ms)
         }
     }
 
+    if (o->kind == K_EVENT) {
+        o->ev_waiters--;
+        if (o->ev_tokens > o->ev_waiters) {      /* a token nobody is left to take (a waiter timed out): keep it as the state */
+            o->ev_tokens = o->ev_waiters;
+            if (!o->manual_reset) o->signaled = 1;
+        }
+    }
     if (result == WAIT_OBJECT_0) {
         switch (o->kind) {
-        case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
+        case K_EVENT: if (!o->manual_reset && !took_token) o->signaled = 0; break;
         case K_WAITABLE_TIMER:
             if (!o->waitable_manual_reset) { o->waitable_triggered = 0; o->waitable_armed = 0; }
             break;
@@ -591,7 +629,14 @@ BOOL SetEvent(HANDLE h)
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
-    o->signaled = 1;
+    if (o->manual_reset) {
+        o->signaled = 1;
+        o->ev_gen++;
+    } else if (!o->signaled && o->ev_waiters > o->ev_tokens) {
+        o->ev_tokens++;                          /* one waiter released now; the event stays reset */
+    } else {
+        o->signaled = 1;
+    }
     pthread_cond_broadcast(&o->cond);
     pthread_mutex_unlock(&o->lock);
     return TRUE;
@@ -612,9 +657,12 @@ BOOL PulseEvent(HANDLE h)
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
-    o->signaled = 1;
-    pthread_cond_broadcast(&o->cond);
+    if (o->manual_reset)
+        o->ev_gen++;                             /* every thread waiting now is released */
+    else if (o->ev_waiters > o->ev_tokens)
+        o->ev_tokens++;                          /* one waiting thread is released */
     o->signaled = 0;
+    pthread_cond_broadcast(&o->cond);
     pthread_mutex_unlock(&o->lock);
     return TRUE;
 }
@@ -693,11 +741,14 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+static void w32_thread_signal_setup(void);   /* the exception-handler section below */
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+    w32_thread_signal_setup();      /* alternate signal stack: a stack overflow still reaches the handlers */
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -786,24 +837,52 @@ DWORD ResumeThread(HANDLE h)
     return prev;
 }
 
+/* Suspension without stopping a thread from outside (POSIX has no such call): a thread that suspends itself
+ * blocks right here until ResumeThread; a thread suspended by another stops at its next suspension point
+ * (w32_suspend_point - the kernel calls it where the console would deliver the suspend APC). Before
+ * 2026-11-11 the count was only kept and the thread ran on: CRI's movie player (Panzer Dragoon Orta's .sfd
+ * movies) suspends and resumes its server threads all the time - 8 million suspends in a CachyOS run - and
+ * its movies dropped to 30-46 fps on Linux and Android only, with frame hitches up to 1.4 s. */
 DWORD SuspendThread(HANDLE h)
 {
-    /* True mid-run suspension is not supported on POSIX; only the
-     * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
-    w32_object *o = (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     o->suspend_count++;
+    if (o == t_self_obj)
+        while (o->suspend_count > 0 && !o->exited)
+            pthread_cond_wait(&o->gate, &o->lock);
     pthread_mutex_unlock(&o->lock);
     return prev;
+}
+
+void w32_suspend_point(void)
+{
+    w32_object *o = t_self_obj;
+    if (!o || !__atomic_load_n(&o->suspend_count, __ATOMIC_ACQUIRE))
+        return;
+    pthread_mutex_lock(&o->lock);
+    while (o->suspend_count > 0)
+        pthread_cond_wait(&o->gate, &o->lock);
+    pthread_mutex_unlock(&o->lock);
 }
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_THREAD) return FALSE;
+#if defined(XR_COMPAT_NO_PTHREAD_CANCEL)
+    /* No way to stop another thread here: say so instead of reporting a thread as ended that still runs (a
+     * waiter would go on while it touches shared state). Nothing in the toolkit calls this; a port that does
+     * must let the thread end itself on Android. */
+    (void)exitCode;
+    fprintf(stderr, "[COMPAT] TerminateThread: not available on this C library (no pthread_cancel)\n");
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return FALSE;
+#else
     pthread_cancel(o->thread);
+#endif
     pthread_mutex_lock(&o->lock);
     o->exit_code = exitCode;
     o->exited    = 1;
@@ -1413,6 +1492,11 @@ VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
 #if defined(__APPLE__)
     memset_s(ptr, cnt, 0, cnt);
+#elif defined(__ANDROID__)
+    /* bionic has no explicit_bzero: a volatile store loop the compiler cannot drop. */
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    while (cnt--)
+        *p++ = 0;
 #else
     explicit_bzero(ptr, cnt);
 #endif
@@ -1706,6 +1790,8 @@ static int anon_map_fd(const char *name)
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
+#elif defined(XR_COMPAT_MEMFD_SYSCALL)
+    return (int)syscall(__NR_memfd_create, name ? name : "xbox_map", 0);
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif
@@ -2054,8 +2140,280 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
     /* TODO: on Windows this does not return; SEH dispatch unimplemented. */
 }
 
+/* ===================================================================== */
+/* Vectored exception handlers on signals (x86-64 / arm64 Linux, Android) */
+/* ===================================================================== */
+/*
+ * Device registers that need semantics are guest pages made inaccessible; the access faults, a vectored handler
+ * decodes the instruction, services it against the device model and steps over it (platform/mmio_decode.h - the
+ * pads' USB host controller, the APU, the AC97 write trap, the guest null guard). On Windows that is the system's
+ * VEH chain. Here one sigaction handler for SIGSEGV / SIGBUS / SIGILL / SIGFPE / SIGTRAP stands in for it:
+ *   - it builds the EXCEPTION_RECORD (access violation: [0] = 1 for a write, from the page-fault error code;
+ *     [1] = the address) and a CONTEXT from the ucontext's general registers, Rip and EFlags;
+ *   - it calls the registered handlers in order (FirstHandler != 0 puts one at the front, as on Windows);
+ *   - EXCEPTION_CONTINUE_EXECUTION writes the CONTEXT back and resumes; nobody claiming it chains to the action that
+ *     was installed before (SDL, a sanitizer), or restores the default so the fault ends the process as it would
+ *     have without us.
+ * Every thread the compat layer creates gets an alternate signal stack (and the thread that registers the first
+ * handler), so a stack overflow still reaches the crash report. gdb stops on every trapped access unless told
+ * "handle SIGSEGV nostop noprint pass" (also SIGTRAP for the single-step traps).
+ * The list is changed under a mutex, read by the signal handler without one: entries are published by a release
+ * store of the count, and a removed entry is cleared, never compacted under a running handler.
+ * arm64 (Android / arm64 Linux, 2026-11-11): the CONTEXT holds X0-X30, Sp, Pc, Cpsr (xbox_winnt.h) plus the fault
+ * address; an access violation's write flag comes from the ESR record in the signal frame (WnR bit; no record ->
+ * read). The MMIO handlers decode the faulting load/store with mmio_decode_a64.h through mmio_decode.h.
+ */
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
+#include <ucontext.h>
+#if defined(__aarch64__)
+#include "mmio_decode_a64.h"   /* mmio_a64_find_esr / mmio_a64_syndrome */
+#endif
+
+#define VEH_MAX 16
+static PVECTORED_EXCEPTION_HANDLER volatile s_veh[VEH_MAX];
+static volatile int s_veh_n;
+static pthread_mutex_t s_veh_lock = PTHREAD_MUTEX_INITIALIZER;
+static const int s_veh_sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP };
+#define VEH_NSIGS ((int)(sizeof s_veh_sigs / sizeof s_veh_sigs[0]))
+static struct sigaction s_veh_old[VEH_NSIGS];
+static int s_veh_installed;
+
+#if defined(__aarch64__)
+/* CONTEXT <-> the arm64 signal frame (mcontext = the kernel's struct sigcontext on glibc and bionic). */
+static void veh_ctx_from(CONTEXT *c, const ucontext_t *uc, const siginfo_t *si, DWORD code)
+{
+    int i;
+    for (i = 0; i < 31; i++)
+        c->X[i] = (uint64_t)uc->uc_mcontext.regs[i];
+    c->Sp = (uint64_t)uc->uc_mcontext.sp;
+    c->Pc = (uint64_t)uc->uc_mcontext.pc;
+    c->Cpsr = (uint32_t)uc->uc_mcontext.pstate;
+    c->ContextFlags = 0;
+    c->XrFaultAddress = code == EXCEPTION_ACCESS_VIOLATION ? (uint64_t)(uintptr_t)si->si_addr : 0;
+}
+
+static void veh_ctx_to(ucontext_t *uc, const CONTEXT *c)
+{
+    int i;
+    for (i = 0; i < 31; i++)
+        uc->uc_mcontext.regs[i] = c->X[i];
+    uc->uc_mcontext.sp = c->Sp;
+    uc->uc_mcontext.pc = c->Pc;
+    uc->uc_mcontext.pstate = (uc->uc_mcontext.pstate & ~0xFFFFFFFFull) | c->Cpsr;
+}
+
+static uint64_t veh_pc(const ucontext_t *uc) { return (uint64_t)uc->uc_mcontext.pc; }
+
+/* Write flag of a data abort: ESR WnR from the frame's ESR record (a real kernel); without one (qemu-user 8.2)
+ * from the faulting instruction itself. */
+static int veh_is_write(const ucontext_t *uc)
+{
+    uint64_t esr;
+    uint32_t insn;
+    if (mmio_a64_find_esr(uc->uc_mcontext.__reserved, sizeof uc->uc_mcontext.__reserved, &esr))
+        return mmio_a64_syndrome(esr).write;
+    memcpy(&insn, (const void *)(uintptr_t)uc->uc_mcontext.pc, 4);
+    return mmio_a64_insn_writes(insn);
+}
+#else
+/* ModRM-free mapping: CONTEXT field <-> gregs index. */
+static void veh_ctx_from_gregs(CONTEXT *c, const greg_t *g)
+{
+    c->Rax = (uint64_t)g[REG_RAX]; c->Rcx = (uint64_t)g[REG_RCX]; c->Rdx = (uint64_t)g[REG_RDX];
+    c->Rbx = (uint64_t)g[REG_RBX]; c->Rsp = (uint64_t)g[REG_RSP]; c->Rbp = (uint64_t)g[REG_RBP];
+    c->Rsi = (uint64_t)g[REG_RSI]; c->Rdi = (uint64_t)g[REG_RDI];
+    c->R8  = (uint64_t)g[REG_R8];  c->R9  = (uint64_t)g[REG_R9];  c->R10 = (uint64_t)g[REG_R10];
+    c->R11 = (uint64_t)g[REG_R11]; c->R12 = (uint64_t)g[REG_R12]; c->R13 = (uint64_t)g[REG_R13];
+    c->R14 = (uint64_t)g[REG_R14]; c->R15 = (uint64_t)g[REG_R15];
+    c->Rip = (uint64_t)g[REG_RIP]; c->EFlags = (uint32_t)g[REG_EFL]; c->ContextFlags = 0;
+}
+
+static void veh_ctx_to_gregs(greg_t *g, const CONTEXT *c)
+{
+    g[REG_RAX] = (greg_t)c->Rax; g[REG_RCX] = (greg_t)c->Rcx; g[REG_RDX] = (greg_t)c->Rdx;
+    g[REG_RBX] = (greg_t)c->Rbx; g[REG_RSP] = (greg_t)c->Rsp; g[REG_RBP] = (greg_t)c->Rbp;
+    g[REG_RSI] = (greg_t)c->Rsi; g[REG_RDI] = (greg_t)c->Rdi;
+    g[REG_R8]  = (greg_t)c->R8;  g[REG_R9]  = (greg_t)c->R9;  g[REG_R10] = (greg_t)c->R10;
+    g[REG_R11] = (greg_t)c->R11; g[REG_R12] = (greg_t)c->R12; g[REG_R13] = (greg_t)c->R13;
+    g[REG_R14] = (greg_t)c->R14; g[REG_R15] = (greg_t)c->R15;
+    g[REG_RIP] = (greg_t)c->Rip;
+    g[REG_EFL] = (greg_t)(((uint64_t)g[REG_EFL] & ~0xFFFFFFFFull) | c->EFlags);
+}
+
+static void veh_ctx_from(CONTEXT *c, const ucontext_t *uc, const siginfo_t *si, DWORD code)
+{
+    (void)si; (void)code;
+    veh_ctx_from_gregs(c, uc->uc_mcontext.gregs);
+}
+
+static void veh_ctx_to(ucontext_t *uc, const CONTEXT *c) { veh_ctx_to_gregs(uc->uc_mcontext.gregs, c); }
+
+static uint64_t veh_pc(const ucontext_t *uc) { return (uint64_t)uc->uc_mcontext.gregs[REG_RIP]; }
+
+/* Write flag of a page fault: the W bit of the error code. */
+static int veh_is_write(const ucontext_t *uc) { return (uc->uc_mcontext.gregs[REG_ERR] & 2) ? 1 : 0; }
+#endif
+
+static DWORD veh_code(int sig, const siginfo_t *si)
+{
+    switch (sig) {
+    case SIGSEGV: case SIGBUS: return EXCEPTION_ACCESS_VIOLATION;
+    case SIGILL:               return EXCEPTION_ILLEGAL_INSTRUCTION;
+    case SIGTRAP:              return EXCEPTION_SINGLE_STEP;
+    case SIGFPE:
+        switch (si->si_code) {
+        case FPE_INTDIV: return EXCEPTION_INT_DIVIDE_BY_ZERO;
+        case FPE_FLTDIV: return EXCEPTION_FLT_DIVIDE_BY_ZERO;
+        case FPE_FLTOVF: return EXCEPTION_FLT_OVERFLOW;
+        case FPE_FLTUND: return EXCEPTION_FLT_UNDERFLOW;
+        case FPE_FLTRES: return EXCEPTION_FLT_INEXACT_RESULT;
+        default:         return EXCEPTION_FLT_INVALID_OPERATION;
+        }
+    }
+    return 0;
+}
+
+static void veh_chain(int sig, siginfo_t *si, void *uc)
+{
+    int i;
+    for (i = 0; i < VEH_NSIGS; i++)
+        if (s_veh_sigs[i] == sig)
+            break;
+    if (i < VEH_NSIGS && (s_veh_old[i].sa_flags & SA_SIGINFO) && s_veh_old[i].sa_sigaction) {
+        s_veh_old[i].sa_sigaction(sig, si, uc);
+        return;
+    }
+    if (i < VEH_NSIGS && s_veh_old[i].sa_handler != SIG_DFL && s_veh_old[i].sa_handler != SIG_IGN
+            && s_veh_old[i].sa_handler) {
+        s_veh_old[i].sa_handler(sig);
+        return;
+    }
+    /* Default action: return with it restored; the instruction faults again and ends the process. A SIGTRAP or
+     * SIGFPE raised by kill() would not repeat, so those are re-raised. */
+    signal(sig, SIG_DFL);
+    if (si->si_code <= 0)
+        raise(sig);
+}
+
+static void veh_signal(int sig, siginfo_t *si, void *ucv)
+{
+    ucontext_t *uc = (ucontext_t *)ucv;
+    EXCEPTION_RECORD rec;
+    CONTEXT ctx;
+    EXCEPTION_POINTERS ep;
+    int i, n = __atomic_load_n(&s_veh_n, __ATOMIC_ACQUIRE);
+    int saved_errno = errno;
+
+    memset(&rec, 0, sizeof rec);
+    rec.ExceptionCode = veh_code(sig, si);
+    rec.ExceptionAddress = (PVOID)(uintptr_t)veh_pc(uc);
+    if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        rec.NumberParameters = 2;
+        rec.ExceptionInformation[0] = (ULONG_PTR)veh_is_write(uc);
+        rec.ExceptionInformation[1] = (ULONG_PTR)si->si_addr;
+    }
+    veh_ctx_from(&ctx, uc, si, rec.ExceptionCode);
+    ep.ExceptionRecord = &rec;
+    ep.ContextRecord = &ctx;
+    for (i = 0; i < n; i++) {
+        PVECTORED_EXCEPTION_HANDLER h = s_veh[i];
+        if (h && h(&ep) == EXCEPTION_CONTINUE_EXECUTION) {
+            veh_ctx_to(uc, &ctx);
+            errno = saved_errno;
+            return;
+        }
+    }
+    errno = saved_errno;
+    veh_chain(sig, si, ucv);
+}
+
+/* This thread's alternate signal stack (64 KB), once. */
+static void veh_altstack(void)
+{
+    static __thread int done;
+    stack_t ss;
+    if (done)
+        return;
+    done = 1;
+    if (sigaltstack(NULL, &ss) == 0 && !(ss.ss_flags & SS_DISABLE) && ss.ss_sp)
+        return;                                 /* the thread has one already (SDL, the runtime) */
+    ss.ss_size = 64 * 1024;
+    ss.ss_sp = malloc(ss.ss_size);
+    ss.ss_flags = 0;
+    if (ss.ss_sp && sigaltstack(&ss, NULL) != 0) {
+        free(ss.ss_sp);
+        done = 0;
+    }
+}
+
+static void veh_install(void)
+{
+    struct sigaction sa;
+    int i;
+    if (s_veh_installed)
+        return;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = veh_signal;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    for (i = 0; i < VEH_NSIGS; i++)
+        sigaction(s_veh_sigs[i], &sa, &s_veh_old[i]);
+    s_veh_installed = 1;
+}
+
 PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
-{ (void)First; (void)Handler; return NULL; }   /* TODO: wire to sigaction */
+{
+    PVOID ret = NULL;
+    int i, n;
+    if (!Handler)
+        return NULL;
+    veh_altstack();
+    pthread_mutex_lock(&s_veh_lock);
+    n = s_veh_n;
+    for (i = 0; i < n; i++)                     /* a cleared slot is reused in place */
+        if (!s_veh[i])
+            break;
+    if (i < VEH_MAX) {
+        if (First && i > 0) {                   /* to the front: shift the others up one */
+            int j;
+            if (i == n)
+                __atomic_store_n(&s_veh_n, n + 1, __ATOMIC_RELEASE);   /* the new last slot is NULL until filled */
+            for (j = i; j > 0; j--)
+                s_veh[j] = s_veh[j - 1];
+            s_veh[0] = Handler;
+        } else {
+            s_veh[i] = Handler;
+            if (i == n)
+                __atomic_store_n(&s_veh_n, n + 1, __ATOMIC_RELEASE);
+        }
+        veh_install();
+        ret = (PVOID)Handler;
+    }
+    pthread_mutex_unlock(&s_veh_lock);
+    return ret;
+}
+
+ULONG RemoveVectoredExceptionHandler(PVOID h)
+{
+    int i, found = 0;
+    pthread_mutex_lock(&s_veh_lock);
+    for (i = 0; i < s_veh_n; i++)
+        if ((PVOID)s_veh[i] == h) {
+            s_veh[i] = NULL;
+            found = 1;
+            break;
+        }
+    pthread_mutex_unlock(&s_veh_lock);
+    return (ULONG)found;
+}
+
+/* For the compat threads: each gets its alternate stack as it starts. */
+static void w32_thread_signal_setup(void) { veh_altstack(); }
+#else
+PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
+{ (void)First; (void)Handler; return NULL; }   /* no MMIO trap on this host (decoders: x86-64, arm64) */
 ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
+static void w32_thread_signal_setup(void) {}
+#endif
 
 #endif /* !_WIN32 */

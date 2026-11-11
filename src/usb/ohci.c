@@ -1503,10 +1503,11 @@ void xbox_OhciInit(void)
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
 
-#if defined(_WIN32)
+#if defined(MMIO_DECODE_AVAILABLE)
     /* The registers have to fault to be answered. The MCPX aperture is mapped
      * as plain committed memory, so both blocks are made inaccessible here and
-     * the title's VEH routes the faults back to xbox_OhciHandleMmio.
+     * the title's VEH routes the faults back to xbox_OhciHandleMmio (on Linux
+     * the compat layer's signal handler runs the same VEH list).
      *
      * A failed protect switches the model off rather than leaving it half on:
      * a controller whose registers read as zero out of RAM is exactly the
@@ -1539,13 +1540,11 @@ void xbox_OhciInit(void)
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
     fflush(stderr);
 
-#if defined(_WIN32)
-    {
+    {   /* every host (it was Windows only: on Linux no frame ever ran and no pad report arrived) */
         HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
         if (th)
             CloseHandle(th);
     }
-#endif
 }
 
 static OhciController *hc_for(uint32_t va)
@@ -1567,7 +1566,7 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
 
 int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
 {
-#if defined(_WIN32)
+#if defined(MMIO_DECODE_AVAILABLE)
     OhciController *hc = hc_for(xbox_va);
     int ok;
 
@@ -1576,7 +1575,7 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
     ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
                       ohci_read, ohci_write);
     if (!ok && hc->decode_fail++ < 20) {
-        const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
+        const uint8_t *ip = (const uint8_t *)(uintptr_t)MMIO_CTX_PC((PCONTEXT)ctx);
         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: "
                         "%02X %02X %02X %02X %02X %02X\n",
                 hc->index, xbox_va - hc->base,

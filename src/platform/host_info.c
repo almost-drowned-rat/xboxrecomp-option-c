@@ -15,7 +15,8 @@
 #include <sys/utsname.h>
 #endif
 
-/* the first line of <parent of game_dir>/tools/release.txt, or "" */
+/* the first line of <parent of game_dir>/tools/release.txt (the payload unpacked there: Windows), else of
+ * <parent>/data/release.txt (written by the launcher when its tools are a read-only bundle: an AppImage), or "" */
 static void release_name(const char *game_dir, char *out, size_t n)
 {
     char path[1100];
@@ -28,6 +29,10 @@ static void release_name(const char *game_dir, char *out, size_t n)
         len--;
     snprintf(path, sizeof path, "%.*stools/release.txt", (int)len, len ? game_dir : "");
     f = fopen(path, "rb");
+    if (!f) {
+        snprintf(path, sizeof path, "%.*sdata/release.txt", (int)len, len ? game_dir : "");
+        f = fopen(path, "rb");
+    }
     if (!f)
         return;
     if (fgets(out, (int)n, f)) {
@@ -41,8 +46,16 @@ static void release_name(const char *game_dir, char *out, size_t n)
 void host_version_text(const char *game_dir, char *buf, size_t n)
 {
     char rel[64];
+    const char *game = XR_GAME_COMMIT;
+#ifdef __ANDROID__
+    /* this library is prebuilt in the runtime SDK (tools/android/make_runtime_sdk.ps1): XR_GAME_COMMIT is the
+     * SDK's, not the game's, which is built on the device later - the app names the game's commit instead */
+    const char *g = getenv("XR_GAME_COMMIT");
+    if (g && *g)
+        game = g;
+#endif
     release_name(game_dir, rel, sizeof rel);
-    snprintf(buf, n, "%s (game %s, toolkit %s)", rel[0] ? rel : "dev build", XR_GAME_COMMIT, XR_TOOLKIT_COMMIT);
+    snprintf(buf, n, "%s (game %s, toolkit %s)", rel[0] ? rel : "dev build", game, XR_TOOLKIT_COMMIT);
 }
 
 /* what the environment says about the machine around a Wine / Linux process */

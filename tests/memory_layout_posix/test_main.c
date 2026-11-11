@@ -298,6 +298,61 @@ int main(int argc, char **argv)
         }
     }
 
+    /*
+     * 6. 128 MB of guest RAM (Panzer Dragoon Orta's devkit layout): RAM mirror 16 lands on the contiguous
+     * window. POSIX's VirtualFree used to unmap the window there and the mirror took its place, so the
+     * tiled aperture (a view of the window) no longer aliased it: the GPU sampled empty textures on Linux.
+     * A write through the tiled aperture must read back through the window, and the window must not be RAM.
+     */
+    {
+        BOOL big;
+        xbox_SetTotalRam((size_t)128 << 20);
+        big = xbox_MemoryLayoutInit(xbe, n);
+        check(big, "init succeeds with 128 MB of guest RAM", NULL);
+        if (big) {
+            unsigned char *b = (unsigned char *)xbox_GetMemoryBase();
+            volatile uint32_t *tiled = (volatile uint32_t *)(b + 0xF0000000u + 0x1000);
+            volatile uint32_t *contig = (volatile uint32_t *)(b + 0x80000000u + 0x1000);
+            volatile uint32_t *ram = (volatile uint32_t *)(b + 0x1000);
+            uint32_t ram_saved = *ram;
+            *tiled = 0xA5C30F17u;
+            check(*contig == 0xA5C30F17u, "128 MB: tiled aperture aliases the contiguous window",
+                  "a RAM mirror replaced the contiguous window");
+            *contig = 0x0BADF00Du;
+            check(*ram != 0x0BADF00Du, "128 MB: the contiguous window is not a RAM mirror",
+                  "a write to 0x80001000 reached guest RAM 0x1000");
+            *ram = ram_saved;
+            xbox_MemoryLayoutShutdown();
+        }
+        xbox_SetTotalRam((size_t)64 << 20);
+    }
+
+    /*
+     * 7. The AC97 bus-master write trap (RECOMP_AC97_READY): a channel reset (RR, bit 1 of a channel's control
+     * byte) completes on the write, the other bits stay. x86 steps the write with the trap flag; arm64 emulates
+     * it with the AArch64 decoder (Orta on Android hung black in DirectSoundCreate without it, 2026-11-11).
+     * Last, because the trap stays armed for the rest of the process.
+     */
+    {
+        BOOL armed;
+        setenv("RECOMP_AC97_READY", "1", 1);
+        armed = xbox_MemoryLayoutInit(xbe, n);
+        check(armed, "init succeeds with RECOMP_AC97_READY", NULL);
+        if (armed) {
+            unsigned char *b = (unsigned char *)xbox_GetMemoryBase();
+            volatile uint8_t *ctl = (volatile uint8_t *)(b + 0xFEC0011Bu);   /* PCM out control, NABM +0x11B */
+            volatile uint32_t *ctl_dw = (volatile uint32_t *)(b + 0xFEC00128u); /* channel +0x120, byte 3 = ctl */
+            *ctl = 0x03;                                    /* RR + RPBM */
+            check(*ctl == 0x01, "AC97: a byte write's channel reset completes",
+                  "RR still set: DirectSound would spin");
+            *ctl_dw = 0x02000000u | 0x00001234u;            /* RR in the control byte of a dword write */
+            check(*ctl_dw == 0x00001234u, "AC97: a dword write's channel reset completes",
+                  "RR still set, or the other bytes lost");
+            xbox_MemoryLayoutShutdown();
+        }
+        unsetenv("RECOMP_AC97_READY");
+    }
+
     printf("\n%d failure(s)\n", failures);
     free(xbe);
     return failures ? 1 : 0;

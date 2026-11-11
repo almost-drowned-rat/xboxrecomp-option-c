@@ -191,6 +191,13 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         ms = (DWORD)(diff / 10000);
     }
 
+    if (ms >= 200) {                    /* a long sleep is rare: say how it was asked for (20 lines a run) */
+        static volatile LONG told;
+        if (InterlockedIncrement(&told) <= 20)
+            fprintf(stderr, "  [KERNEL] KeDelayExecutionThread: %lu ms (interval %lld, %s, alertable %d)\n",
+                    (unsigned long)ms, (long long)Interval->QuadPart,
+                    Interval->QuadPart < 0 ? "relative" : "absolute", (int)Alertable);
+    }
     {
         long long t0 = xbox_ft_on() ? xbox_ft_now() : 0;   /* the renderer's [hitch] lines */
         DWORD result = WAIT_OBJECT_0;
@@ -289,6 +296,11 @@ NTSTATUS __stdcall xbox_KeAlertThread(PVOID Thread, KPROCESSOR_MODE AlertMode)
 
     (void)AlertMode;
 
+    {
+        static volatile LONG told;
+        if (InterlockedIncrement(&told) <= 5)
+            fprintf(stderr, "  [KERNEL] KeAlertThread: thread %p (wakes an alertable wait)\n", hThread);
+    }
     if (!QueueUserAPC(xbox_alert_apc, hThread, 0)) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_THREAD,
             "KeAlertThread: QueueUserAPC failed (error %u)", GetLastError());

@@ -11,6 +11,8 @@ project(platform C)
 #                    Windows gdi32 D3DKMT, other hosts: not available yet)
 #   host_info.*    - the log's "version:" and "host:" lines (release name,
 #                    game + toolkit commits, Windows / Wine / Steam Deck)
+#   host_paths.*   - the writable install root (exe folder, or the folder of
+#                    the .AppImage) and the file a restart executes
 #
 # On Windows the real <windows.h> is used, so the library carries host_wait
 # and the src/ include path. On Linux it also carries the POSIX primitive
@@ -28,10 +30,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
 if(WIN32)
-    add_library(platform STATIC host_wait.c host_info.c host_vblank.c)
+    add_library(platform STATIC host_wait.c host_info.c host_vblank.c host_paths.c host_stack_dump.c)
     target_include_directories(platform PUBLIC ${XBOXRECOMP_SRC_DIR})
 else()
-    add_library(platform STATIC win32_compat.c host_wait.c host_info.c host_vblank.c)
+    add_library(platform STATIC win32_compat.c host_wait.c host_info.c host_vblank.c host_paths.c host_stack_dump.c)
     target_include_directories(platform PUBLIC
         ${XBOXRECOMP_SRC_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -46,9 +48,12 @@ endif()
 # host_info.c's commits: regenerated at every build (the header changes only
 # after a commit). CMAKE_SOURCE_DIR = the consuming game's repo when a port
 # pulls the toolkit in with add_subdirectory(), the toolkit itself otherwise.
+# A tree without .git: -DXR_GAME_COMMIT=<sha> / -DXR_TOOLKIT_COMMIT=<sha> at
+# configure name the commits instead of "unknown" (never over a real git answer).
 set(XR_BUILD_INFO_H "${CMAKE_CURRENT_BINARY_DIR}/generated/xr_build_info.h")
 add_custom_target(xr_build_info
     COMMAND ${CMAKE_COMMAND} -DGAME_DIR=${CMAKE_SOURCE_DIR} -DTOOLKIT_DIR=${XBOXRECOMP_SRC_DIR}/..
+            -DGAME_OVERRIDE=${XR_GAME_COMMIT} -DTOOLKIT_OVERRIDE=${XR_TOOLKIT_COMMIT}
             -DOUT=${XR_BUILD_INFO_H} -P ${XBOXRECOMP_SRC_DIR}/../cmake/build_info.cmake
     BYPRODUCTS ${XR_BUILD_INFO_H}
     COMMENT "build info (game / toolkit commits)"

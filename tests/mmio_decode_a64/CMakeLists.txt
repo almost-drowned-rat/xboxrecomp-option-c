@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.20)
+project(mmio_decode_a64_test C)
+set(CMAKE_C_STANDARD 11)
+# Header only (src/platform/mmio_decode_a64.h): no runtime, runs on any host.
+add_executable(mmio_decode_a64_test test_main.c)
+target_include_directories(mmio_decode_a64_test PRIVATE ../../src)
+if(NOT MSVC)
+    target_compile_options(mmio_decode_a64_test PRIVATE -Wall -Wextra)
+endif()
+enable_testing()
+add_test(NAME mmio_decode_a64_test COMMAND mmio_decode_a64_test)

@@ -1,0 +1,7 @@
+/* libxr_glslang.so: only glslang's C interface (glslang_c_interface.h, resource_limits_c.h) is exported. */
+{
+    global:
+        glslang_*;
+    local:
+        *;
+};

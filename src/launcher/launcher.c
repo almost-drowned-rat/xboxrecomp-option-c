@@ -3,7 +3,7 @@
 #include "launcher.h"
 
 #include "game_setup_ui.h"
-#include "http_get.h"
+#include "platform/host_paths.h"
 #include "sha256.h"
 #include "zip_read.h"
 
@@ -14,6 +14,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __ANDROID__
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #define LP 1024
 #define MAX_ARGS 256
 #define TRAILER_MAGIC "XRPAYLD1"
@@ -23,9 +30,17 @@ extern void xbox_set_window_icon(const void *bmp, size_t n);   /* kernel.h (wind
 
 typedef struct {
     const XrLauncherConfig *cfg;
+    /* root = the WRITABLE install folder (xbox_host_root: the exe's folder, or the folder of the .AppImage);
+     * tools = RES, the launcher's files: root/tools unpacked from the payload (Windows), or - bundled - a
+     * read-only folder that already holds them (AppImage: <exe>/../share/<slug>/tools, marked by release.txt) */
     char root[LP], tools[LP], game[LP], data[LP], build[LP], gen[LP], pipe[LP], obj[LP];
-    char exe[LP];                       /* this exe */
-    char release[33];                   /* the payload's release (the trailer) */
+    char exe[LP];                       /* this exe (the payload trailer) */
+    char game_exe[256];                 /* cfg->game_exe, without ".exe" off Windows */
+    char release[33];                   /* the payload's release (the trailer, or a bundled release.txt) */
+    int bundled;                        /* tools is a read-only, ready folder: no payload, no unpacking */
+    char clang[LP], python[LP], rc[LP]; /* toolchain.txt: absolute; rc empty = no resource compiler */
+    char ld[LP];                        /* toolchain.txt: the linker, empty = clang links */
+    char out[LP];                       /* the game: root/game_exe ({OUT}) */
     XrSetupUi *ui;
     SDL_Mutex *log_mx;
     SDL_IOStream *log;
@@ -112,7 +127,7 @@ static SDL_EnumerationResult SDLCALL rm_cb(void *u, const char *dir, const char 
 }
 
 /* removes p and everything below it - only ever on the launcher's own folders
- * (data/build, tools/download/unpack); links are removed, never followed */
+ * (data/build, tools/bundle/unpack); links are removed, never followed */
 static int rm_tree(const char *p)
 {
     SDL_PathInfo pi;
@@ -124,6 +139,14 @@ static int rm_tree(const char *p)
     return SDL_RemovePath(p) && c.ok;
 }
 
+/* the app's native library folder (Android: nativeLibraryDir, the only place programs may be executed from),
+ * named by the app's loader in XR_NATIVE_DIR; "" elsewhere */
+static const char *native_dir(void)
+{
+    const char *d = SDL_getenv("XR_NATIVE_DIR");
+    return d ? d : "";
+}
+
 /* "{TOOLS}/x" with the placeholders filled in */
 static void expand(L *l, const char *in, char *out, size_t n, const char *xbe)
 {
@@ -132,6 +155,8 @@ static void expand(L *l, const char *in, char *out, size_t n, const char *xbe)
         const char *v = NULL;
         size_t skip = 0;
         if (!strncmp(in, "{TOOLS}", 7)) v = l->tools, skip = 7;
+        else if (!strncmp(in, "{NATIVE}", 8)) v = native_dir(), skip = 8;
+        else if (!strncmp(in, "{OUT}", 5)) v = l->out, skip = 5;
         else if (!strncmp(in, "{ROOT}", 6)) v = l->root, skip = 6;
         else if (!strncmp(in, "{GEN}", 5)) v = l->gen, skip = 5;
         else if (!strncmp(in, "{PIPE}", 6)) v = l->pipe, skip = 6;
@@ -173,6 +198,52 @@ static int split_tabs(char *line, char **argv, int max)
 
 /* runs argv in cwd, stdout + stderr appended to log_path (NULL: dropped);
  * returns the exit code, -1 when it could not start */
+#ifdef __ANDROID__
+/* SDL3 has no process support on Android (SDL_PROCESS_DUMMY). fork + execv; the child only calls
+ * async-signal-safe functions (the parent has threads). posix_spawn cannot set the working folder before
+ * API 34. The environment is inherited (the loader's LD_LIBRARY_PATH / PYTHONHOME reach clang and python). */
+static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
+{
+    int fd = -1, nul = open("/dev/null", O_RDWR | O_CLOEXEC), st = 0, code = -1;
+    pid_t pid;
+    if (log_path && (fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644)) < 0)
+        lg(l, "cannot open %s: %s", log_path, strerror(errno));
+    pid = fork();
+    if (pid == 0) {
+        int o = fd >= 0 ? fd : nul;
+        if (nul >= 0)
+            dup2(nul, 0);
+        if (o >= 0) {
+            dup2(o, 1);
+            dup2(o, 2);
+        }
+        if (cwd && chdir(cwd) != 0)
+            _exit(126);
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    if (pid < 0) {
+        lg(l, "cannot start %s: fork: %s", argv[0], strerror(errno));
+    } else {
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+            ;
+        if (WIFEXITED(st)) {
+            code = WEXITSTATUS(st);
+            if (code == 127 || code == 126)
+                lg(l, "%s: exit %d (%s)", argv[0], code,
+                   code == 127 ? "could not be executed - not in the native library folder?"
+                               : "working folder missing");
+        } else if (WIFSIGNALED(st)) {
+            lg(l, "%s: killed by signal %d", argv[0], WTERMSIG(st));
+        }
+    }
+    if (fd >= 0)
+        close(fd);
+    if (nul >= 0)
+        close(nul);
+    return code;
+}
+#else
 static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
 {
     SDL_PropertiesID p = SDL_CreateProperties();
@@ -204,6 +275,7 @@ static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
         SDL_CloseIO(out);
     return code;
 }
+#endif
 
 /* ── a step on a worker thread, the window kept alive meanwhile ────────── */
 
@@ -272,7 +344,8 @@ static void make_folders(L *l)
     join(p, sizeof p, l->root, "saves");
     SDL_CreateDirectory(p);
     SDL_CreateDirectory(l->data);
-    SDL_CreateDirectory(l->tools);
+    if (!l->bundled)
+        SDL_CreateDirectory(l->tools);
     snprintf(text, sizeof text,
              "Put your own %s disc image here: one .iso file - or the extracted disc files\r\n"
              "(default.xbe and its folders directly in this folder).\r\n\r\n"
@@ -309,7 +382,13 @@ static int choose_image(L *l, char *out, size_t n)
     static const SDL_DialogFileFilter f[] = { { "Xbox disc image", "iso;xiso" }, { "All files", "*" } };
     Pick p;
     memset(&p, 0, sizeof p);
+#ifdef __ANDROID__
+    /* Android filters by MIME type, and .iso has none it knows for sure: no filter, every file shows */
+    (void)f;
+    SDL_ShowOpenFileDialog(pick_cb, &p, NULL, NULL, 0, NULL, false);
+#else
     SDL_ShowOpenFileDialog(pick_cb, &p, NULL, f, 2, NULL, false);
+#endif
     while (!SDL_GetAtomicInt(&p.done)) {
         SDL_Event e;
         while (SDL_PollEvent(&e))
@@ -318,6 +397,16 @@ static int choose_image(L *l, char *out, size_t n)
     }
     if (!p.path[0])
         return 0;
+    if (strstr(p.path, "://")) {        /* a URI (Android: content://): the port makes it a readable path */
+        if (!l->cfg->open_uri || !l->cfg->open_uri(p.path, out, n) || !out[0]) {
+            lg(l, "disc image picked as %s, which cannot be opened%s", p.path,
+               l->cfg->open_uri ? "" : " (the port gives no open_uri)");
+            xr_setup_ui_message(l->ui, 1, "The chosen file cannot be opened - please choose it again.");
+            return 0;
+        }
+        lg(l, "disc image picked: %s as %s", p.path, out);
+        return 1;
+    }
     snprintf(out, n, "%s", p.path);
     lg(l, "disc image picked: %s", out);
     return 1;
@@ -328,20 +417,35 @@ enum { B_CHOOSE = 1, B_OPEN, B_AGAIN, B_QUIT };
 static int no_game_dialog(L *l)
 {
     /* short labels: the Windows message box gives every button the same fixed width */
+#ifdef __ANDROID__
+    /* the game folder is the app's own storage: no file manager reaches it, so only the picker */
+    const SDL_MessageBoxButtonData b[] = {
+        { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, B_CHOOSE, "Choose image..." },
+        { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, B_QUIT, "Quit" },
+    };
+#else
     const SDL_MessageBoxButtonData b[] = {
         { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, B_CHOOSE, "Choose image..." },
         { 0, B_OPEN, "Open folder" },
         { 0, B_AGAIN, "Check again" },
         { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, B_QUIT, "Quit" },
     };
+#endif
     char msg[1600];
     SDL_MessageBoxData d;
     int id = B_QUIT;
+#ifdef __ANDROID__
+    snprintf(msg, sizeof msg,
+             "%s not found.\n\nChoose your %s disc image (.iso) with \"Choose image...\".\n"
+             "It is read from where it is and not changed; the game is installed into the app.",
+             l->cfg->game, l->cfg->disc);
+#else
     snprintf(msg, sizeof msg,
              "%s not found.\n\nPlace your %s disc image (.iso) or the extracted disc files in:\n\n%s\n\n"
              "and choose \"Check again\" - or pick the disc image where it is now with \"Choose image...\"\n"
              "(it is read from there and not changed). \"Open folder\" shows the game folder.",
              l->cfg->game, l->cfg->disc, l->game);
+#endif
     memset(&d, 0, sizeof d);
     d.flags = SDL_MESSAGEBOX_INFORMATION | SDL_MESSAGEBOX_BUTTONS_LEFT_TO_RIGHT;
     d.title = l->cfg->window_title;
@@ -552,43 +656,98 @@ static int unpack_job(L *l, void *a)
 
 /* ── 4. the compiler ───────────────────────────────────────────────────── */
 
-/* Only our own code on the first-start path: no system tools (curl.exe, tar.exe, powershell - Wine / Proton have
- * none of them) and no "is the network up" check (Wine answers it wrongly): the download is tried, the real error
- * shown (http_get.h), the zip unpacked with the toolkit's reader. */
+/* Everything ships in the release (maintainer, 2026-11-10: the player downloads nothing after the release
+ * download, the first start runs offline): no download, no fallback to one. toolchain.txt (format 2, tab
+ * separated, paths relative to the tools folder):
+ *
+ *   format  2
+ *   clang   llvm-mingw/bin/clang.exe        the compiler driver (Linux: llvm/bin/clang)
+ *   python  python/python.exe               the lifter's Python (Linux: python/bin/python3)
+ *   rc      llvm-mingw/bin/llvm-rc.exe      optional: the resource compiler (Windows); without it no .rc is built
+ *   bundle  bundle/<zip> <sha256> <size> <folder in the zip> <folder under tools>
+ *                                           optional: a shipped zip unpacked at the first start (Windows); without
+ *                                           it the compiler is already unpacked (an AppImage's read-only tools)
+ *   ld      {NATIVE}/liblld_exe.so          optional: the linker run for the link line instead of clang (Android:
+ *                                           lld called directly, its line starts with "-flavor gnu")
+ *
+ * clang / python / rc / ld may start with {NATIVE}/ instead: the app's native library folder (Android,
+ * XR_NATIVE_DIR), the only place an app may execute files from since API 29.
+ *
+ * The zip goes through the toolkit's reader (no system tools: Wine / Proton have no tar.exe or powershell). */
+#define PACKAGE_INCOMPLETE "The package is incomplete - please download it again."
+
 typedef struct {
-    char url[LP], sha[65], folder[256], zip[LP];
+    int format;
+    char clang[LP], python[LP], rc[LP], ld[LP];  /* relative, as written */
+    char zip[LP], sha[65], folder[256], dest[256];
     Sint64 size;
-    SDL_AtomicInt got;                  /* bytes downloaded (the progress bar) */
-    int cls;                            /* the last download's XR_HTTP_* class */
-    char err[512];                      /* its message */
     Prog unpack;                        /* entries unpacked */
 } Toolchain;
+
+/* a relative path that stays inside the tools folder (no "..", not absolute) */
+static int safe_rel(const char *p)
+{
+    return p[0] && p[0] != '/' && p[0] != '\\' && !strchr(p, ':') && !strstr(p, "..");
+}
+
+/* a toolchain.txt program: relative to the tools folder, or "{NATIVE}/<file>" in the native library folder */
+static int tc_path(L *l, const char *rel, char *out, size_t n)
+{
+    if (!strncmp(rel, "{NATIVE}/", 9)) {
+        if (!native_dir()[0] || !safe_rel(rel + 9))
+            return 0;
+        join(out, n, native_dir(), rel + 9);
+        return 1;
+    }
+    if (!safe_rel(rel))
+        return 0;
+    join(out, n, l->tools, rel);
+    return 1;
+}
 
 static int read_toolchain(L *l, Toolchain *t)
 {
     char p[LP], *text, *line, *save = NULL;
+    int bad = 0;
     memset(t, 0, sizeof *t);
     join(p, sizeof p, l->tools, "toolchain.txt");
     if (!(text = read_text(p)))
         return 0;
     for (line = SDL_strtok_r(text, "\r\n", &save); line; line = SDL_strtok_r(NULL, "\r\n", &save)) {
-        char *argv[4];
-        if (split_tabs(line, argv, 4) < 2)
+        char *argv[8];
+        int n = split_tabs(line, argv, 8);
+        if (n < 1 || argv[0][0] == '#')
             continue;
-        if (!strcmp(argv[0], "url")) snprintf(t->url, sizeof t->url, "%s", argv[1]);
-        else if (!strcmp(argv[0], "sha256")) snprintf(t->sha, sizeof t->sha, "%s", argv[1]);
-        else if (!strcmp(argv[0], "size")) t->size = (Sint64)SDL_strtoll(argv[1], NULL, 10);
-        else if (!strcmp(argv[0], "folder")) snprintf(t->folder, sizeof t->folder, "%s", argv[1]);
+        if (n < 2)
+            continue;
+        if (!strcmp(argv[0], "format")) t->format = SDL_atoi(argv[1]);
+        else if (!strcmp(argv[0], "clang")) snprintf(t->clang, sizeof t->clang, "%s", argv[1]);
+        else if (!strcmp(argv[0], "python")) snprintf(t->python, sizeof t->python, "%s", argv[1]);
+        else if (!strcmp(argv[0], "rc")) snprintf(t->rc, sizeof t->rc, "%s", argv[1]);
+        else if (!strcmp(argv[0], "ld")) snprintf(t->ld, sizeof t->ld, "%s", argv[1]);
+        else if (!strcmp(argv[0], "bundle") && n >= 6) {
+            snprintf(t->zip, sizeof t->zip, "%s", argv[1]);
+            snprintf(t->sha, sizeof t->sha, "%s", argv[2]);
+            t->size = (Sint64)SDL_strtoll(argv[3], NULL, 10);
+            snprintf(t->folder, sizeof t->folder, "%s", argv[4]);
+            snprintf(t->dest, sizeof t->dest, "%s", argv[5]);
+        } else if (!strcmp(argv[0], "url")) {
+            bad = 1;                    /* an old descriptor: it would want a download */
+        }
     }
     SDL_free(text);
-    {
-        const char *b = strrchr(t->url, '/');
-        char dl[LP];
-        join(dl, sizeof dl, l->tools, "download");
-        SDL_CreateDirectory(dl);
-        join(t->zip, sizeof t->zip, dl, b ? b + 1 : "toolchain.zip");
-    }
-    return t->url[0] && t->sha[0] && t->folder[0];
+    if (bad || t->format != 2)
+        return 0;
+    if (t->zip[0] && (!safe_rel(t->zip) || !safe_rel(t->dest) || strlen(t->sha) != 64 || t->size <= 0))
+        return 0;
+    l->rc[0] = l->ld[0] = 0;
+    if (!tc_path(l, t->clang, l->clang, sizeof l->clang) || !tc_path(l, t->python, l->python, sizeof l->python))
+        return 0;
+    if (t->rc[0] && !tc_path(l, t->rc, l->rc, sizeof l->rc))
+        return 0;
+    if (t->ld[0] && !tc_path(l, t->ld, l->ld, sizeof l->ld))
+        return 0;
+    return 1;
 }
 
 static int file_sha256(const char *p, char hex[65])
@@ -614,36 +773,14 @@ static int file_sha256(const char *p, char hex[65])
     return 1;
 }
 
-static double dl_frac(void *a)
-{
-    Toolchain *t = (Toolchain *)a;
-    int n = SDL_GetAtomicInt(&t->got);
-    return t->size > 0 && n > 0 ? (double)n / (double)t->size : 0.0;
-}
-
-/* three tries for what may pass (DNS, connect, a dropped transfer); TLS, HTTP status and the disk do not change */
-static int download_job(L *l, void *a)
-{
-    Toolchain *t = (Toolchain *)a;
-    int i;
-    for (i = 1; i <= 3; i++) {
-        t->cls = xr_http_get_file(t->url, t->zip, &t->got, t->err, sizeof t->err);
-        lg(l, "compiler download, try %d: %s - %s", i, xr_http_class_name(t->cls), t->err);
-        if (t->cls != XR_HTTP_DNS && t->cls != XR_HTTP_CONNECT && t->cls != XR_HTTP_OTHER)
-            break;
-        if (i < 3)
-            SDL_Delay(2000u * (unsigned)i);
-    }
-    return t->cls == XR_HTTP_OK ? 0 : 1;
-}
-
+/* t->zip here is the absolute path (ensure_toolchain) */
 static int check_job(L *l, void *a)
 {
     Toolchain *t = (Toolchain *)a;
     char hex[65];
     if (!file_sha256(t->zip, hex))
         return 1;
-    lg(l, "compiler download sha256 %s (expected %s)", hex, t->sha);
+    lg(l, "compiler bundle sha256 %s (expected %s)", hex, t->sha);
     return SDL_strcasecmp(hex, t->sha) ? 2 : 0;
 }
 
@@ -652,14 +789,16 @@ static double unpack_frac(void *a)
     return prog_frac(&((Toolchain *)a)->unpack);
 }
 
-/* the zip into tools/download/unpack (every entry through the zip-slip guard, streamed: libLLVM is 78 MB) */
+/* the zip into tools/bundle/unpack (every entry through the zip-slip guard, streamed: libLLVM is 78 MB), then its
+ * folder moved to tools/<dest> with the zip's SHA-256 as the marker. The zip stays: a damaged or deleted
+ * compiler folder is unpacked again offline. */
 static int unpack_tc_job(L *l, void *a)
 {
     Toolchain *t = (Toolchain *)a;
     char tmp[LP], from[LP], to[LP], marker[LP], err[256];
     ZipFile *z;
     int i, bad = 0;
-    join(tmp, sizeof tmp, l->tools, "download/unpack");
+    join(tmp, sizeof tmp, l->tools, "bundle/unpack");
     rm_tree(tmp);
     SDL_CreateDirectory(tmp);
     if (!(z = zip_open(t->zip, err, sizeof err))) {
@@ -696,79 +835,56 @@ static int unpack_tc_job(L *l, void *a)
         return 1;
     lg(l, "compiler zip: %d entries unpacked", t->unpack.total);
     join(from, sizeof from, tmp, t->folder);
-    join(to, sizeof to, l->tools, "llvm-mingw");
+    join(to, sizeof to, l->tools, t->dest);
     rm_tree(to);
     if (!SDL_RenamePath(from, to)) {
         lg(l, "cannot move %s to %s: %s", from, to, SDL_GetError());
         return 1;
     }
     rm_tree(tmp);
-    SDL_RemovePath(t->zip);             /* 190 MB the player does not need any more (a repair fetches it again) */
     join(marker, sizeof marker, to, ".sha256");
     return write_text(marker, t->sha) ? 0 : 1;
-}
-
-/* an error with Retry / Quit; 1 = retry (never with RECOMP_NO_DIALOGS: the log has the message) */
-static int retry_dialog(L *l, const char *msg)
-{
-    const SDL_MessageBoxButtonData b[] = {
-        { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Retry" },
-        { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Quit" },
-    };
-    SDL_MessageBoxData d;
-    int id = 0;
-    if (xr_no_dialogs())
-        return 0;
-    memset(&d, 0, sizeof d);
-    d.flags = SDL_MESSAGEBOX_ERROR | SDL_MESSAGEBOX_BUTTONS_LEFT_TO_RIGHT;
-    d.title = l->cfg->window_title;
-    d.message = msg;
-    d.numbuttons = 2;
-    d.buttons = b;
-    return SDL_ShowMessageBox(&d, &id) && id == 1;
 }
 
 static int ensure_toolchain(L *l)
 {
     Toolchain t;
-    char marker[LP], clang[LP], *have;
-    int rc;
+    char marker[LP], *have;
     if (!read_toolchain(l, &t)) {
-        xr_setup_ui_message(l->ui, 1, "The launcher's toolchain.txt is missing or damaged - start it with --repair.");
+        lg(l, "toolchain.txt missing, damaged or not format 2 (a download line?) in %s", l->tools);
+        xr_setup_ui_message(l->ui, 1, PACKAGE_INCOMPLETE);
         return 0;
     }
-    join(marker, sizeof marker, l->tools, "llvm-mingw/.sha256");
-    join(clang, sizeof clang, l->tools, "llvm-mingw/bin/clang.exe");
-    have = read_text(marker);
-    if (have && !SDL_strcasecmp(have, t.sha) && is_file(clang)) {
+    if (t.zip[0]) {
+        char dest[LP], zrel[LP];
+        join(dest, sizeof dest, l->tools, t.dest);
+        join(marker, sizeof marker, dest, ".sha256");
+        have = read_text(marker);
+        if (have && !SDL_strcasecmp(have, t.sha) && is_file(l->clang) && is_file(l->python)) {
+            SDL_free(have);
+            return 1;
+        }
         SDL_free(have);
-        return 1;
-    }
-    SDL_free(have);
-    if (file_size(t.zip) != t.size || run_job(l, "Checking the compiler download", 0.10, 0.02, check_job, &t, NULL)) {
-        for (;;) {
-            char msg[2048];
-            SDL_RemovePath(t.zip);
-            rc = run_job(l, "Downloading the compiler (llvm-mingw, once)", 0.10, 0.15, download_job, &t, dl_frac);
-            if (rc == 0)
-                rc = run_job(l, "Checking the compiler download", 0.25, 0.01, check_job, &t, NULL);
-            if (rc == 0)
-                break;
-            SDL_RemovePath(t.zip);
-            if (rc == 2)
-                snprintf(msg, sizeof msg, "The compiler download is damaged (its SHA-256 does not match).\n\n"
-                                          "Retry to download it once more.");
-            else
-                snprintf(msg, sizeof msg, "The compiler could not be downloaded:\n%s\n\nRetry - or download it by "
-                                          "hand:\n%s\n\nput the file as it is into:\n%s\n\nand start again.",
-                         t.err, t.url, t.zip);
-            lg(l, "%s", msg);
-            if (!retry_dialog(l, msg))
-                return 0;
+        snprintf(zrel, sizeof zrel, "%s", t.zip);
+        join(t.zip, sizeof t.zip, l->tools, zrel);
+        if (file_size(t.zip) != t.size) {
+            lg(l, "compiler bundle %s: size %lld, expected %lld", t.zip, (long long)file_size(t.zip),
+               (long long)t.size);
+            xr_setup_ui_message(l->ui, 1, PACKAGE_INCOMPLETE);
+            return 0;
+        }
+        if (run_job(l, "Checking the compiler", 0.10, 0.04, check_job, &t, NULL)) {
+            xr_setup_ui_message(l->ui, 1, PACKAGE_INCOMPLETE);
+            return 0;
+        }
+        if (run_job(l, "Unpacking the compiler (once)", 0.14, 0.12, unpack_tc_job, &t, unpack_frac)) {
+            xr_setup_ui_message(l->ui, 1, "The compiler could not be unpacked - see data/launcher.log.");
+            return 0;
         }
     }
-    if (run_job(l, "Unpacking the compiler", 0.26, 0.04, unpack_tc_job, &t, unpack_frac)) {
-        xr_setup_ui_message(l->ui, 1, "The compiler could not be unpacked - see data\\launcher.log.");
+    if (!is_file(l->clang) || !is_file(l->python) || (l->ld[0] && !is_file(l->ld))) {
+        lg(l, "compiler %s, python %s or linker %s missing", l->clang, l->python, l->ld[0] ? l->ld : "(clang)");
+        xr_setup_ui_message(l->ui, 1, PACKAGE_INCOMPLETE);
         return 0;
     }
     return 1;
@@ -790,7 +906,7 @@ static int lift_job(L *l, void *a)
         if (*line == '\n')
             lines++;
     la->p.total = lines ? lines : 1;
-    join(py, sizeof py, l->tools, "python/python.exe");
+    snprintf(py, sizeof py, "%s", l->python);
     join(cwd, sizeof cwd, l->tools, "lifter");
     join(logp, sizeof logp, l->build, "lift.log");
     for (line = SDL_strtok_r(text, "\r\n", &save); line; line = SDL_strtok_r(NULL, "\r\n", &save)) {
@@ -809,7 +925,8 @@ static int lift_job(L *l, void *a)
         }
         argv[k++] = py;
         argv[k++] = "-I";
-        for (i = 1; i < n && k < MAX_ARGS + 1; i++) {
+        argv[k++] = "-B";               /* no __pycache__ next to the lifter (read-only inside an AppImage) */
+        for (i = 1; i < n && k < MAX_ARGS + 2; i++) {
             expand(l, raw[i], exp[i], LP, la->xbe);
             argv[k++] = exp[i];
         }
@@ -843,8 +960,8 @@ typedef struct {
     int nrc;
     char copy[16][LP];
     int ncopy;
-    char clang[LP], llvm_rc[LP];
-    char *text;                         /* the descriptor's buffer the args point into */
+    char clang[LP], llvm_rc[LP], ld[LP];
+    char *text;                        /* the descriptor's buffer the args point into */
     char argbuf[MAX_ARGS * 3][LP];      /* expanded args */
     int nargbuf;
 } Build;
@@ -897,8 +1014,11 @@ static int read_build(L *l, Build *b)
             expand(l, raw[1], b->copy[b->ncopy++], LP, NULL);
         }
     }
-    join(b->clang, sizeof b->clang, l->tools, "llvm-mingw/bin/clang.exe");
-    join(b->llvm_rc, sizeof b->llvm_rc, l->tools, "llvm-mingw/bin/llvm-rc.exe");
+    snprintf(b->clang, sizeof b->clang, "%s", l->clang);
+    snprintf(b->llvm_rc, sizeof b->llvm_rc, "%s", l->rc);
+    snprintf(b->ld, sizeof b->ld, "%s", l->ld);
+    if (b->rc_file[0] && !b->llvm_rc[0])
+        lg(l, "build.txt names %s but toolchain.txt no resource compiler: built without it", b->rc_file);
     return b->ncc > 0 && b->nsrc > 0 && b->nlink > 0;
 }
 
@@ -969,10 +1089,10 @@ static int link_job(L *l, void *a)
 {
     Build *b = (Build *)a;
     char *argv[MAX_UNITS + MAX_ARGS + 8], out[LP], logp[LP];
-    int k = 0, i;
+    int k = 0, i, j;
     join(logp, sizeof logp, l->build, "link.log");
     SDL_RemovePath(logp);
-    if (b->rc_file[0]) {
+    if (b->rc_file[0] && b->llvm_rc[0]) {
         char *rv[MAX_ARGS + 8];
         int r = 0;
         join(b->res, sizeof b->res, l->obj, "resources.res");
@@ -986,16 +1106,33 @@ static int link_job(L *l, void *a)
         if (run_proc(l, rv, l->root, logp) != 0)
             return 1;
     }
-    join(out, sizeof out, l->root, l->cfg->game_exe);
-    argv[k++] = b->clang;
-    argv[k++] = "-o";
-    argv[k++] = out;
-    for (i = 0; i < b->nsrc; i++)
-        argv[k++] = b->objp[i];
-    if (b->rc_file[0])
-        argv[k++] = b->res;
-    for (i = 0; i < b->nlink; i++)
-        argv[k++] = b->link[i];
+    join(out, sizeof out, l->root, l->game_exe);
+    argv[k++] = b->ld[0] ? b->ld : b->clang;
+    for (i = 0; i < b->nlink && strcmp(b->link[i], "{OBJECTS}"); i++)
+        ;
+    if (i < b->nlink) {
+        /* a full line (a linker run directly: crt objects before, libraries after the game's objects): the
+         * objects go where {OBJECTS} stands, the output is the line's own {OUT} */
+        for (i = 0; i < b->nlink; i++) {
+            if (strcmp(b->link[i], "{OBJECTS}")) {
+                argv[k++] = b->link[i];
+                continue;
+            }
+            for (j = 0; j < b->nsrc; j++)
+                argv[k++] = b->objp[j];
+            if (b->rc_file[0] && b->llvm_rc[0])
+                argv[k++] = b->res;
+        }
+    } else {
+        argv[k++] = "-o";
+        argv[k++] = out;
+        for (i = 0; i < b->nsrc; i++)
+            argv[k++] = b->objp[i];
+        if (b->rc_file[0] && b->llvm_rc[0])
+            argv[k++] = b->res;
+        for (i = 0; i < b->nlink; i++)
+            argv[k++] = b->link[i];
+    }
     argv[k] = NULL;
     if (run_proc(l, argv, l->root, logp) != 0)
         return 1;
@@ -1019,13 +1156,25 @@ static int link_job(L *l, void *a)
 
 /* ── the game ──────────────────────────────────────────────────────────── */
 
+#ifdef __ANDROID__
+/* no process: the game is a library (libGAME.so in root) the app loads once xr_launcher_main returned 0 */
+static int start_game(L *l)
+{
+    if (!is_file(l->out)) {
+        lg(l, "the game %s is missing", l->out);
+        return 0;
+    }
+    lg(l, "ready: %s (the app loads it)", l->out);
+    return 1;
+}
+#else
 static int start_game(L *l)
 {
     char exe[LP];
     char *argv[] = { exe, NULL };
     SDL_PropertiesID p = SDL_CreateProperties();
     SDL_Process *proc;
-    join(exe, sizeof exe, l->root, l->cfg->game_exe);
+    join(exe, sizeof exe, l->root, l->game_exe);
     SDL_SetPointerProperty(p, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, argv);
     SDL_SetStringProperty(p, SDL_PROP_PROCESS_CREATE_WORKING_DIRECTORY_STRING, l->root);
     SDL_SetNumberProperty(p, SDL_PROP_PROCESS_CREATE_STDIN_NUMBER, SDL_PROCESS_STDIO_NULL);
@@ -1043,6 +1192,82 @@ static int start_game(L *l)
     lg(l, "started %s", exe);
     SDL_DestroyProcess(proc);           /* the game keeps running; the launcher ends */
     return 1;
+}
+#endif
+
+/* ── the system's Vulkan loader (Linux) ────────────────────────────────── */
+
+/* The game links libvulkan.so.1 (the GPU driver belongs to the system, the package carries no loader): without it
+ * the dynamic loader stops the game before any message of ours. Checked here, before the first-start build, so the
+ * player hears it at once and in words. Windows always has vulkan-1.dll with a GPU driver. */
+static int vulkan_loader_present(L *l)
+{
+#if defined(__linux__) && !defined(__ANDROID__)
+    SDL_SharedObject *so = SDL_LoadObject("libvulkan.so.1");
+    if (!so) {
+        lg(l, "no libvulkan.so.1: %s", SDL_GetError());
+        xr_setup_ui_message(l->ui, 1,
+                            "Vulkan driver missing - install the Vulkan driver for your GPU "
+                            "(Mesa: vulkan-radeon / vulkan-intel / mesa-vulkan-drivers; NVIDIA: its own driver), "
+                            "then start again.");
+        return 0;
+    }
+    SDL_UnloadObject(so);
+#else
+    (void)l;
+#endif
+    return 1;
+}
+
+/* ── where the launcher's files are ────────────────────────────────────── */
+
+/* The tools folder (RES). Bundled = read-only and ready (release.txt inside, written by the release script):
+ *   1. $XR_LAUNCHER_TOOLS (tests, a distribution package), when it holds release.txt;
+ *   2. <exe folder>/../share/<slug>/tools - the AppImage layout (usr/bin/<launcher>, usr/share/<slug>/tools);
+ * else root/tools, unpacked from the payload appended to the exe (Windows, a plain Linux folder). */
+static void find_tools(L *l, const char *base)
+{
+    const char *env = SDL_getenv("XR_LAUNCHER_TOOLS");
+    char p[LP], cand[LP];
+    l->bundled = 0;
+    if (env && *env) {
+        join(p, sizeof p, env, "release.txt");
+        if (is_file(p)) {
+            snprintf(l->tools, sizeof l->tools, "%s", env);
+            l->bundled = 1;
+            return;
+        }
+        fprintf(stderr, "[LAUNCHER] XR_LAUNCHER_TOOLS=%s holds no release.txt - ignored\n", env);
+    }
+    if (base && l->cfg->slug && *l->cfg->slug) {
+        snprintf(cand, sizeof cand, "%s../share/%s/tools", base, l->cfg->slug);
+        join(p, sizeof p, cand, "release.txt");
+        if (is_file(p)) {
+            snprintf(l->tools, sizeof l->tools, "%s", cand);
+            l->bundled = 1;
+            return;
+        }
+    }
+    join(l->tools, sizeof l->tools, l->root, "tools");
+}
+
+/* a bundled folder's release.txt names the release (the stamp: a new AppImage over the old one builds again) */
+static int read_bundled_release(L *l)
+{
+    char p[LP], *t;
+    size_t k;
+    join(p, sizeof p, l->tools, "release.txt");
+    if (!(t = read_text(p)))
+        return 0;
+    k = strcspn(t, "\r\n");
+    while (k && (t[k - 1] == ' ' || t[k - 1] == '\t'))
+        k--;
+    if (k > 32)
+        k = 32;
+    memcpy(l->release, t, k);
+    l->release[k] = 0;
+    SDL_free(t);
+    return l->release[0] != 0;
 }
 
 /* ── main ──────────────────────────────────────────────────────────────── */
@@ -1064,20 +1289,19 @@ int xr_launcher_main(const XrLauncherConfig *cfg, int argc, char **argv)
     l.cfg = cfg;
     SDL_Init(SDL_INIT_VIDEO);
     xbox_set_window_icon(cfg->icon_bmp, cfg->icon_bmp_size);
-    base = SDL_GetBasePath();
-    snprintf(l.root, sizeof l.root, "%s", base ? base : "./");
-    {
-        const char *a0 = argc > 0 ? argv[0] : "", *s = strrchr(a0, '/'), *bs = strrchr(a0, '\\');
-        if (bs > s)
-            s = bs;
-        join(l.exe, sizeof l.exe, l.root, s ? s + 1 : a0);
-        if (!is_file(l.exe)) {          /* started without the extension in argv[0] */
-            snprintf(p, sizeof p, "%s.exe", l.exe);
-            if (is_file(p))
-                snprintf(l.exe, sizeof l.exe, "%s", p);
-        }
+    base = SDL_GetBasePath();           /* the exe's folder: inside an AppImage the read-only mount */
+    snprintf(l.root, sizeof l.root, "%s", xbox_host_root()[0] ? xbox_host_root() : base ? base : "./");
+    snprintf(l.exe, sizeof l.exe, "%s", xbox_host_self());
+    snprintf(l.game_exe, sizeof l.game_exe, "%s", cfg->game_exe);
+#ifndef _WIN32
+    {                                   /* "ORTA.exe" in the config is "ORTA" here */
+        size_t k = strlen(l.game_exe);
+        if (k > 4 && !SDL_strcasecmp(l.game_exe + k - 4, ".exe"))
+            l.game_exe[k - 4] = 0;
     }
-    join(l.tools, sizeof l.tools, l.root, "tools");
+#endif
+    find_tools(&l, base);
+    join(l.out, sizeof l.out, l.root, l.game_exe);
     join(l.game, sizeof l.game, l.root, "game");
     join(l.data, sizeof l.data, l.root, "data");
     join(l.build, sizeof l.build, l.data, "build");
@@ -1088,26 +1312,36 @@ int xr_launcher_main(const XrLauncherConfig *cfg, int argc, char **argv)
     l.log_mx = SDL_CreateMutex();
     join(logp, sizeof logp, l.data, "launcher.log");
     l.log = SDL_IOFromFile(logp, "wb");
-    lg(&l, "%s launcher in %s", cfg->window_title, l.root);
+    lg(&l, "%s launcher in %s (tools %s, %s)", cfg->window_title, l.root, l.tools,
+       l.bundled ? "bundled, read-only" : "from the payload");
     l.ui = xr_setup_ui_open(cfg->window_title);
 
-    if (!read_trailer(&l, &payload_ofs)) {
-        xr_setup_ui_message(l.ui, 1, "This launcher carries no payload (a damaged download?) - download it again.");
+    if (l.bundled) {
+        if (!read_bundled_release(&l)) {
+            xr_setup_ui_message(l.ui, 1, PACKAGE_INCOMPLETE);
+            goto out;
+        }
+    } else if (!read_trailer(&l, &payload_ofs)) {
+        xr_setup_ui_message(l.ui, 1, PACKAGE_INCOMPLETE);
         goto out;
     }
     lg(&l, "release %s", l.release);
+    if (!vulkan_loader_present(&l))
+        goto out;
     if (!ensure_game(&l, image, sha1))
         goto out;
 
     snprintf(stamp_want, sizeof stamp_want, "%s\n%s\n", l.release, sha1);
     join(p, sizeof p, l.build, "stamp.txt");
     stamp_have = read_text(p);
-    join(xbe, sizeof xbe, l.root, cfg->game_exe);
+    join(xbe, sizeof xbe, l.root, l.game_exe);
     if (repair) {
         lg(&l, "repair: building again");
         rm_tree(l.build);
-        join(p, sizeof p, l.tools, "release.txt");
-        SDL_RemovePath(p);
+        if (!l.bundled) {               /* the payload is unpacked again; a bundled folder is the AppImage's */
+            join(p, sizeof p, l.tools, "release.txt");
+            SDL_RemovePath(p);
+        }
     } else if (stamp_have && !strcmp(stamp_have, stamp_want) && is_file(xbe)) {
         SDL_free(stamp_have);
         ok = no_start || start_game(&l);
@@ -1115,8 +1349,8 @@ int xr_launcher_main(const XrLauncherConfig *cfg, int argc, char **argv)
     }
     SDL_free(stamp_have);
 
-    /* 3. payload */
-    {
+    /* 3. payload (a bundled tools folder is the payload, already unpacked) */
+    if (!l.bundled) {
         char *have;
         join(p, sizeof p, l.tools, "release.txt");
         have = read_text(p);
@@ -1177,6 +1411,14 @@ int xr_launcher_main(const XrLauncherConfig *cfg, int argc, char **argv)
     rm_tree(l.obj);
     join(p, sizeof p, l.build, "stamp.txt");
     write_text(p, stamp_want);
+    if (l.bundled) {
+        /* the game's log line "version: <release> (...)" reads tools/release.txt (platform/host_info.c), which
+         * a read-only bundle has elsewhere: the release name goes to data/release.txt for it */
+        char rel[64];
+        join(p, sizeof p, l.data, "release.txt");
+        snprintf(rel, sizeof rel, "%s\n", l.release);
+        write_text(p, rel);
+    }
     lg(&l, "built %s", xbe);
     ok = no_start || start_game(&l);
 out:

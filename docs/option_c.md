@@ -212,3 +212,40 @@ Defaults are unchanged for a port that sets none of the switches below, except w
   - A live-file line `stop` drops the running pad script for good, and later live lines still press.
 - **New tests:** `apu_fe_trap`, `phys_resolve`, `pad_live_stop`, `video_aspect`; `kernel_regressions` case 6 is
   the concurrent handle-table check.
+
+## 7. Changes since the v1.0.0 snapshot (Orta Recompiled v1.1.0: Linux and Android)
+
+The toolkit now runs on Linux (x86-64) and Android (arm64) besides Windows. Windows behaviour is unchanged unless a
+line says otherwise.
+
+- **POSIX platform layer** (`src/platform/win32_compat.c`).
+  - Vectored exception handlers on signals (SIGSEGV / SIGBUS / SIGILL / SIGFPE / SIGTRAP, own signal stack), so the
+    MMIO traps (APU, USB host controller, AC97) work as on Windows; x86-64 and arm64.
+  - Events release the threads waiting at the moment of a `SetEvent` / `PulseEvent`, even when another thread
+    resets the event before they run (generation counter for manual reset, release tokens for auto reset). Before,
+    such wakeups were lost: Orta's movies stalled 0.7-3 s on Linux and Android.
+  - `SuspendThread` really suspends: the thread stops at its next kernel call, as the console's suspend APC does.
+  - File allocation info, directory contexts dropped on close, atomic saves (shadow file + fsync + rename).
+  - Android (bionic) branches: no `pthread_cancel`, `memfd_create` through the system call before API 30.
+- **arm64.** `mmio_decode_a64.h`: the AArch64 decoder for trapped device pages (loads, stores, pairs, STLR; write
+  flag from the ESR record, from the instruction without one). The AC97 bus-master store is emulated on arm64
+  (no single step there). Page tracking is off on hosts with pages other than 4 KB.
+- **Kernel paths** (`kernel_path.c`) at the Win32 level on POSIX: partition images, `[PATH]` lines, utility drive.
+- **Audio:** an SDL3 audio stream behind the XAudio2 interface on non-Windows hosts.
+- **Vulkan on Android:** identity pre-transform (the compositor rotates), the surface and swapchain made again after
+  the app returns from the background, `SUBOPTIMAL` ignored unless the extent changes.
+- **Launcher.** Nothing is downloaded any more: the release carries the compiler (`toolchain.txt` format 2, bundled
+  zip on Windows, unpacked read-only tools in an AppImage); `platform/host_paths.h` gives the writable root (the
+  folder holding the `.AppImage`, else the exe's folder); "Vulkan driver missing" message; fork/exec on Android.
+- **Input: pad modes** (`xinput_xbox.h`). `XBOX_PADS_MERGE` puts every host pad on player 1 (single-player titles,
+  a handheld docked with an external pad); `xbox_InputSetPadPriority` ranks pads (Android: external before built-in
+  or touch); `xbox_InputSwapPorts` for a menu. `RECOMP_PADS_MERGE=0/1` overrides. Without a call nothing changes,
+  on every host.
+- **Diagnostics:** a stall report after 10 s without a kernel call (`[HANG]`, every thread's host stack via
+  `host_stack_dump.c`), `RECOMP_FLIP_STALL_MS` for single long frames.
+- **Release tools:** `tools/linux/make_toolchain_bundle.sh` (clang + lld + Python for an AppImage, glibc 2.35
+  sysroot, licence texts), `cmake/linux-sysroot.cmake`, `tools/linux/build_glslang.sh`, `tools/release/prune_llvm_mingw.py`
+  (the Windows compiler zip without what the build never uses), `tools/android/` (runtime SDK, on-device clang +
+  lld, `libxr_glslang.so`).
+- **New tests:** `mmio_trap`, `mmio_decode_a64`, `kernel_file_posix`, `host_paths`, `compat_bionic`,
+  `compat_events`, `host_stack_dump`.

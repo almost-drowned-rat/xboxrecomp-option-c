@@ -10,7 +10,9 @@ add_library(xbox_bootvideo STATIC
 )
 target_include_directories(xbox_bootvideo PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-find_package(SDL3 CONFIG REQUIRED)
+if(NOT TARGET SDL3::SDL3)                 # a consumer's own SDL3 target (add_subdirectory) wins
+    find_package(SDL3 CONFIG REQUIRED)
+endif()
 target_link_libraries(xbox_bootvideo PUBLIC SDL3::SDL3)
 
 if(MSVC)

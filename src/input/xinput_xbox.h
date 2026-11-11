@@ -104,6 +104,19 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
  */
 unsigned xbox_InputConnectedMask(void);
 
+/* ---- pad modes (2026-11-11) -------------------------------------------
+ * XBOX_PADS_MERGE: every host pad is player 1 (single-player titles; a handheld's built-in pad, a touch pad and an
+ * external pad all steer port 0). XBOX_PADS_PER_PORT (default): one port per pad. RECOMP_PADS_MERGE=0/1 overrides.
+ * xbox_InputSetPadPriority: the platform ranks pads by name (Android: external above built-in / virtual); the pads
+ * are sorted onto the ports when one comes or goes. xbox_InputSwapPorts: by hand (a menu), until the next change.
+ * XBOX_INPUT_HAS_PAD_MODE lets a port use these with an older pin out of its build. */
+#define XBOX_INPUT_HAS_PAD_MODE 1
+enum { XBOX_PADS_PER_PORT = 0, XBOX_PADS_MERGE = 1 };
+void xbox_InputSetPadMode(int mode);
+int xbox_InputPadsMerged(void);           /* 1 = XBOX_PADS_MERGE is on */
+void xbox_InputSetPadPriority(int (*prio)(const char *name));
+int xbox_InputSwapPorts(int a, int b);   /* names for a menu: xbox_InputPadName (xinput_bind.h) */
+
 /* ---- pad script (xinput_script.c) ------------------------------------
  * RECOMP_PAD_SCRIPT=<steps>|@file, RECOMP_PAD_LIVE=<file>, RECOMP_PAD_PRESS;
  * syntax in xinput_script.c. Applied by xbox_InputGetState. */

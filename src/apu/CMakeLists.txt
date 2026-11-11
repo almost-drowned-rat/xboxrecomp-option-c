@@ -48,8 +48,15 @@ if(WIN32)
     # XAudio2Create rather than at build time here.
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
 else()
-    # Linux: platform layer (Win32 primitives on POSIX) + libm. The APU's SDL
-    # audio calls are stubs (apu_shim.h), so no SDL library; host audio output
-    # comes with DirectSound at API level (SDL3).
+    # Linux: platform layer (Win32 primitives on POSIX) + libm, and SDL3 for the
+    # host audio output (apu_xaudio2.c's SDL3 audio-stream backend). Without
+    # SDL3 the xa2_* functions stay inactive stubs (no sound).
     target_link_libraries(xbox_apu PRIVATE platform m)
+    if(NOT TARGET SDL3::SDL3)
+        find_package(SDL3 CONFIG QUIET)
+    endif()
+    if(TARGET SDL3::SDL3)
+        target_link_libraries(xbox_apu PRIVATE SDL3::SDL3)
+        target_compile_definitions(xbox_apu PRIVATE XBOX_APU_SDL3_AUDIO=1)
+    endif()
 endif()

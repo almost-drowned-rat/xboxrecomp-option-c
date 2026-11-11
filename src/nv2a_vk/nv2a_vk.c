@@ -610,14 +610,28 @@ static void garbage_free(Frame *f)
 
 static void crop_collect(uint32_t slot);   /* the window crop's read-back (before vk_flip) */
 
+/* A Vulkan call that blocked >= 100 ms (acquire, present, the frame fence): one line each, 30 a run. These run on
+ * the thread that executes the pushbuffer, whose time the main thread's frame split does not count - and a
+ * blocked flip there stops the GPU semaphore, so the title waits in its fence wait (Orta's movies on Linux,
+ * 2026-11-11: the main thread spun 1.3-1.6 s in D3D's BlockOnTime while vk_flip waited). */
+static void vk_slow_note(const char *what, Uint64 t0)
+{
+    static SDL_AtomicInt told;
+    Uint64 ms = (SDL_GetTicksNS() - t0) / 1000000u;
+    if (ms >= 100 && SDL_AddAtomicInt(&told, 1) < 30)
+        LOGE("%s blocked %llu ms (frame %u)\n", what, (unsigned long long)ms, s_frame);
+}
+
 static void frame_begin(void)
 {
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     s_f = &s_fr[s_fi];
     if (s_f->submitted) {
+        Uint64 t0 = SDL_GetTicksNS();
         xbox_ft_push(FT_GPU_WAIT);
         vkWaitForFences(s_dev, 1, &s_f->fence, VK_TRUE, UINT64_MAX);
         xbox_ft_pop();
+        vk_slow_note("frame fence wait", t0);
         vkResetFences(s_dev, 1, &s_f->fence);
         s_f->submitted = 0;
         crop_collect(s_fi);                   /* that frame's copy of the presented surface, if it made one */
@@ -3673,6 +3687,136 @@ int nv2a_vk_present_fifo(void)
     return s_present_fifo;
 }
 
+/* ANDROID: the surface's rotation and its life.
+ *
+ * Pre-rotation: Android reports currentTransform = ROTATE_90/270 when the app's orientation differs from the
+ * panel's natural one (the S23 is a portrait panel, Orta runs landscape). A swapchain created with that transform
+ * promises images already rotated for the panel; ours are not, so the compositor turned the picture a second time
+ * and squeezed it (2026-11-11, S23: the 4:3 frame's pillarbox x 450..1890 came out as y 210..870, sideways).
+ * IDENTITY instead, in the window's own orientation: the compositor rotates (a small composition cost, no change
+ * to any present path). Android then answers every present with VK_SUBOPTIMAL_KHR - that alone is no reason to
+ * rebuild the swapchain (sc_extent_changed).
+ *
+ * Surface life: Android destroys the window's surface when the app goes to the background and makes a new one on
+ * return. The old VkSurfaceKHR is dead then (black after minimise -> restore, the game running on). Background:
+ * no acquire / present at all (an acquire on a dying surface may block). Foreground, or a lost surface: the
+ * swapchain and the VkSurfaceKHR are made again (surface_recreate), retried every few flips while the window has
+ * no surface yet. */
+static SDL_AtomicInt s_sc_background;      /* Android: between DID_ENTER_BACKGROUND and DID_ENTER_FOREGROUND */
+static SDL_AtomicInt s_sc_lost;            /* the surface must be made again before the next acquire */
+
+static int sc_rotated(VkSurfaceTransformFlagBitsKHR t)
+{
+    return t == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR || t == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR
+        || t == VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR
+        || t == VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR;
+}
+
+/* The transform and extent a swapchain is made with for these capabilities. */
+static void sc_choose(const VkSurfaceCapabilitiesKHR *caps, VkExtent2D *ext, VkSurfaceTransformFlagBitsKHR *pre)
+{
+    *ext = caps->currentExtent;
+    *pre = caps->currentTransform;
+#if defined(__ANDROID__)
+    if (caps->supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
+        int pw = 0, ph = 0;
+        *pre = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        /* the image in the window's orientation: currentExtent may be given in the panel's */
+        if (ext->width != 0xFFFFFFFFu && s_win && SDL_GetWindowSizeInPixels(s_win, &pw, &ph) && pw > 0 && ph > 0
+            && (pw > ph) != (ext->width > ext->height)
+            && ext->height <= caps->maxImageExtent.width && ext->width <= caps->maxImageExtent.height) {
+            uint32_t t = ext->width;
+            ext->width = ext->height;
+            ext->height = t;
+        }
+    }
+#endif
+}
+
+/* After a VK_SUBOPTIMAL_KHR: does the surface want another size than the swapchain has? (Android reports
+ * suboptimal for every present of an IDENTITY swapchain on a rotated panel - not a reason to rebuild.) */
+#if defined(__ANDROID__)
+static int sc_extent_changed(void)
+{
+    VkSurfaceCapabilitiesKHR caps;
+    VkExtent2D e;
+    VkSurfaceTransformFlagBitsKHR pre;
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_pd, s_surface, &caps) != VK_SUCCESS)
+        return 1;
+    sc_choose(&caps, &e, &pre);
+    return e.width != 0xFFFFFFFFu && (e.width != s_sc_extent.width || e.height != s_sc_extent.height);
+}
+
+static bool SDLCALL sc_event_watch(void *u, SDL_Event *e)
+{
+    (void)u;
+    if (e->type == SDL_EVENT_DID_ENTER_BACKGROUND || e->type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
+        SDL_SetAtomicInt(&s_sc_background, 1);
+    } else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+        SDL_SetAtomicInt(&s_sc_lost, 1);        /* a new window surface behind the same SDL window */
+        SDL_SetAtomicInt(&s_sc_background, 0);
+    }
+    return true;
+}
+#endif
+
+static int create_swapchain(void);
+
+/* The swapchain and the VkSurfaceKHR made again (Android: the window's new surface after the background).
+ * 1 = presentable again; 0 = no surface yet (still in the background), retried later. */
+static int surface_recreate(void)
+{
+#if defined(__SWITCH__)
+    return create_swapchain();
+#else
+    uint32_t i;
+    VkBool32 ok = VK_FALSE;
+    vkDeviceWaitIdle(s_dev);
+    for (i = 0; i < 8; i++)
+        if (s_sc_views[i]) {
+            vkDestroyImageView(s_dev, s_sc_views[i], NULL);
+            s_sc_views[i] = VK_NULL_HANDLE;
+        }
+    if (s_swapchain) {
+        vkDestroySwapchainKHR(s_dev, s_swapchain, NULL);
+        s_swapchain = VK_NULL_HANDLE;
+    }
+    if (s_surface) {
+        SDL_Vulkan_DestroySurface(s_inst, s_surface, NULL);
+        s_surface = VK_NULL_HANDLE;
+    }
+    if (!SDL_Vulkan_CreateSurface(s_win, s_inst, NULL, &s_surface)) {
+        s_surface = VK_NULL_HANDLE;
+        return 0;
+    }
+    if (vkGetPhysicalDeviceSurfaceSupportKHR(s_pd, s_qfam, s_surface, &ok) != VK_SUCCESS || !ok
+        || !create_swapchain()) {
+        LOGE("surface made again, but no swapchain on it yet\n");
+        return 0;
+    }
+    LOGE("surface and swapchain made again (%ux%u)\n", s_sc_extent.width, s_sc_extent.height);
+    return 1;
+#endif
+}
+
+/* Before an acquire: 1 = the swapchain can be used now. Background: no. Lost: made again, at most every 15th
+ * flip while it fails (no window surface yet). */
+static int sc_ready(void)
+{
+    static unsigned retry;
+    if (SDL_GetAtomicInt(&s_sc_background))
+        return 0;
+    if (!SDL_GetAtomicInt(&s_sc_lost) && s_swapchain)
+        return 1;
+    if (retry++ % 15)
+        return 0;
+    if (!surface_recreate())
+        return 0;
+    SDL_SetAtomicInt(&s_sc_lost, 0);
+    retry = 0;
+    return 1;
+}
+
 static int create_swapchain(void)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -3680,6 +3824,7 @@ static int create_swapchain(void)
     VkPresentModeKHR modes[8], mode = VK_PRESENT_MODE_FIFO_KHR;
     uint32_t nf = 16, nm = 8, i;
     VkSwapchainCreateInfoKHR ci = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
+    VkSurfaceTransformFlagBitsKHR pre;
 
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_pd, s_surface, &caps) != VK_SUCCESS)
         return 0;
@@ -3733,10 +3878,22 @@ static int create_swapchain(void)
              mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" :
              mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "other", why);
     }
-    s_sc_extent = caps.currentExtent;
+    sc_choose(&caps, &s_sc_extent, &pre);
     if (s_sc_extent.width == 0xFFFFFFFFu) {
         s_sc_extent.width = (uint32_t)(720.0 * xbox_video_aspect() + 0.5);   /* the window's aspect (SDL_CreateWindow) */
         s_sc_extent.height = 720;
+    }
+    if (!s_sc_extent.width || !s_sc_extent.height)
+        return 0;                       /* a minimised / hidden window: no swapchain until it has a size */
+    if (pre != caps.currentTransform || sc_rotated(caps.currentTransform)) {
+        static VkSurfaceTransformFlagBitsKHR told = (VkSurfaceTransformFlagBitsKHR)0;
+        if (told != caps.currentTransform) {
+            told = caps.currentTransform;
+            fprintf(stderr, "  [VK] surface transform 0x%X (supported 0x%X, extent %ux%u): swapchain made with "
+                            "0x%X, %ux%u - the compositor rotates\n", (unsigned)caps.currentTransform,
+                    (unsigned)caps.supportedTransforms, caps.currentExtent.width, caps.currentExtent.height,
+                    (unsigned)pre, s_sc_extent.width, s_sc_extent.height);
+        }
     }
     ci.surface = s_surface;
     ci.minImageCount = caps.minImageCount < 3 ? 3 : caps.minImageCount;
@@ -3746,8 +3903,11 @@ static int create_swapchain(void)
     ci.imageExtent = s_sc_extent;
     ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    ci.preTransform = caps.currentTransform;
-    ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    ci.preTransform = pre;
+    ci.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
+                            ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+                            : (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)
+                                  ? VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR : VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     ci.presentMode = mode;
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = s_swapchain;
@@ -4274,6 +4434,10 @@ static int ready(void)
         snprintf(w, sizeof w, "The window's Vulkan surface could not be created (SDL: %s).", SDL_GetError());
         vk_fatal(w);
     }
+#if defined(__ANDROID__)
+    if (!s_headless)
+        SDL_AddEventWatch(sc_event_watch, NULL);    /* background / foreground: the surface's life */
+#endif
 #endif
 
     qci.queueFamilyIndex = s_qfam;
@@ -8120,18 +8284,28 @@ static void vk_flip(void)
      * which serves the pushbuffer path and an HLE Present alike. */
 
     VT("flip %u: surface %08X drew %d, acquiring\n", s_frame, s ? s->va : 0, s_drew_any);
-    if (!s_headless) {
+    if (!s_headless && sc_ready()) {
         VkResult rr;
         long long t_acq = xbox_ft_on() ? xbox_ft_now() : 0;
+        Uint64 t_acq_ns = SDL_GetTicksNS();
         xbox_ft_push(FT_PRESENT);
         rr = vkAcquireNextImageKHR(s_dev, s_swapchain, UINT64_MAX, s_f->acquired,
                                    VK_NULL_HANDLE, &idx);
         xbox_ft_pop();
+        vk_slow_note("acquire", t_acq_ns);
         if (t_acq)
             xbox_ft_acquire(xbox_ft_ms(t_acq));  /* shown on its own: which of the two calls blocks */
-        if (rr == VK_ERROR_OUT_OF_DATE_KHR) {
+        if (rr == VK_ERROR_SURFACE_LOST_KHR) {
+            LOGE("acquire: surface lost - made again when the window has one\n");
+            SDL_SetAtomicInt(&s_sc_lost, 1);
+        } else if (rr == VK_ERROR_OUT_OF_DATE_KHR) {
             vkDeviceWaitIdle(s_dev);
+#if defined(__ANDROID__)
+            if (!create_swapchain())
+                SDL_SetAtomicInt(&s_sc_lost, 1);
+#else
             create_swapchain();
+#endif
         } else if (rr == VK_SUCCESS || rr == VK_SUBOPTIMAL_KHR) {
             VkImage dst = s_sc_images[idx];
             VT("flip %u: acquired image %u\n", s_frame, idx);
@@ -8272,17 +8446,31 @@ static void vk_flip(void)
         pi.swapchainCount = 1;
         pi.pSwapchains = &s_swapchain;
         pi.pImageIndices = &idx;
+        Uint64 t_pr_ns = SDL_GetTicksNS();
         VT("flip %u: vkQueuePresentKHR\n", s_frame);
         xbox_ft_push(FT_PRESENT);
         pr = vkQueuePresentKHR(s_queue, &pi);
         xbox_ft_pop();
+        vk_slow_note("present", t_pr_ns);
         {
             extern void xbox_GuestPresentNote(void);   /* RECOMP_PACING_STATS (FRAME PACING) */
             xbox_GuestPresentNote();
         }
-        if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
+        if (pr == VK_ERROR_SURFACE_LOST_KHR) {
+            LOGE("present: surface lost - made again when the window has one\n");
+            SDL_SetAtomicInt(&s_sc_lost, 1);
+#if defined(__ANDROID__)
+        } else if (pr == VK_ERROR_OUT_OF_DATE_KHR || (pr == VK_SUBOPTIMAL_KHR && sc_extent_changed())) {
+#else
+        } else if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
+#endif
             vkDeviceWaitIdle(s_dev);
+#if defined(__ANDROID__)
+            if (!create_swapchain())
+                SDL_SetAtomicInt(&s_sc_lost, 1);
+#else
             create_swapchain();
+#endif
         }
     }
     if (hud_on()) {

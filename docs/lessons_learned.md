@@ -416,6 +416,17 @@ new one at the milestone it was found. Workflow: [porting_guide.md](porting_guid
 - Still racy without a guest lock: D3D queues flips from the software-method trap and retires them in the DPC,
   on two host threads; on the console both run at DISPATCH on one CPU. THPS 2X saw completed one ahead after
   ~1500 swaps. Keep it off until ISR/DPC/trap handlers are serialised.
+- **Open (Panzer Dragoon Orta, 2026-11-10, `RECOMP_VBLANK=1`): the flip targets run ahead of the vblank count on a
+  long session.** After 41 min of play, D3D's flip queue (XDK 5028: `[g_pDevice] + 0x17C0`) held two pending flips
+  (slot flags +0x174 / +0x180, targets +0x178 / +0x184 = 0x2A47FB / 0x2A47FA). The next target +0x1C4 was 0x2A47FC,
+  but D3D's own vblank count +0x1C0, incremented by its vblank DPC, was 0x2542A (about 41 min at 60 Hz). The ISR /
+  DPC retire a slot only when count == target, so those flips never retire. Gameplay never noticed. D3D's
+  PersistDisplay (Orta sub_002ABB20, run before XLaunchNewImage) waits for the queue to empty and spun for ever
+  (a hang dump from a long Orta play session). Orta avoids the path: its Saturn launcher is
+  replaced. Not found yet: what advances +0x1C4 about 2.4 M past the count - Present targeting +0x1C4 + interval at a
+  higher rate than guest vblanks, or the counter mirror above not standing down. It will bite any title that calls
+  PersistDisplay or BlockUntilVerticalBlank-style queue waits after a long session. Start at the flip-target code
+  in the XDK Swap (Orta sub_002B2BA0's caller, sub_002B2E..; the target sits in +0x1C8 / +0x1C4).
 
 ### Decals that z-fight: NV2A polygon offset (THPS 2X, M4)
 - **Symptom:** floor oil/dirt decals and wall graffiti in the Hangar broke up in patches that changed with the camera.
@@ -533,6 +544,9 @@ new one at the milestone it was found. Workflow: [porting_guide.md](porting_guid
   (`zip_extract_to_file`): the 64 MB in-memory cap of `zip_extract` is for shader packs, libLLVM-23.dll alone is 78 MB.
 - **A message must not guess:** "no internet?" was a guess from a failed process start. Carry the real cause up to
   the box (and into `data\launcher.log`).
+- **Superseded for the download itself (maintainer, 2026-11-10, Orta v1.1.0):** the launcher downloads **nothing**
+  any more - the compiler ships in the release (`tools\bundle`, `toolchain.txt` format 2) and the first start runs
+  offline; `http_get.c` is gone. The no-system-tools rule and the in-process, streamed unpacking stay.
 
 ## M6 / v1.0 – gameplay patches, play tests, the release (THPS 2X, 2026-10-31)
 

@@ -22,16 +22,61 @@
 
 #if defined(_WIN32)
 #include <direct.h>
+#include <windows.h>
 #define MKDIR(p) _mkdir(p)
 #define RMDIR(p) _rmdir(p)
 #define SEP "\\"
 #else
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #define MKDIR(p) mkdir(p, 0755)
 #define RMDIR(p) rmdir(p)
 #define SEP "/"
 #endif
+
+/* The temp folder of an earlier run (a second run in the same build folder, or one that stopped half way) holds
+ * files from its last cases - the first install then failed and every later check with it. So the folder is
+ * removed whole before a run. */
+static void rm_tree(const char *dir)
+{
+    char p[1024];
+#if defined(_WIN32)
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    snprintf(p, sizeof p, "%s\\*", dir);
+    h = FindFirstFileA(p, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+                continue;
+            snprintf(p, sizeof p, "%s\\%s", dir, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                rm_tree(p);
+            else
+                remove(p);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#else
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    struct stat st;
+    if (d) {
+        while ((e = readdir(d)) != NULL) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+                continue;
+            snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+            if (lstat(p, &st) == 0 && S_ISDIR(st.st_mode))
+                rm_tree(p);
+            else
+                remove(p);
+        }
+        closedir(d);
+    }
+#endif
+    RMDIR(dir);
+}
 
 static int s_fail;
 #define CHECK(c, what) do { if (c) printf("  PASS  %s\n", what); else { printf("  FAIL  %s (%s:%d)\n", what, __FILE__, __LINE__); s_fail++; } } while (0)
@@ -297,6 +342,17 @@ int main(int argc, char **argv)
     ImageSpec good = { TITLE, 0, 0, 0 };
 
     snprintf(s_root, sizeof s_root, "%s", argc > 1 ? argv[1] : "game_setup_tmp");
+    {
+        /* Only the test's own folders are emptied (ctest passes <build>/layout): a mistyped argument must never
+         * wipe anything else. */
+        const char *leaf = s_root + strlen(s_root);
+        while (leaf > s_root && leaf[-1] != '/' && leaf[-1] != '\\')
+            leaf--;
+        if (!strcmp(leaf, "layout") || !strcmp(leaf, "game_setup_tmp"))
+            rm_tree(s_root);
+        else
+            printf("  (not emptying %s: only a folder named layout or game_setup_tmp is)\n", s_root);
+    }
     MKDIR(s_root);
     path_in(s_game, sizeof s_game, s_root, "game");
     MKDIR(s_game);

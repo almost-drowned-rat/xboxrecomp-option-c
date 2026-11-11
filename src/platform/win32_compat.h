@@ -162,6 +162,9 @@ VOID   ExitThread(DWORD exitCode);
 BOOL   GetExitCodeThread(HANDLE h, LPDWORD exitCode);
 DWORD  ResumeThread(HANDLE h);
 DWORD  SuspendThread(HANDLE h);
+/* POSIX only: a thread another one suspended stops here until it is resumed (no-op otherwise). The kernel
+ * calls it where the console delivers the suspend APC: back from a kernel call, at PASSIVE_LEVEL. */
+void   w32_suspend_point(void);
 BOOL   TerminateThread(HANDLE h, DWORD exitCode);
 DWORD  GetCurrentThreadId(void);
 HANDLE GetCurrentThread(void);
@@ -434,12 +437,10 @@ VOID RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
                PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue);
 VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args);
 
-/* Win32 VEH: opaque PEXCEPTION_POINTERS + AddVectoredExceptionHandler stub.
- * On Linux the equivalent goes through sigaction(SIGSEGV/SIGFPE) +
- * ucontext_t; for now we accept the registration and never fire. 
- * 
- * Note: GCC needs correct struct. This is from nxdk
- * */
+/* Win32 VEH on signals: on x86-64 Linux, AddVectoredExceptionHandler handlers run from one sigaction handler for
+ * SIGSEGV / SIGBUS / SIGILL / SIGFPE / SIGTRAP with an EXCEPTION_RECORD and a CONTEXT (xbox_winnt.h) built from the
+ * signal's ucontext; EXCEPTION_CONTINUE_EXECUTION writes the CONTEXT back. Other POSIX hosts: registration fails
+ * (returns NULL), nothing fires. See win32_compat.c. */
 #ifdef __linux__
 typedef struct _EXCEPTION_POINTERS
 {

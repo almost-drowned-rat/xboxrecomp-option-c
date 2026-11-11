@@ -34,6 +34,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <unistd.h>     /* sysconf(_SC_PAGESIZE) */
+#endif
 
 #define PT_PAGE        0x1000u
 #define PT_PAGES       (XBOX_CONTIG_SIZE / PT_PAGE)
@@ -62,6 +65,18 @@ void xbox_PageTrackEnable(void)
     if (s_on >= 0)
         return;
     s_on = !(e && *e == '0');
+#if !defined(_WIN32)
+    {
+        /* Tracking protects single 4 KB guest pages; a host with 16 KB pages (Apple Silicon, Android 15+ devices
+         * built for them) cannot protect at that grain - mprotect refuses the address. Off there for now. */
+        long host_page = sysconf(_SC_PAGESIZE);
+        if (s_on && host_page != (long)PT_PAGE) {
+            s_on = 0;
+            fprintf(stderr, "  Page tracking: off - the host page is %ld bytes, tracking needs %u\n",
+                    host_page, (unsigned)PT_PAGE);
+        }
+    }
+#endif
     if (s_on) {
         InitializeCriticalSection(&s_lock);
         fprintf(stderr, "  Page tracking: contiguous window, %u pages (RECOMP_PAGE_TRACK=0 turns it off)\n",
@@ -84,14 +99,23 @@ static uintptr_t pt_tiled(uint32_t i)
     return (uintptr_t)xbox_GetMemoryOffset() + XBOX_TILED_BASE + (uintptr_t)i * PT_PAGE;
 }
 
+/* A protect that fails must not leave a page counted as armed: no write would ever fault, its generation would
+ * never move and a texture over it would never be read again. So the first failure switches tracking off for good
+ * (every check then says "changed": the consumers hash as before). Seen on hosts whose page is not 4 KB, where
+ * mprotect refuses a 4 KB-aligned address (xbox_PageTrackEnable already stays off there). */
 static void pt_protect(uint32_t first, uint32_t n, DWORD prot)
 {
     DWORD old;
     uintptr_t t;
-    VirtualProtect((void *)pt_contig(first), (SIZE_T)n * PT_PAGE, prot, &old);
+    int ok = VirtualProtect((void *)pt_contig(first), (SIZE_T)n * PT_PAGE, prot, &old) != 0;
     t = pt_tiled(first);
     if (t && pt_tiled(first + n - 1))
-        VirtualProtect((void *)t, (SIZE_T)n * PT_PAGE, prot, &old);
+        ok &= VirtualProtect((void *)t, (SIZE_T)n * PT_PAGE, prot, &old) != 0;
+    if (!ok && s_on > 0) {
+        s_on = 0;
+        fprintf(stderr, "  Page tracking: protecting guest pages failed (error %lu); off for this run\n",
+                (unsigned long)GetLastError());
+    }
 }
 
 /* Guest VA -> page range in the contiguous window; 0 if (partly) outside. */
@@ -155,6 +179,10 @@ int xbox_PageTrackCheck(uint32_t va, uint32_t len, uint64_t *stamp)
     if (nrun) {
         pt_protect(run0, nrun, PAGE_READONLY);
         s_st_arms += nrun;
+    }
+    if (s_on <= 0) {            /* a protect just failed (pt_protect): from now on everything reads as changed */
+        LeaveCriticalSection(&s_lock);
+        return 0;
     }
     for (i = first; i <= last; i++)
         sum += s_gen[i] + ((uint64_t)i << 40);

@@ -19,7 +19,9 @@ target_include_directories(xbox_shaderpack PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_compile_definitions(xbox_shaderpack PRIVATE MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_DEFLATE_APIS
     MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS MINIZ_NO_ZLIB_COMPATIBLE_NAMES)
 
-find_package(SDL3 CONFIG REQUIRED)
+if(NOT TARGET SDL3::SDL3)                 # a consumer's own SDL3 target (add_subdirectory) wins
+    find_package(SDL3 CONFIG REQUIRED)
+endif()
 target_link_libraries(xbox_shaderpack PUBLIC SDL3::SDL3)
 
 if(MSVC)

@@ -2609,6 +2609,9 @@ static void bridge_KeRemoveQueueDpc(X86Ctx *ctx);   /* defined with the queue */
 typedef struct { uint32_t dpc, arg1, arg2; int64_t queued_us; } PendingDpc;
 static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
 static volatile LONG g_dpc_head, g_dpc_tail;
+/* The timer thread's progress, for the hang reports: passes, the tick of the last one and where it is now. */
+static volatile LONG s_timer_passes, s_timer_phase;
+static volatile DWORD s_timer_last;
 
 /* The queue is fed from several host threads at once -- the USB and APU
  * controller threads raise interrupts whose ISRs queue DPCs, and the title
@@ -2996,6 +2999,11 @@ void xbox_DpcHangReport(void)
             head != tail && g_dpc_queue[head].dpc ? BRIDGE_MEM32(g_dpc_queue[head].dpc + 12) : 0,
             g_vblank_dpc, g_vblank_dpc && BRIDGE_MEM8(g_vblank_dpc + 2) ? " (queued)" : "",
             xbox_Nv2aVblankHoldState());
+    fprintf(stderr, "  [HANG] timer thread: %ld passes, last %lu ms ago, now in %s\n", (long)s_timer_passes,
+            s_timer_passes ? (unsigned long)(GetTickCount() - s_timer_last) : 0UL,
+            s_timer_phase == 1 ? "its wait" : s_timer_phase == 2 ? "the vblank tick" : s_timer_phase == 3
+            ? "the device interrupts" : s_timer_phase == 4 ? "the DPC drain" : s_timer_phase == 5 ? "the timers"
+            : "not started");
     xbox_IrqlDumpHolders();
 }
 
@@ -3397,10 +3405,17 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         int i;
 
         /* a device interrupt, the next guest vblank or 10 ms */
+        s_timer_phase = 1;
         kernel_timer_wait();
+        InterlockedIncrement(&s_timer_passes);
+        s_timer_last = GetTickCount();
+        s_timer_phase = 2;
         kernel_vblank_tick(ctx);  /* the GPU's frame clock */
+        s_timer_phase = 3;
         kernel_service_irqs(ctx); /* device interrupts; their DPCs drain below */
+        s_timer_phase = 4;
         kernel_drain_dpcs(ctx);   /* deferred work, before due timers */
+        s_timer_phase = 5;
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -10433,6 +10448,8 @@ static void kernel_watch_arm_once(void)
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
 static void kernel_thunk_dispatch_body(X86Ctx *ctx);
+static void kt_leave(void);             /* the stall reports' per-thread kernel call table (kt_enter) */
+static void kt_report(void);
 
 /* The guest CPU lock (RECOMP_GUEST_LOCK=1).
  *
@@ -10511,6 +10528,8 @@ static void kernel_thunk_dispatch(RECOMP_PARAMS)
     t_dispatch_depth++;
     kernel_thunk_dispatch_body(ctx);
     t_dispatch_depth--;
+    if (t_dispatch_depth == 0)
+        kt_leave();
     if (s_rt_ready && t_guest_thread && t_dispatch_depth == 0) {
         int e = g_thread_obj;
         if (e >= 0 && s_thread_objs[e].rt)
@@ -10520,6 +10539,17 @@ static void kernel_thunk_dispatch(RECOMP_PARAMS)
             rt_pause_if_needed();
         }
     }
+#if !defined(_WIN32)
+    /* A thread another one suspended (NtSuspendThread) stops here, back from a kernel call at PASSIVE_LEVEL -
+     * where the console delivers the suspend APC; POSIX cannot stop a thread from outside (win32_compat.c). */
+    if (t_guest_thread && t_dispatch_depth == 0) {
+        extern void xbox_IrqlThreadState(int *irql, int *gate_depth);
+        int irql, gate_depth;
+        xbox_IrqlThreadState(&irql, &gate_depth);
+        if (irql == PASSIVE_LEVEL && !gate_depth)
+            w32_suspend_point();
+    }
+#endif
     /* Back to guest code: take the CPU again. Only at the outermost call --
      * a guest callback a bridge runs (an APC) returns into the bridge, not to
      * the thread's own code -- and only if the thread still exists as one. */
@@ -10544,6 +10574,139 @@ static volatile int g_summary_slot;
 static volatile uint32_t g_summary_esp;
 static volatile LONG g_summary_started;
 
+/* No kernel call for 10 s while the title had been calling: every guest thread is stuck somewhere (a spin in guest
+ * code, an ISR that never returns, a wait nobody signals). Once per stall, at most three times a run: the DPC /
+ * gate / device state (xbox_DpcHangReport) and where every host thread is (Linux / Android: host_stack_dump.c;
+ * Windows has the gate holder's samples in the hang report). RECOMP_STALL_DUMP=0 turns it off. */
+#include "platform/host_stack_dump.h"
+static void kernel_stall_check(long long calls)
+{
+    static long long last = -1;
+    static int quiet, dumps, armed = 1, off = -1;
+    if (off < 0) {
+        const char *e = getenv("RECOMP_STALL_DUMP");
+        off = e && *e == '0';
+    }
+    if (off)
+        return;
+    if (calls != last) {
+        last = calls;
+        quiet = 0;
+        armed = 1;
+        return;
+    }
+    if (++quiet < 5 || !armed || dumps >= 3)
+        return;
+    armed = 0;
+    dumps++;
+    fprintf(stderr, "  [HANG] no kernel call for %d s (total %lld) - stall report %d of 3\n", quiet * 2, calls, dumps);
+    xbox_DpcHangReport();
+    kt_report();
+    xbox_HostStackDump(stderr, "kernel calls stalled");
+    fflush(stderr);
+}
+
+/* Where every thread that calls the kernel is, for the stall reports: the kernel call it is in (ordinal, since
+ * when, the guest caller and the first stack words = its arguments), or the last one it made. Written by each
+ * thread into its own slot, read without a lock (a diagnostic). */
+#define KT_SLOTS 64
+static struct {
+    volatile LONG tid;                  /* 0 = free */
+    volatile LONG ord;                  /* the ordinal it is in, -1 = in guest code */
+    volatile LONG last;                 /* the last ordinal */
+    volatile uint32_t caller, a0, a1, a2;
+    volatile DWORD since;               /* GetTickCount at the call's start */
+} s_kt[KT_SLOTS];
+static RECOMP_TLS int t_kt = -2;        /* -2 = not yet, -1 = no slot left */
+
+static void kt_enter(X86Ctx *ctx, ULONG ordinal)
+{
+    int i;
+    if (t_kt == -2) {
+        LONG me = (LONG)GetCurrentThreadId();
+        t_kt = -1;
+        for (i = 0; i < KT_SLOTS; i++)
+            if (InterlockedCompareExchange(&s_kt[i].tid, me, 0) == 0) {
+                t_kt = i;
+                break;
+            }
+    }
+    if (t_kt < 0)
+        return;
+    i = t_kt;
+    s_kt[i].caller = g_xbox_kernel_caller;
+    s_kt[i].a0 = g_esp ? BRIDGE_MEM32(g_esp) : 0;
+    s_kt[i].a1 = g_esp ? BRIDGE_MEM32(g_esp + 4) : 0;
+    s_kt[i].a2 = g_esp ? BRIDGE_MEM32(g_esp + 8) : 0;
+    s_kt[i].since = GetTickCount();
+    s_kt[i].last = (LONG)ordinal;
+    s_kt[i].ord = (LONG)ordinal;
+    if (ordinal == 258) {               /* PsTerminateSystemThread does not come back: the slot is free again */
+        s_kt[i].tid = 0;
+        t_kt = -1;
+    }
+}
+
+static void kt_leave(void)
+{
+    if (t_kt >= 0)
+        s_kt[t_kt].ord = -1;
+}
+
+static void kt_report(void)
+{
+    DWORD now = GetTickCount();
+    int i;
+    for (i = 0; i < KT_SLOTS; i++) {
+        if (!s_kt[i].tid)
+            continue;
+        if (s_kt[i].ord >= 0)
+            fprintf(stderr, "  [HANG] tid %ld: in ordinal %ld for %lu ms, caller 0x%08X, stack %08X %08X %08X\n",
+                    (long)s_kt[i].tid, (long)s_kt[i].ord, (unsigned long)(now - s_kt[i].since), s_kt[i].caller,
+                    s_kt[i].a0, s_kt[i].a1, s_kt[i].a2);
+        else
+            fprintf(stderr, "  [HANG] tid %ld: guest code since %lu ms, last ordinal %ld from 0x%08X\n",
+                    (long)s_kt[i].tid, (unsigned long)(now - s_kt[i].since), (long)s_kt[i].last, s_kt[i].caller);
+    }
+}
+
+/* RECOMP_FLIP_STALL_MS=<ms> (diagnostic, off by default): no frame presented for that long -> the stall report
+ * (DPC / gate state + every host thread's stack, host_stack_dump.c) - for single long frames that are too short
+ * for the 10-s kernel stall check (CRI movie stalls of 1.3-1.6 s on Linux, 2026-11-11). Five reports at most;
+ * re-armed by the next present. */
+static DWORD WINAPI flip_stall_thread(LPVOID arg)
+{
+    extern volatile LONG g_xr_presents;
+    long limit = (long)(intptr_t)arg, quiet = 0;
+    LONG last = -1;
+    int dumps = 0, armed = 1;
+    for (;;) {
+        LONG now;
+        Sleep(50);
+        now = InterlockedCompareExchange(&g_xr_presents, 0, 0);
+        if (now != last) {
+            last = now;
+            quiet = 0;
+            armed = 1;
+            continue;
+        }
+        quiet += 50;
+        if (now > 0 && armed && quiet >= limit && dumps < 5) {
+            char why[96];
+            armed = 0;
+            dumps++;
+            snprintf(why, sizeof why, "no frame presented for %ld ms (frame %ld), report %d of 5", quiet,
+                     (long)now, dumps);
+            fprintf(stderr, "  [HANG] %s\n", why);
+            xbox_DpcHangReport();
+            kt_report();
+            xbox_HostStackDump(stderr, why);
+            fflush(stderr);
+        }
+    }
+    return 0;
+}
+
 static DWORD WINAPI kernel_summary_thread(LPVOID unused)
 {
     (void)unused;
@@ -10551,6 +10714,7 @@ static DWORD WINAPI kernel_summary_thread(LPVOID unused)
         Sleep(2000);
         if (g_kernel_call_count <= 200)
             continue;
+        kernel_stall_check(g_kernel_call_count);
         fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                 g_kernel_call_count, (unsigned)g_summary_ordinal, g_summary_slot, g_summary_esp);
         /* And which ones, ranked. "Latest" names whatever the sample
@@ -10638,8 +10802,12 @@ static void kernel_thunk_dispatch_body(X86Ctx *ctx)
     g_summary_ordinal = ordinal;
     g_summary_slot = slot;
     g_summary_esp = g_esp;
-    if (!g_summary_started && InterlockedExchange(&g_summary_started, 1) == 0)
+    if (!g_summary_started && InterlockedExchange(&g_summary_started, 1) == 0) {
+        const char *fs = getenv("RECOMP_FLIP_STALL_MS");
         CloseHandle(CreateThread(NULL, 0, kernel_summary_thread, NULL, 0, NULL));
+        if (fs && atoi(fs) > 0)
+            CloseHandle(CreateThread(NULL, 0, flip_stall_thread, (LPVOID)(intptr_t)atoi(fs), 0, NULL));
+    }
 
     /* Pop the dummy return address that PUSH32(esp, 0) pushed before RECOMP_ICALL.
      * On real x86, "call [thunk]" pushes a real return address and "ret" pops it.
@@ -10650,6 +10818,7 @@ static void kernel_thunk_dispatch_body(X86Ctx *ctx)
      * lock, which is the one fact a deadlock report otherwise lacks. */
     g_xbox_kernel_caller = g_esp ? BRIDGE_MEM32(g_esp) : 0;
     g_esp += 4;
+    kt_enter(ctx, ordinal);
 
     /* Name the bridge that corrupts a watched dword.
      *

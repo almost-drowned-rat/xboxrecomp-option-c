@@ -23,6 +23,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+
+/* The AC97 bus-master write trap and RECOMP_WATCH step the faulting write with the x86 trap flag (EFlags TF) and
+ * close the page again afterwards. Only an x86 host's CONTEXT has EFlags (xbox_winnt.h: PCONTEXT is opaque
+ * elsewhere); on an arm64 host (Android, 2026-11-11) both are not armed - a stepped write there needs the
+ * AArch64 decoder (mmio_decode_a64.h) to emulate the store instead. */
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#define XR_HOST_SINGLE_STEP 1
+#else
+#define XR_HOST_SINGLE_STEP 0
+#endif
+/* arm64 Linux / Android: the AC97 trap emulates the faulting store with the AArch64 decoder instead of stepping it
+ * (Orta on the S23, 2026-11-11: without the trap DirectSoundCreate spun at DISPATCH_LEVEL on a channel reset, the
+ * one-CPU gate stayed shut and no interrupt was delivered again - a black screen). RECOMP_WATCH stays x86-only. */
+#if !XR_HOST_SINGLE_STEP && defined(__aarch64__) && defined(__linux__)
+#define XR_AC97_EMULATE 1
+#include "platform/mmio_decode.h"
+#include <unistd.h>   /* sysconf */
+#else
+#define XR_AC97_EMULATE 0
+#endif
 #if !defined(_WIN32)
 #include <time.h>     /* clock_gettime */
 #include <unistd.h>   /* _exit */
@@ -428,6 +448,23 @@ static void ac97_clear_reset_bits_at(void *page)
     }
 }
 
+#if XR_AC97_EMULATE
+/* The decoder's device callbacks: the NABM page through the writable host view (the guest page stays read-only). */
+static uint64_t ac97_emu_rd(void *dev, uint32_t off, int size)
+{
+    uint64_t v = 0;
+    if (off + (uint32_t)size <= AC97_TRAP_BYTES)
+        memcpy(&v, (const uint8_t *)dev + off, (size_t)size);
+    return v;
+}
+
+static void ac97_emu_wr(void *dev, uint32_t off, uint64_t val, int size)
+{
+    if (off + (uint32_t)size <= AC97_TRAP_BYTES)
+        memcpy((uint8_t *)dev + off, &val, (size_t)size);
+}
+#endif
+
 static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
@@ -435,6 +472,40 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 
     if (!g_ac97_page)
         return EXCEPTION_CONTINUE_SEARCH;
+#if XR_AC97_EMULATE
+    /* One step: the write fault emulated through the host view (Pc moves past the store), then what the
+     * controller does after a write - the channel model, RR cleared - all under s_ac97_cs, as the x86 path. */
+    (void)old;
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
+        if (fault >= (uintptr_t)g_ac97_page && fault < (uintptr_t)g_ac97_page + AC97_TRAP_BYTES) {
+            int ok;
+            EnterCriticalSection(&s_ac97_cs);
+            memcpy(s_ac97_before, (const uint8_t *)g_ac97_page + AC97_MODEL_LO, sizeof s_ac97_before);
+            s_ac97_off = (uint32_t)(fault - (uintptr_t)g_ac97_page);
+            ok = mmio_emulate(ep->ContextRecord, s_ac97_off, g_ac97_host_view, ac97_emu_rd, ac97_emu_wr);
+            if (ok) {
+                if (g_ac97_after_write)
+                    g_ac97_after_write((volatile uint8_t *)g_ac97_host_view, s_ac97_before, s_ac97_off);
+                ac97_clear_reset_bits_at(g_ac97_host_view);
+            }
+            LeaveCriticalSection(&s_ac97_cs);
+            if (ok)
+                return EXCEPTION_CONTINUE_EXECUTION;
+            {
+                static int told;
+                if (!told++)
+                    fprintf(stderr, "  AC97: a bus-master write at NABM +0x%03X the decoder does not know "
+                                    "(insn %08X) - not emulated\n", s_ac97_off,
+                            *(const uint32_t *)(uintptr_t)MMIO_CTX_PC(ep->ContextRecord));
+            }
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+#elif !XR_HOST_SINGLE_STEP
+    (void)code; (void)old;
+    return EXCEPTION_CONTINUE_SEARCH;
+#else
 
     /* Second half: the faulting write has now executed. Apply what the
      * controller would have done and close the page again. Thread-local,
@@ -475,6 +546,7 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
+#endif
 }
 
 /* Arm the trap. Called once the MCPX aperture exists, and only alongside the
@@ -486,11 +558,31 @@ static void ac97_arm_write_trap(void)
 
     if (!g_mcpx_memory || g_ac97_page)
         return;
+#if XR_AC97_EMULATE
+    /* the emulation writes through the host view, and the protection must cover only the NABM page */
+    if (!g_mcpx_mapping || sysconf(_SC_PAGESIZE) != (long)AC97_TRAP_BYTES) {
+        fprintf(stderr, "  AC97: no bus-master write trap on this host (%s); a channel reset will spin\n",
+                g_mcpx_mapping ? "host page is not 4 KB" : "no file mapping behind the MCPX aperture");
+        return;
+    }
+#elif !XR_HOST_SINGLE_STEP
+    (void)old;
+    fprintf(stderr, "  AC97: no bus-master write trap on this host (no trap-flag single step);"
+                    " a channel reset will spin\n");
+    return;
+#endif
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
     InitializeCriticalSection(&s_ac97_cs);
     if (g_mcpx_mapping)     /* 0x400000 is a multiple of the 64 KB view granularity */
         g_ac97_host_view = MapViewOfFile(g_mcpx_mapping, FILE_MAP_ALL_ACCESS, 0, AC97_NABM_OFFSET,
                                          AC97_TRAP_BYTES);
+#if XR_AC97_EMULATE
+    if (!g_ac97_host_view) {
+        g_ac97_page = NULL;
+        fprintf(stderr, "  AC97: no host view of the bus-master page; a channel reset will spin\n");
+        return;
+    }
+#endif
     /* First, so it runs before the game target's own crash reporter, which
      * would otherwise print the write as an access violation. */
     g_ac97_veh = AddVectoredExceptionHandler(1, ac97_write_veh);
@@ -1005,12 +1097,15 @@ static volatile int   s_dp_running;     /* the thread counts display vblanks now
  * before (the renderer calls this after each present), a histogram every 10 s:
  * "[pacing] refreshes per frame 1:a 2:b 3:c 4+:d". With the timer (=timer) the
  * thread still counts, it only does not pace - the two modes side by side. */
+volatile LONG g_xr_presents;           /* frames presented (RECOMP_FLIP_STALL_MS watches it, kernel_bridge.c) */
+
 void xbox_GuestPresentNote(void)
 {
     static int on = -1;
     static uint64_t last_dv, t_last;
     static unsigned h[5];
     uint64_t dv, now, d;
+    InterlockedIncrement(&g_xr_presents);
     if (on < 0) {
         const char *e = getenv("RECOMP_PACING_STATS");
         on = e && *e == '1';
@@ -2489,6 +2584,10 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
 
     if (!g_watch_page)
         return EXCEPTION_CONTINUE_SEARCH;
+#if !XR_HOST_SINGLE_STEP
+    (void)ctx; (void)code; (void)old;
+    return EXCEPTION_CONTINUE_SEARCH;
+#else
 
     if (code == EXCEPTION_SINGLE_STEP && s_watch_stepping) {
         s_watch_stepping = 0;
@@ -2512,6 +2611,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
+#endif
 }
 
 /* The target, which may be reached through pointers that do not exist yet.
@@ -2598,6 +2698,11 @@ static int watch_arm(uint32_t va)
     DWORD old;
 
     g_watch_va = va;
+#if !XR_HOST_SINGLE_STEP
+    (void)old;
+    fprintf(stderr, "  WATCH: not available on this host (no trap-flag single step); 0x%08X not armed\n", va);
+    return 0;
+#endif
     if (!peek_readable(g_watch_va)) {
         fprintf(stderr, "  WATCH: 0x%08X is not in a mapped window; "
                         "not armed\n", g_watch_va);
@@ -3957,6 +4062,17 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 fprintf(stderr, "  Mirror %d: skipped, overlaps the tiled"
                                 " aperture at 0x%08X\n",
                         m + 1, (unsigned)XBOX_TILED_BASE);
+                continue;
+            }
+            /* The contiguous window is mapped already (above), and with 128 MB of guest RAM mirror 16 lands on it.
+             * Windows refused that view (error 487, the mirror failed and the window stayed); POSIX's VirtualFree
+             * below unmapped the window and the mirror took its place, so the GPU's tiled aperture no longer
+             * aliased it (Panzer Dragoon Orta's first Linux run: "tiled aperture does NOT alias"). Skipped
+             * explicitly, the same on every host. */
+            if (guest_lo < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE && (uint64_t)XBOX_CONTIG_BASE < guest_hi) {
+                fprintf(stderr, "  Mirror %d: skipped, overlaps the contiguous"
+                                " window at 0x%08X\n",
+                        m + 1, (unsigned)XBOX_CONTIG_BASE);
                 continue;
             }
             /* Inside the reservation this hands back the slice we are about

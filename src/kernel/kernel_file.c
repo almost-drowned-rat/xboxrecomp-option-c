@@ -1162,11 +1162,213 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 /* ======================================================================== */
 #else /* !_WIN32 */
 
+/* ── Atomic save writes, POSIX (the same contract as the Win32 side above) ──
+ *
+ * A save opened for writing gets a copy in save_dir/.pending/ as its handle; closing it fsyncs the copy, renames
+ * it over the save (rename(2) is atomic on one filesystem, and .pending lies inside save_dir) and fsyncs the
+ * folder, so the new name survives a power loss too. A run killed mid-save leaves the old save as it was; the
+ * copy is dropped at the next start (kernel_path.c pending_cleanup). Contents the title keeps (FILE_OPEN,
+ * FILE_OPEN_IF) are copied first. Only under save_dir, only for write access, never directories or
+ * delete-on-close opens (real saves on Linux, 2026-11-11). */
+#include <pthread.h>
+
+typedef struct {
+    HANDLE h;
+    int    delete_final;
+    int    delete_old;                  /* renamed while open: old_final goes when the copy is committed */
+    char   tmp[XBOX_HOST_PATH];
+    char   final_path[XBOX_HOST_PATH];
+    char   old_final[XBOX_HOST_PATH];
+} SaveShadow;
+
+#define SAVE_SHADOW_MAX 64
+static SaveShadow      s_shadow[SAVE_SHADOW_MAX];
+static pthread_mutex_t s_shadow_lock = PTHREAD_MUTEX_INITIALIZER;
+static long            s_shadow_seq;
+
+static SaveShadow *shadow_find(HANDLE h)
+{
+    int i;
+    for (i = 0; i < SAVE_SHADOW_MAX; i++)
+        if (h && s_shadow[i].h == h)
+            return &s_shadow[i];
+    return NULL;
+}
+
+static int copy_file_posix(const char *from, const char *to)
+{
+    char buf[65536];
+    int in = open(from, O_RDONLY), out;
+    ssize_t n;
+    if (in < 0)
+        return 0;
+    out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) {
+        close(in);
+        return 0;
+    }
+    while ((n = read(in, buf, sizeof buf)) > 0) {
+        char *p = buf;
+        while (n > 0) {
+            ssize_t w = write(out, p, (size_t)n);
+            if (w <= 0) {
+                close(in);
+                close(out);
+                unlink(to);
+                return 0;
+            }
+            p += w;
+            n -= w;
+        }
+    }
+    close(in);
+    if (n < 0 || close(out) != 0) {
+        unlink(to);
+        return 0;
+    }
+    return 1;
+}
+
+/* the folder holding p, fsynced: a rename is durable only once its directory is */
+static void fsync_parent(const char *p)
+{
+    char dir[XBOX_HOST_PATH];
+    char *slash;
+    int fd;
+    snprintf(dir, sizeof dir, "%s", p);
+    slash = strrchr(dir, '/');
+    if (!slash)
+        return;
+    *slash = 0;
+    if ((fd = open(dir[0] ? dir : "/", O_RDONLY | O_DIRECTORY)) >= 0) {
+        fsync(fd);
+        close(fd);
+    }
+}
+
+/* Open host_path for writing through a pending copy: the fd, -1 with errno (the caller maps it), or -2 when the
+ * open should go the normal way. *sh_out is the claimed slot (its handle filled in by the caller). */
+static int shadow_open(const char *host_path, int flags, ULONG disposition, SaveShadow **sh_out)
+{
+    struct stat st;
+    int exists = stat(host_path, &st) == 0;
+    int keep = disposition == XBOX_FILE_OPEN || disposition == XBOX_FILE_OPEN_IF;
+    const char *name = strrchr(host_path, '/');
+    const char *pending = xbox_path_pending_dir();
+    SaveShadow *sh = NULL;
+    int fd, i;
+
+    *sh_out = NULL;
+    if (exists && S_ISDIR(st.st_mode))
+        return -2;
+    if (!exists && (disposition == XBOX_FILE_OPEN || disposition == XBOX_FILE_OVERWRITE))
+        return -2;                          /* the normal open reports "not found" */
+    if (exists && disposition == XBOX_FILE_CREATE) {
+        errno = EEXIST;
+        return -1;
+    }
+    if (!pending || !pending[0])
+        return -2;
+    mkdir(pending, 0755);                   /* made at path init; a title may have removed save_dir since */
+    pthread_mutex_lock(&s_shadow_lock);
+    for (i = 0; i < SAVE_SHADOW_MAX && !sh; i++)
+        if (!s_shadow[i].h && !s_shadow[i].tmp[0])
+            sh = &s_shadow[i];
+    if (!sh) {
+        pthread_mutex_unlock(&s_shadow_lock);
+        return -2;                          /* table full: write in place */
+    }
+    snprintf(sh->tmp, sizeof sh->tmp, "%s/%ld_%s", pending, ++s_shadow_seq, name ? name + 1 : "save");
+    snprintf(sh->final_path, sizeof sh->final_path, "%s", host_path);
+    sh->delete_final = 0;
+    sh->delete_old = 0;
+    sh->old_final[0] = 0;
+    pthread_mutex_unlock(&s_shadow_lock);   /* the slot is ours (tmp set); copy without holding the lock */
+
+    if (keep && exists && !copy_file_posix(host_path, sh->tmp)) {
+        sh->tmp[0] = 0;
+        return -2;
+    }
+    flags &= ~(O_EXCL | O_TRUNC | O_ACCMODE);
+    flags |= O_RDWR | O_CREAT | (keep && exists ? 0 : O_TRUNC);
+    fd = open(sh->tmp, flags, 0644);
+    if (fd < 0) {
+        unlink(sh->tmp);
+        sh->tmp[0] = 0;
+        return -2;
+    }
+    *sh_out = sh;
+    return fd;
+}
+
+/* A delete disposition set on a pending copy deletes the save on close. */
+static int shadow_mark_delete(HANDLE h, int del)
+{
+    SaveShadow *sh;
+    pthread_mutex_lock(&s_shadow_lock);
+    sh = shadow_find(h);
+    if (sh)
+        sh->delete_final = del;
+    pthread_mutex_unlock(&s_shadow_lock);
+    return sh != NULL;
+}
+
+/* RECOMP_SAVE_CRASH_TEST=<text>, as on Windows: end the process the moment a save write whose path contains
+ * <text> (case-insensitive) is about to be committed - a deterministic "killed mid-save" for storage tests. */
+static void crash_test_point(const char *final_path)
+{
+    /* read at every commit (a save commit is no hot path): a forked test child sets it after its parent
+     * already committed once */
+    const char *needle = getenv("RECOMP_SAVE_CRASH_TEST");
+    if (needle && *needle && strcasestr(final_path, needle)) {
+        fprintf(stderr, "  [STORAGE] RECOMP_SAVE_CRASH_TEST: terminating before %s is committed\n", final_path);
+        xbox_log_drain();
+        _exit(3);                           /* no atexit, no flush: as a kill */
+    }
+}
+
 void xbox_file_close_host(void *host_handle)
 {
-    /* ponytail: no atomic save writes on POSIX yet (see the Win32 side). */
-    if (host_handle)
-        CloseHandle((HANDLE)host_handle);
+    HANDLE h = (HANDLE)host_handle;
+    SaveShadow done;
+    SaveShadow *sh;
+    int fd;
+
+    if (!h)
+        return;
+    xbox_dir_context_drop(h);               /* before the value can be reused (see below) */
+    pthread_mutex_lock(&s_shadow_lock);
+    sh = shadow_find(h);
+    if (sh) {
+        done = *sh;
+        sh->h = NULL;                       /* tmp stays set until the commit is through: the slot is not free */
+    }
+    pthread_mutex_unlock(&s_shadow_lock);
+    if (sh && (fd = w32_handle_fd(h)) >= 0)
+        fsync(fd);
+    CloseHandle(h);
+    if (!sh)
+        return;
+    if (!done.delete_final)
+        crash_test_point(done.final_path);
+    if (done.delete_final) {
+        unlink(done.tmp);
+        unlink(done.final_path);
+        fsync_parent(done.final_path);
+    } else if (rename(done.tmp, done.final_path) != 0) {
+        fprintf(stderr, "  [STORAGE] save write not committed: %s -> %s (errno %d); the old save is kept\n",
+                done.tmp, done.final_path, errno);
+        unlink(done.tmp);
+    } else {
+        fsync_parent(done.final_path);
+        if (done.delete_old) {
+            unlink(done.old_final);         /* renamed while open: the old name is gone now */
+            fsync_parent(done.old_final);
+        }
+    }
+    pthread_mutex_lock(&s_shadow_lock);
+    sh->tmp[0] = 0;                         /* the slot is free again */
+    pthread_mutex_unlock(&s_shadow_lock);
 }
 /* ====================  POSIX backend  =================================== */
 /* ======================================================================== */
@@ -1234,7 +1436,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
     ULONG CreateDisposition, ULONG CreateOptions)
 {
-    char host_path[XBOX_HOST_PATH];
+    char host_path[XBOX_HOST_PATH], shadow_tmp[XBOX_HOST_PATH];
+    SaveShadow *shadow = NULL;
     (void)AllocationSize; (void)FileAttributes; (void)ShareAccess;
 
     if (!FileHandle || !ObjectAttributes)
@@ -1261,25 +1464,55 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         }
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
     } else {
-        fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
+        int flags = posix_open_flags(DesiredAccess, CreateDisposition);
+        fd = -2;
+        if ((flags & O_ACCMODE) != O_RDONLY && !(CreateOptions & XBOX_FILE_DELETE_ON_CLOSE)
+                && xbox_path_in_save_dir(host_path)) {
+            fd = shadow_open(host_path, flags, CreateDisposition, &shadow);
+            if (fd >= 0)
+                snprintf(shadow_tmp, sizeof shadow_tmp, "%s", shadow->tmp);
+        }
+        if (fd == -2)
+            fd = open(host_path, flags, 0644);
     }
 
     if (fd < 0) {
         int e = errno;
+        NTSTATUS st = errno_to_status(e);
+        /* ENOENT covers both a missing file and a missing folder on the way; Windows (and the console) answer the
+         * second with STATUS_OBJECT_PATH_NOT_FOUND, and titles branch on the difference (create the folder, or not). */
+        if (e == ENOENT) {
+            char parent[XBOX_HOST_PATH];
+            char *slash;
+            struct stat ps;
+            snprintf(parent, sizeof parent, "%s", host_path);
+            slash = strrchr(parent, '/');
+            if (slash && slash != parent) {
+                *slash = '\0';
+                if (stat(parent, &ps) != 0 || !S_ISDIR(ps.st_mode))
+                    st = STATUS_OBJECT_PATH_NOT_FOUND;
+            }
+        }
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = st;
             IoStatusBlock->Information = 0;
         }
-        return errno_to_status(e);
+        return st;
     }
 
-    *FileHandle = w32_open_handle(fd, host_path);
+    /* a pending copy is recorded under its own path (what the handle really is); the save's name is in the slot */
+    *FileHandle = w32_open_handle(fd, shadow ? shadow_tmp : host_path);
+    if (shadow) {
+        pthread_mutex_lock(&s_shadow_lock);
+        shadow->h = *FileHandle;
+        pthread_mutex_unlock(&s_shadow_lock);
+    }
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = xbox_create_information(CreateDisposition, existed);
     }
-    XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %s -> handle=%p", host_path, *FileHandle);
+    XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %s -> handle=%p%s", host_path, *FileHandle, shadow ? " (pending copy)" : "");
     return STATUS_SUCCESS;
 }
 
@@ -1361,7 +1594,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(Handle);
+        xbox_file_close_host(Handle);       /* as on Windows: commits a pending save, drops a directory search */
         return STATUS_SUCCESS;
     }
     return STATUS_INVALID_HANDLE;
@@ -1476,8 +1709,35 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
+        case XboxFileAllocationInformation: {
+            /* Reserve space (see the Windows one: Halo's save path, Orta's Z: cache .tmp files with
+             * OVERWRITE_IF). NT semantics: a size below the end of file cuts the file there; a larger one
+             * only reserves, the end of file stays. Linux: fallocate KEEP_SIZE; a filesystem without it
+             * (EOPNOTSUPP: tmpfs on old kernels, 9p/drvfs under WSL) still succeeds - the reservation is
+             * a hint, the later writes grow the file. */
+            PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+            off_t want = (off_t)info->EndOfFile.QuadPart;
+            struct stat st;
+            if (want < 0 || fstat(fd, &st) != 0)
+                return STATUS_INVALID_PARAMETER;
+            if (want < st.st_size) {
+                if (ftruncate(fd, want) != 0)
+                    return STATUS_UNSUCCESSFUL;
+            }
+#if defined(__linux__)
+            else if (want > st.st_size)
+                (void)fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, want);
+#endif
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            return STATUS_SUCCESS;
+        }
         case XboxFileDispositionInformation: {
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
+            /* A pending save copy: the save goes at close (the copy with it). */
+            if (shadow_mark_delete(FileHandle, info->DeleteFile != 0)) {
+                IoStatusBlock->Status = STATUS_SUCCESS;
+                return STATUS_SUCCESS;
+            }
             /* POSIX: unlinking an open file removes it on last close -- this
              * matches NT "delete on close" semantics exactly. */
             if (info->DeleteFile) {
@@ -1506,25 +1766,35 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
 
 NTSTATUS xbox_file_dismount(HANDLE h)
 {
-    (void)h;                          /* no partition images on POSIX (kernel_path.c) */
+    const char *p = h ? w32_handle_path(h) : NULL;   /* the partition image the device opened (kernel_path.c) */
+    if (p)
+        xbox_path_utility_formatted(p);
     return STATUS_SUCCESS;
 }
 
 /* FileRenameInformation, POSIX (see the Windows one): rename(2) of the handle's path. The handle keeps working
- * (POSIX renames an open file in place); its recorded path stays the old one, which only names log lines. */
+ * (POSIX renames an open file in place); its recorded path stays the old one, which only names log lines.
+ * A save written through a pending copy is renamed at its commit (close) instead. */
 NTSTATUS xbox_file_rename(HANDLE file, HANDLE root, const char *xbox_name, int replace)
 {
-    char target[XBOX_HOST_PATH];
+    char target[XBOX_HOST_PATH], save_name[XBOX_HOST_PATH] = "";
     const char *src = w32_handle_path(file);
     struct stat st;
 
     if (!src || !xbox_name || !xbox_name[0])
         return STATUS_INVALID_PARAMETER;
+    {   /* a pending save copy lives in .pending: a bare name is relative to the SAVE's folder, not the copy's */
+        SaveShadow *sh;
+        pthread_mutex_lock(&s_shadow_lock);
+        if ((sh = shadow_find(file)) != NULL)
+            snprintf(save_name, sizeof save_name, "%s", sh->final_path);
+        pthread_mutex_unlock(&s_shadow_lock);
+    }
     if (xbox_name[0] == '\\' || (xbox_name[0] && xbox_name[1] == ':')) {
         if (!xbox_translate_path(xbox_name, target, sizeof target))
             return STATUS_OBJECT_PATH_NOT_FOUND;
     } else {
-        const char *base = root ? w32_handle_path(root) : src;
+        const char *base = root ? w32_handle_path(root) : save_name[0] ? save_name : src;
         const char *slash;
         size_t n;
         if (!base)
@@ -1537,6 +1807,21 @@ NTSTATUS xbox_file_rename(HANDLE file, HANDLE root, const char *xbox_name, int r
     }
     if (!replace && stat(target, &st) == 0)
         return STATUS_OBJECT_NAME_COLLISION;
+    {   /* a save written through a pending copy: the commit at close goes to the new name, the old one goes */
+        SaveShadow *sh;
+        pthread_mutex_lock(&s_shadow_lock);
+        sh = shadow_find(file);
+        if (sh) {
+            if (stat(sh->final_path, &st) == 0 && !sh->delete_old) {
+                snprintf(sh->old_final, sizeof sh->old_final, "%s", sh->final_path);
+                sh->delete_old = 1;
+            }
+            snprintf(sh->final_path, sizeof sh->final_path, "%s", target);
+            pthread_mutex_unlock(&s_shadow_lock);
+            return STATUS_SUCCESS;
+        }
+        pthread_mutex_unlock(&s_shadow_lock);
+    }
     if (rename(src, target) != 0) {
         fprintf(stderr, "  [FILE] rename %s -> %s refused (errno %d)\n", src, target, errno);
         return errno == ENOENT ? STATUS_OBJECT_PATH_NOT_FOUND
@@ -1631,6 +1916,37 @@ static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
 
+/* As on Windows: a closed directory handle takes its enumeration with it. The compat layer reuses handle values,
+ * and a search the title abandons at its first match (Orta's Z: cache check: open "Partition5\", query
+ * "laser.txb", close) otherwise went on under the next directory opened at the same value - its first answer was
+ * the OLD search's next entry under the old pattern, so every cache hit after the first one read as a miss and the
+ * file was copied from the disc again (an Orta run under WSL, 2026-11-10: rename onto the existing name ->
+ * NAME_COLLISION, .tmp files left behind). */
+void xbox_dir_context_drop(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init || !FileHandle)
+        return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].handle == FileHandle) {
+            if (s_dir_contexts[i].dir)
+                closedir(s_dir_contexts[i].dir);
+            s_dir_contexts[i].dir = NULL;
+            s_dir_contexts[i].handle = NULL;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
+
+/* NT masks: "*.*" is every name (with or without a dot), as "*" (FsRtlIsNameInExpression's DOS rule the FATX
+ * driver follows); everything else is matched case-insensitively. */
+static int dir_name_matches(const char *pattern, const char *name)
+{
+    if (!strcmp(pattern, "*") || !strcmp(pattern, "*.*"))
+        return 1;
+    return fnmatch(pattern, name, FNM_CASEFOLD | FNM_NOESCAPE) == 0;
+}
+
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
@@ -1697,7 +2013,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         }
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
             continue;
-        if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
+        if (dir_name_matches(ctx->pattern, de->d_name))
             break;
     }
 

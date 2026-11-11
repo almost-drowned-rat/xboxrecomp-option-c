@@ -502,8 +502,8 @@ void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count);
 
 /**
  * Get the kernel thunk table address and entry count currently in effect.
- * Set during memory layout init from the XBE header. *xbox_va/*count are
- * zeroed if never configured.
+ * Set during memory layout init from the XBE header. Both outputs (xbox_va,
+ * count) are zeroed if never configured.
  */
 void xbox_kernel_get_thunk_address(uint32_t *xbox_va, uint32_t *count);
 
@@ -813,9 +813,8 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     PLARGE_INTEGER ByteOffset);
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle);
-#ifdef _WIN32
+/* a closed directory handle takes its NtQueryDirectoryFile enumeration with it (both hosts) */
 void xbox_dir_context_drop(HANDLE FileHandle);
-#endif
 
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes);
 

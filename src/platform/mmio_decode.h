@@ -28,12 +28,25 @@
 
 #include <stdint.h>
 
+/* Windows: the system's VEH. x86-64 Linux: the compat layer's signal handler hands the same CONTEXT fields
+ * (win32_compat.c, AddVectoredExceptionHandler). arm64 Linux / Android: the same handler with the arm64 CONTEXT,
+ * and mmio_emulate (at the end of this file) runs mmio_decode_a64.h on it.
+ * MMIO_CTX_PC(ctx): the faulting instruction's address on either, for the callers' "undecoded" lines. */
+#if defined(_WIN32) || (defined(__x86_64__) && defined(__linux__))
+#define MMIO_DECODE_AVAILABLE 1
+#define MMIO_CTX_PC(c) ((c)->Rip)
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include "win32_compat.h"
+#endif
 
 /* Service one register access. dev is passed straight back to the callbacks. */
+#ifndef MMIO_RW_FN_DEFINED
+#define MMIO_RW_FN_DEFINED
 typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
 typedef void     (*mmio_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
+#endif
 
 static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
 {
@@ -293,5 +306,37 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 }
 
-#endif /* _WIN32 */
+#elif defined(__aarch64__) && defined(__linux__)
+#define MMIO_DECODE_AVAILABLE 1
+#define MMIO_CTX_PC(c) ((c)->Pc)
+#include "win32_compat.h"
+#include "mmio_decode_a64.h"
+
+/* The arm64 counterpart: the faulting load/store at ctx->Pc against the device at offset `off` (the offset of
+ * ctx->XrFaultAddress, which the compat signal handler took from si_addr). Registers go through MmioA64Regs so the
+ * decoder stays the tested, host-independent one; on success they come back with Pc past the instruction. */
+static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+                               mmio_read_fn rd, mmio_write_fn wr)
+{
+    MmioA64Regs r;
+    uint32_t insn;
+    int i;
+
+    if (!ctx->XrFaultAddress)
+        return 0;
+    for (i = 0; i < 31; i++)
+        r.x[i] = ctx->X[i];
+    r.sp = ctx->Sp;
+    r.pc = ctx->Pc;
+    memcpy(&insn, (const void *)(uintptr_t)ctx->Pc, 4);
+    if (!mmio_a64_emulate(&r, insn, ctx->XrFaultAddress, off, dev, rd, wr))
+        return 0;
+    for (i = 0; i < 31; i++)
+        ctx->X[i] = r.x[i];
+    ctx->Sp = r.sp;
+    ctx->Pc = r.pc;
+    return 1;
+}
+
+#endif /* _WIN32 || x86-64 Linux / arm64 Linux */
 #endif /* MMIO_DECODE_H */

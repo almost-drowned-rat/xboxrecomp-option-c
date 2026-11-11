@@ -12,30 +12,13 @@
 #include <string.h>
 #include "apu_xaudio2.h"
 
-/* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
- * stubbed to report inactive; real audio output via SDL2 comes later. */
-#if defined(_WIN32)
-
-#define COBJMACROS
-#include <windows.h>
-#include <xaudio2.h>
-
-#pragma comment(lib, "xaudio2.lib")
-#pragma comment(lib, "ole32.lib")
+/* Two backends behind one interface (apu_xaudio2.h): XAudio2 on Windows, an SDL3 audio stream elsewhere
+ * (XBOX_APU_SDL3_AUDIO, set by the CMake file when SDL3 is found). Without either, every xa2_* is an inactive
+ * stub (no sound). */
 
 #define XA2_SAMPLE_RATE   48000
-#define XA2_CHANNELS      g_xa2_channels
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
 #define XA2_NUM_BUFS      3
-#define XA2_MASK_51       (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER | SPEAKER_LOW_FREQUENCY | \
-                           SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT)
-
-static IXAudio2               *g_xa2 = NULL;
-static IXAudio2MasteringVoice *g_xa2_master = NULL;
-static IXAudio2SourceVoice    *g_xa2_source = NULL;
-static int                     g_xa2_channels = 2;
-extern volatile int            g_xbox_audio_surround;   /* kernel_xbox.c: XC_AUDIO's Dolby Digital bit */
-static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][6];
 
 int xa2_surround_requested(void)
 {
@@ -46,6 +29,61 @@ int xa2_surround_requested(void)
     }
     return req;
 }
+
+/* RECOMP_APU_WAV=<file>: record what goes to the host output (48 kHz stereo s16),
+ * as the oracle for the DirectSound HLE's RECOMP_DSOUND_WAV. */
+static void apu_wav(const int16_t *samples, int frames)
+{
+    static FILE *f;
+    static int tried;
+    static uint32_t bytes;
+    if (!tried) {
+        const char *p = getenv("RECOMP_APU_WAV");
+        tried = 1;
+        if (p && *p && (f = fopen(p, "wb")) != NULL) {
+            static const uint8_t hdr[44] = {
+                'R','I','F','F', 36,0,0,0, 'W','A','V','E', 'f','m','t',' ', 16,0,0,0,
+                1,0, 2,0, 0x80,0xBB,0,0, 0x00,0xEE,0x02,0, 4,0, 16,0, 'd','a','t','a', 0,0,0,0 };
+            fwrite(hdr, 1, sizeof hdr, f);
+        }
+    }
+    if (!f || frames <= 0)
+        return;
+    fwrite(samples, 4, (size_t)frames, f);
+    bytes += (uint32_t)frames * 4u;
+    {
+        long at = ftell(f);
+        uint32_t riff = 36u + bytes;
+        fseek(f, 4, SEEK_SET);  fwrite(&riff, 4, 1, f);
+        fseek(f, 40, SEEK_SET); fwrite(&bytes, 4, 1, f);
+        fseek(f, at, SEEK_SET);
+    }
+}
+
+int xa2_get_buffer_size(void)
+{
+    return XA2_BUF_SAMPLES;
+}
+
+#if defined(_WIN32)
+
+#define COBJMACROS
+#include <windows.h>
+#include <xaudio2.h>
+
+#pragma comment(lib, "xaudio2.lib")
+#pragma comment(lib, "ole32.lib")
+
+#define XA2_CHANNELS      g_xa2_channels
+#define XA2_MASK_51       (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER | SPEAKER_LOW_FREQUENCY | \
+                           SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT)
+
+static IXAudio2               *g_xa2 = NULL;
+static IXAudio2MasteringVoice *g_xa2_master = NULL;
+static IXAudio2SourceVoice    *g_xa2_source = NULL;
+static int                     g_xa2_channels = 2;
+extern volatile int            g_xbox_audio_surround;   /* kernel_xbox.c: XC_AUDIO's Dolby Digital bit */
+static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][6];
 
 int xa2_surround(void) { return g_xa2_channels == 6; }
 int xa2_channels(void) { return g_xa2_channels; }
@@ -189,36 +227,6 @@ int xa2_is_active(void)
     return g_xa2_initialized;
 }
 
-/* RECOMP_APU_WAV=<file>: record what goes to XAudio2 (48 kHz stereo s16),
- * as the oracle for the DirectSound HLE's RECOMP_DSOUND_WAV. */
-static void apu_wav(const int16_t *samples, int frames)
-{
-    static FILE *f;
-    static int tried;
-    static uint32_t bytes;
-    if (!tried) {
-        const char *p = getenv("RECOMP_APU_WAV");
-        tried = 1;
-        if (p && *p && (f = fopen(p, "wb")) != NULL) {
-            static const uint8_t hdr[44] = {
-                'R','I','F','F', 36,0,0,0, 'W','A','V','E', 'f','m','t',' ', 16,0,0,0,
-                1,0, 2,0, 0x80,0xBB,0,0, 0x00,0xEE,0x02,0, 4,0, 16,0, 'd','a','t','a', 0,0,0,0 };
-            fwrite(hdr, 1, sizeof hdr, f);
-        }
-    }
-    if (!f || frames <= 0)
-        return;
-    fwrite(samples, 4, (size_t)frames, f);
-    bytes += (uint32_t)frames * 4u;
-    {
-        long at = ftell(f);
-        uint32_t riff = 36u + bytes;
-        fseek(f, 4, SEEK_SET);  fwrite(&riff, 4, 1, f);
-        fseek(f, 40, SEEK_SET); fwrite(&bytes, 4, 1, f);
-        fseek(f, at, SEEK_SET);
-    }
-}
-
 /* Submit a buffer of mixed samples to XAudio2.
  * Called from APU frame thread. Returns 1 if buffer was submitted. */
 int xa2_submit_samples(const int16_t *samples, int num_samples)
@@ -252,20 +260,102 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     return 1;
 }
 
-int xa2_get_buffer_size(void)
+#elif defined(XBOX_APU_SDL3_AUDIO)
+
+/* SDL3 audio stream (Linux and other non-Windows hosts): the same contract as the XAudio2 voice above.
+ * - 48 kHz signed 16-bit, 2 channels, or 6 for 5.1 when RECOMP_AUDIO_51 is set and the default playback device
+ *   has six or more channels ("force": six on any device, tests only). SDL's 5.1 order is FL FR FC LFE BL BR,
+ *   the GP's FL FR FC LFE SL SR, so the samples go out as they are.
+ * - Pacing: a submission is refused while more than XA2_NUM_BUFS x XA2_BUF_SAMPLES frames are queued, the same
+ *   depth the XAudio2 path keeps (its BuffersQueued test), so the APU's monitor runs at the device's rate.
+ * - SDL picks the host system (PipeWire, PulseAudio, ALSA ...); the stream converts to the device format. */
+#include <SDL3/SDL.h>
+
+extern volatile int g_xbox_audio_surround;   /* kernel_xbox.c: XC_AUDIO's Dolby Digital bit */
+static SDL_AudioStream *g_sdl_stream;
+static int              g_sdl_channels = 2;
+static int              g_sdl_frames_written;
+
+int xa2_surround(void) { return g_sdl_channels == 6; }
+int xa2_channels(void) { return g_sdl_channels; }
+
+int xa2_init(void)
 {
-    return XA2_BUF_SAMPLES;
+    SDL_AudioSpec spec, dev;
+    int dev_frames = 0;
+
+    if (g_sdl_stream)
+        return 1;
+    if (!SDL_WasInit(SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        fprintf(stderr, "[AUDIO] SDL audio init failed: %s\n", SDL_GetError());
+        return 0;
+    }
+    g_sdl_channels = 2;
+    if (xa2_surround_requested()) {
+        const char *e = getenv("RECOMP_AUDIO_51");
+        int have = SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &dev, &dev_frames) ? dev.channels : 0;
+        if (have >= 6 || (e && !strcmp(e, "force")))
+            g_sdl_channels = 6;
+        fprintf(stderr, "[AUDIO] 5.1 asked: device %d channels -> %s\n", have,
+                g_sdl_channels == 6 ? "5.1 output" : "stereo (the device has no 5.1)");
+    }
+    spec.format = SDL_AUDIO_S16;
+    spec.channels = g_sdl_channels;
+    spec.freq = XA2_SAMPLE_RATE;
+    g_sdl_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (!g_sdl_stream) {
+        fprintf(stderr, "[AUDIO] SDL_OpenAudioDeviceStream failed: %s\n", SDL_GetError());
+        g_sdl_channels = 2;
+        return 0;
+    }
+    SDL_ResumeAudioStreamDevice(g_sdl_stream);
+    g_xbox_audio_surround = g_sdl_channels == 6;
+    g_sdl_frames_written = 0;
+    fprintf(stderr, "[AUDIO] SDL3 audio stream on '%s' (%d Hz %s 16-bit, up to %d x %d frames queued)\n",
+            SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?", XA2_SAMPLE_RATE,
+            g_sdl_channels == 6 ? "5.1" : "stereo", XA2_NUM_BUFS, XA2_BUF_SAMPLES);
+    return 1;
 }
 
-#else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+void xa2_shutdown(void)
+{
+    if (g_sdl_stream) {
+        SDL_DestroyAudioStream(g_sdl_stream);
+        g_sdl_stream = NULL;
+        fprintf(stderr, "[AUDIO] Shut down (%d buffers written)\n", g_sdl_frames_written);
+    }
+    g_sdl_channels = 2;
+}
+
+int xa2_is_active(void)
+{
+    return g_sdl_stream != NULL;
+}
+
+int xa2_submit_samples(const int16_t *samples, int num_samples)
+{
+    int bytes_per_frame = g_sdl_channels * (int)sizeof(int16_t);
+    int n = num_samples > XA2_BUF_SAMPLES ? XA2_BUF_SAMPLES : num_samples;
+
+    if (!g_sdl_stream || n <= 0)
+        return 0;
+    if (SDL_GetAudioStreamQueued(g_sdl_stream) >= XA2_NUM_BUFS * XA2_BUF_SAMPLES * bytes_per_frame)
+        return 0;
+    if (!SDL_PutAudioStreamData(g_sdl_stream, samples, n * bytes_per_frame))
+        return 0;
+    if (g_sdl_channels == 2)
+        apu_wav(samples, n);                       /* the WAV oracle is stereo */
+    g_sdl_frames_written++;
+    return 1;
+}
+
+#else /* no host audio backend */
 
 int  xa2_init(void)                                   { return 0; }
 void xa2_shutdown(void)                               {}
 int  xa2_is_active(void)                              { return 0; }
-int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
-int  xa2_get_buffer_size(void)                        { return 0; }
+int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; apu_wav(s, 0); return 0; }
 int  xa2_surround(void)                               { return 0; }
-int  xa2_surround_requested(void)                     { return 0; }
 int  xa2_channels(void)                               { return 2; }
 
-#endif /* _WIN32 */
+#endif

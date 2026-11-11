@@ -153,32 +153,30 @@ typedef void             **PHANDLE, **LPHANDLE;
 typedef void              *HMODULE, *HINSTANCE, *HKEY, *HLOCAL, *HGLOBAL;
 typedef void              *HWND, *HDC, *HBITMAP, *HICON, *HMENU, *HCURSOR;
 
-/* PCONTEXT: Windows VEH register state. On Linux the equivalent is
- * ucontext_t*; we leave it opaque here since Linux callers don't use it. */
- 
-#ifdef __linux__
-/* On gcc these data structures are necessary  even if anyone is going to be used*/
-typedef union Register{
-	uint32_t X; // all register
-	uint8_t SR[4]; // Subregister
-} REG; 
-
-typedef uint32_t  IREG;
-
-typedef struct ProcessorCONTEXT{
-	// General
-	REG EAX;
-	REG EBX;
-	REG ECX;
-	REG EDX;
-	IREG ESI;
-	IREG EDI;
-	IREG ESP;
-	IREG EBP;
-	//  Instruction Pointer Flags
-	IREG EIP;
-	IREG EFlags;
-} *PCONTEXT;
+/* PCONTEXT: the register state a vectored exception handler sees. On an x86-64 POSIX host the compat layer's
+ * signal handler (win32_compat.c, AddVectoredExceptionHandler) fills it from the signal's ucontext_t and writes
+ * it back when a handler resumes, so the trapped-MMIO decoder (mmio_decode.h) and the other handlers read and
+ * write the fields they use on Windows: the general registers, Rip, EFlags. On an arm64 POSIX host (Android,
+ * arm64 Linux) the same handler fills the Windows ARM64 names X[0..30], Sp, Pc, Cpsr, plus XrFaultAddress (not a
+ * Windows field: the faulting data address, so mmio_decode.h's arm64 path can check the decoded address against
+ * it). Other hosts: opaque (no MMIO trap). */
+#if defined(__x86_64__)
+typedef struct _CONTEXT {
+    uint64_t Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
+    uint64_t R8, R9, R10, R11, R12, R13, R14, R15;
+    uint64_t Rip;
+    uint32_t EFlags;
+    uint32_t ContextFlags;          /* unused on POSIX; the Windows name, for code that sets it */
+} CONTEXT, *PCONTEXT;
+#elif defined(__aarch64__)
+typedef struct _CONTEXT {
+    uint64_t X[31];                 /* x0 .. x30 (x29 = fp, x30 = lr) */
+    uint64_t Sp;
+    uint64_t Pc;
+    uint32_t Cpsr;                  /* PSTATE (NZCV etc.) */
+    uint32_t ContextFlags;          /* unused on POSIX */
+    uint64_t XrFaultAddress;        /* POSIX extension: siginfo si_addr of a data abort, 0 otherwise */
+} CONTEXT, *PCONTEXT;
 #else
 typedef void              *PCONTEXT;
 #endif
