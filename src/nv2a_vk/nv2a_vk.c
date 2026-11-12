@@ -714,6 +714,11 @@ typedef struct {
     uint32_t cframe, wframe;   /* RECOMP_VK_SURF_LOG: flip it was made at, last flip a draw or clear wrote it (0 never) */
     int sampled_logged;        /* RECOMP_VK_SURF_LOG: its first sampling was logged */
     uint32_t logged_gen;       /* RECOMP_VK_SURF_LOG: gen of the last "old contents" line (one per write state) */
+    /* had one until a resize made the surface again: ms_flip gives it back
+     * (THPS 2X GitHub #17 - its scene target, presented in the menus, changes
+     * its width when a level starts at 16:9 / 16:10 and was never presented
+     * again, so the level ran without MSAA) */
+    uint32_t ms_again;
 } VkSurf;
 
 /* the boot animation's frame (nv2a_vk_boot_frame): presented in place of a
@@ -850,6 +855,10 @@ static uint32_t to_stored(uint32_t v, uint32_t p, uint32_t l)
     return (uint32_t)(((uint64_t)v * p + l / 2) / l);
 }
 static VkSurf     s_surf[VK_MAX_SURF];
+/* RECOMP_VK_RT_STATS=<N> (diagnostic, THPS 2X GitHub #17 MSAA): every N-th
+ * flip lists the surfaces drawn into since the last one - va, size, sample
+ * count, draws - and which one is presented */
+static uint32_t   s_rt_draws[VK_MAX_SURF];
 static VkDepthBuf s_depth[VK_MAX_DEPTH];
 
 /* ── Render scale: what fits the device ─────────────────────────────── */
@@ -1530,7 +1539,8 @@ static void rescale_surfaces(double k)
                        VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
         garbage_add(s->image, s->view, s->mem);
         a1_drop(s);
-        ms_drop(s);                     /* MSAA: made again at the new size at the next flip */
+        s->ms_again = s->ms;            /* MSAA: made again at the new size at the next flip */
+        ms_drop(s);
         s->image = img; s->view = view; s->mem = mem;
         s->pw = pw; s->ph = ph;
         s->gen++;                       /* cube maps built from it refill */
@@ -6080,6 +6090,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     if (d)
         d->dirty = 1;
     surf_written(s);
+    s_rt_draws[s - s_surf]++;               /* RECOMP_VK_RT_STATS */
     if (pipe != cur_pipe || cur_pipe_gen != s_cb_gen || s_pipe_foreign) {
         vkCmdBindPipeline(s_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         cur_pipe = pipe;
@@ -7581,6 +7592,284 @@ static VkSurf *gamma_run(VkSurf *s)
     return x;
 }
 
+/* ── BLOOM (nv2a_vk_set_bloom) ────────────────────────────────────────
+ * A look option of the port, not of the console: the presented surface's
+ * bright parts (soft knee above a threshold) go into a quarter-size 16-bit
+ * float image (one pass, 4 bilinear taps = a 4x4 box), are blurred there with
+ * a separable 9-tap Gaussian (linear-sampled: 5 fetches per direction, two
+ * rounds H V H V) and added onto the frame in one full-screen pass into an
+ * image of the surface's size, presented in its place (like SMAA / the gamma
+ * ramp). One fragment shader, the pass picked by a push constant; two
+ * pipelines (the 16F quarter images, the BGRA8 result). OFF = nothing made. */
+static volatile int s_bloom_opt = NV2A_VK_BLOOM_OFF;
+static int s_bloom_env = -2;                    /* -2 not read, -1 not set, else forced */
+static int s_bloom_bad;
+static VkSurf s_bloom_q[2], s_bloom_img;        /* quarter size ping-pong, the result */
+static VkDescriptorSetLayout s_bloom_dsl;
+static VkPipelineLayout      s_bloom_layout;
+static VkPipeline            s_bloom_pipe[2];   /* [0] R16G16B16A16_SFLOAT, [1] B8G8R8A8_UNORM */
+static const VkFormat s_bloom_fmt[2] = { VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_B8G8R8A8_UNORM };
+
+void nv2a_vk_set_bloom(int strength)
+{
+    s_bloom_opt = strength > NV2A_VK_BLOOM_OFF && strength <= NV2A_VK_BLOOM_MAX ? strength : NV2A_VK_BLOOM_OFF;
+}
+
+/* the strength now: 0 = off, 1..NV2A_VK_BLOOM_MAX */
+static int bloom_level(void)
+{
+    if (s_bloom_env == -2) {
+        const char *e = getenv("RECOMP_VK_BLOOM");
+        char *end;
+        long v = e && *e ? strtol(e, &end, 10) : -1;
+        s_bloom_env = e && *e && !*end && v >= 0 && v <= NV2A_VK_BLOOM_MAX ? (int)v : -1;
+    }
+    return s_bloom_env >= 0 ? s_bloom_env : s_bloom_opt;
+}
+
+static const char s_bloom_fs[] =
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2D src;\n"
+    "layout(set = 0, binding = 1) uniform sampler2D glow;\n"
+    "layout(push_constant) uniform P { vec4 a; vec4 r; vec4 d; } pc;\n"   /* a: pass, threshold, intensity */
+    "layout(location = 0) out vec4 o;\n"                                 /* r: 1/input size, 1/output size */
+    "vec3 bright(vec2 uv) {\n"                                           /* d: blur direction (input texels) */
+    "    vec3 c = textureLod(src, uv, 0.0).rgb;\n"
+    "    float b = dot(c, vec3(0.2126, 0.7152, 0.0722));\n"           /* luminance: a saturated red is not white */
+    "    float k = clamp((b - pc.a.y) / max(1.0 - pc.a.y, 1e-3), 0.0, 1.0);\n"
+    "    return c * (k * k);\n"
+    "}\n"
+    "void main() {\n"
+    "    vec2 uv = gl_FragCoord.xy * pc.r.zw;\n"
+    "    int pass = int(pc.a.x + 0.5);\n"
+    "    if (pass == 0) {\n"
+    "        vec2 t = pc.r.xy;\n"
+    "        vec3 c = bright(uv + vec2(-t.x, -t.y)) + bright(uv + vec2(t.x, -t.y))\n"
+    "               + bright(uv + vec2(-t.x, t.y)) + bright(uv + vec2(t.x, t.y));\n"
+    "        o = vec4(c * 0.25, 1.0);\n"
+    "    } else if (pass == 1) {\n"
+    "        vec2 s = pc.d.xy * pc.r.xy;\n"
+    "        vec3 c = textureLod(src, uv, 0.0).rgb * 0.2270270270;\n"
+    "        c += (textureLod(src, uv + s * 1.3846153846, 0.0).rgb\n"
+    "            + textureLod(src, uv - s * 1.3846153846, 0.0).rgb) * 0.3162162162;\n"
+    "        c += (textureLod(src, uv + s * 3.2307692308, 0.0).rgb\n"
+    "            + textureLod(src, uv - s * 3.2307692308, 0.0).rgb) * 0.0702702703;\n"
+    "        o = vec4(c, 1.0);\n"
+    "    } else {\n"
+    "        vec4 base = texelFetch(src, ivec2(gl_FragCoord.xy), 0);\n"
+    "        o = vec4(base.rgb + textureLod(glow, uv, 0.0).rgb * pc.a.z, base.a);\n"
+    "    }\n"
+    "}\n";
+
+static int bloom_pipelines(void)
+{
+    VkShaderModule vs, fs;
+    int p;
+    if (s_bloom_pipe[1])
+        return 1;
+    if (!s_pp_sampler && !pp_pipe(VK_FORMAT_B8G8R8A8_UNORM))   /* the linear sampler lives there */
+        return 0;
+    if (!s_bloom_layout) {
+        VkDescriptorSetLayoutBinding bd[2];
+        VkDescriptorSetLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        VkPushConstantRange pr = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48 };
+        VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        int i;
+        for (i = 0; i < 2; i++) {
+            bd[i].binding = (uint32_t)i;
+            bd[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            bd[i].descriptorCount = 1;
+            bd[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            bd[i].pImmutableSamplers = NULL;
+        }
+        lci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        lci.bindingCount = 2;
+        lci.pBindings = bd;
+        if (vkCreateDescriptorSetLayout(s_dev, &lci, NULL, &s_bloom_dsl) != VK_SUCCESS)
+            return 0;
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &s_bloom_dsl;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pr;
+        if (vkCreatePipelineLayout(s_dev, &pli, NULL, &s_bloom_layout) != VK_SUCCESS)
+            return 0;
+    }
+    vs = compile(GLSLANG_STAGE_VERTEX, s_pp_vs);
+    fs = compile(GLSLANG_STAGE_FRAGMENT, s_bloom_fs);
+    for (p = 0; p < 2 && vs && fs; p++) {
+        VkGraphicsPipelineCreateInfo ci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+        VkPipelineShaderStageCreateInfo st[2];
+        VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+        VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+        VkPipelineViewportStateCreateInfo vps = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+        VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+        VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+        VkPipelineColorBlendAttachmentState ba;
+        VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+        VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+        VkPipelineRenderingCreateInfo rci = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+        static const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+        memset(st, 0, sizeof st);
+        st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        st[0].module = vs;
+        st[0].pName = "main";
+        st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        st[1].module = fs;
+        st[1].pName = "main";
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        vps.viewportCount = vps.scissorCount = 1;
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.lineWidth = 1.0f;
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        memset(&ba, 0, sizeof ba);
+        ba.colorWriteMask = 0xF;
+        cb.attachmentCount = 1;
+        cb.pAttachments = &ba;
+        dy.dynamicStateCount = 2;
+        dy.pDynamicStates = dyn;
+        rci.colorAttachmentCount = 1;
+        rci.pColorAttachmentFormats = &s_bloom_fmt[p];
+        ci.pNext = &rci;
+        ci.stageCount = 2;
+        ci.pStages = st;
+        ci.pVertexInputState = &vi;
+        ci.pInputAssemblyState = &ia;
+        ci.pViewportState = &vps;
+        ci.pRasterizationState = &rs;
+        ci.pMultisampleState = &ms;
+        ci.pColorBlendState = &cb;
+        ci.pDynamicState = &dy;
+        ci.layout = s_bloom_layout;
+        if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &ci, NULL, &s_bloom_pipe[p]) != VK_SUCCESS)
+            s_bloom_pipe[p] = VK_NULL_HANDLE;
+    }
+    if (vs) vkDestroyShaderModule(s_dev, vs, NULL);
+    if (fs) vkDestroyShaderModule(s_dev, fs, NULL);
+    return s_bloom_pipe[0] && s_bloom_pipe[1];
+}
+
+/* x at (w, h) of format fmt, made (again) when missing or of another size; 0 = failed to allocate */
+static int bloom_image(VkSurf *x, uint32_t w, uint32_t h, VkFormat fmt)
+{
+    if (x->image && (x->pw != w || x->ph != h)) {
+        garbage_add(x->image, x->view, x->mem);
+        memset(x, 0, sizeof *x);
+    }
+    if (!x->image) {
+        if (!make_image(w, h, fmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, &x->image, &x->view, &x->mem)) {
+            memset(x, 0, sizeof *x);
+            return 0;
+        }
+        x->pw = w; x->ph = h;
+    }
+    return 1;
+}
+
+/* one bloom pass: in0 (and in1) sampled, out written whole */
+static void bloom_pass(int pass, VkSurf *out, VkSurf *in0, VkSurf *in1, float thr, float inten, float dx, float dy)
+{
+    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+    VkViewport vp = { 0.0f, 0.0f, (float)out->pw, (float)out->ph, 0.0f, 1.0f };
+    VkRect2D sc = { { 0, 0 }, { out->pw, out->ph } };
+    VkDescriptorImageInfo ii[2];
+    VkWriteDescriptorSet wr[2];
+    float pc[12];
+    int i;
+    ca.imageView = out->view;
+    ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    ri.renderArea.extent.width = out->pw;
+    ri.renderArea.extent.height = out->ph;
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    p_begin_rendering(s_cb, &ri);
+    vkCmdBindPipeline(s_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_bloom_pipe[pass == 2]);
+    vkCmdSetViewport(s_cb, 0, 1, &vp);
+    vkCmdSetScissor(s_cb, 0, 1, &sc);
+    for (i = 0; i < 2; i++) {
+        ii[i].sampler = s_pp_sampler;
+        ii[i].imageView = i && in1 ? in1->view : in0->view;
+        ii[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        memset(&wr[i], 0, sizeof wr[i]);
+        wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[i].dstBinding = (uint32_t)i;
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr[i].pImageInfo = &ii[i];
+    }
+    p_push_desc(s_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_bloom_layout, 0, 2, wr);
+    pc[0] = (float)pass; pc[1] = thr; pc[2] = inten; pc[3] = 0.0f;
+    pc[4] = 1.0f / (float)in0->pw; pc[5] = 1.0f / (float)in0->ph;
+    pc[6] = 1.0f / (float)out->pw; pc[7] = 1.0f / (float)out->ph;
+    pc[8] = dx; pc[9] = dy; pc[10] = pc[11] = 0.0f;
+    vkCmdPushConstants(s_cb, s_bloom_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+    vkCmdDraw(s_cb, 3, 1, 0, 0);
+    p_end_rendering(s_cb);
+    {
+        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(s_cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             0, 1, &mb, 0, NULL, 0, NULL);
+    }
+}
+
+/* Surface s with bloom; the result (at s's size) to present instead, or NULL (OFF, or a failure: present s as it
+ * is). Outside rendering. */
+static VkSurf *bloom_run(VkSurf *s)
+{
+    /* a straight line through the values tuned on Orta's dark first level (test runs:
+     * low 0.65 / 0.50, medium 0.55 / 0.85, high 0.45 / 1.30 = strength ~2 / ~5 / ~8; 0.60 / 1.0 hardly showed
+     * outside the HUD): threshold 0.70 .. 0.45, intensity 0.15 .. 1.30. Brightness = luminance: with the
+     * brightest channel, strength 10 turned Orta's red berserk scenes into one glow. */
+    int lv = bloom_level(), r;
+    float thr[NV2A_VK_BLOOM_MAX + 1], inten[NV2A_VK_BLOOM_MAX + 1];
+    uint32_t qw, qh;
+    if (!lv || s_bloom_bad || !s || !s->view)
+        return NULL;
+    thr[lv] = 0.70f - (0.25f / 9.0f) * (float)(lv - 1);
+    inten[lv] = 0.15f + (1.15f / 9.0f) * (float)(lv - 1);
+    end_rendering();
+    if (!bloom_pipelines()) {
+        LOGE("bloom could not be set up -- presenting without it\n");
+        s_bloom_bad = 1;
+        return NULL;
+    }
+    qw = (s->pw + 3) / 4; qh = (s->ph + 3) / 4;
+    if (!bloom_image(&s_bloom_q[0], qw, qh, s_bloom_fmt[0]) || !bloom_image(&s_bloom_q[1], qw, qh, s_bloom_fmt[0])
+        || !bloom_image(&s_bloom_img, s->pw, s->ph, s_bloom_fmt[1])) {
+        static uint32_t told_w, told_h;
+        if (told_w != s->pw || told_h != s->ph)
+            LOGE("bloom: %ux%u images failed to allocate -- presented without it\n", s->pw, s->ph);
+        told_w = s->pw; told_h = s->ph;
+        return NULL;
+    }
+    {
+        static int told_lv;
+        if (told_lv != lv)
+            LOGE("bloom %d (threshold %.2f, intensity %.2f): %ux%u, glow at %ux%u\n", lv, thr[lv], inten[lv],
+                 s->pw, s->ph, qw, qh);
+        told_lv = lv;
+    }
+    barrier_all();
+    bloom_pass(0, &s_bloom_q[0], s, NULL, thr[lv], inten[lv], 0.0f, 0.0f);
+    for (r = 0; r < 2; r++) {
+        bloom_pass(1, &s_bloom_q[1], &s_bloom_q[0], NULL, thr[lv], inten[lv], 1.0f, 0.0f);
+        bloom_pass(1, &s_bloom_q[0], &s_bloom_q[1], NULL, thr[lv], inten[lv], 0.0f, 1.0f);
+    }
+    bloom_pass(2, &s_bloom_img, s, &s_bloom_q[0], thr[lv], inten[lv], 0.0f, 0.0f);
+    s_dyn_valid = 0;
+    return &s_bloom_img;
+}
+
 /* ── MSAA (ANTIALIASING = MSAA 2X / 4X) ───────────────────────────────
  * The presented surface only (maintainer, 2026-10-26) and its depth: at the
  * flip it gets a multisampled image of the chosen count (ms_flip), filled
@@ -7592,10 +7881,22 @@ static VkSurf *gamma_run(VkSurf *s)
  * count in their key. A count that fails to allocate (or that the device
  * lacks) goes back to the count that last worked, with a log line, and is
  * not tried again this run (nv2a_vk_antialiasing_fits). No VRAM estimate
- * (maintainer, 2026-10-26). Other render targets (shadows, reflections) stay
- * single-sampled; a depth buffer a title shares between the presented
- * surface and another target is kept apart per sample count. */
+ * (maintainer, 2026-10-26). A depth buffer a title shares between the
+ * presented surface and another target is kept apart per sample count.
+ * THE SCENE TARGET (maintainer 2026-11-12, extends the 2026-10-26 rule):
+ * many titles draw their 3D world into a target of its own and only copy it
+ * into the presented surface (Panzer Dragoon Orta: 8082D000 683x384, ~250-430
+ * draws a frame, into 800BA000 that carries the HUD) - then MSAA on the
+ * presented surface smoothed nothing of the 3D. So the target with the most
+ * draws (at least 32) also gets the multisampled image, once it has been the
+ * most-drawn one for 30 flips in a row (no flapping in menus / loading); the
+ * one before loses it. Shadow / reflection targets have fewer draws and stay
+ * single-sampled. RECOMP_VK_MSAA_SCENE=0 = the presented surface only. */
 static VkPipeline s_ms_seed_pipe[2];            /* [2x, 4x] */
+static int s_ms_top = -1;                       /* this frame's most-drawn target (the flip), -1 none */
+static int s_ms_scene = -1;                     /* the target that has the scene MSAA, -1 none */
+static int s_ms_cand = -1, s_ms_cand_n;         /* the most-drawn one and for how many flips in a row */
+static uint32_t s_ms_scene_fail_va;             /* a scene target that failed to allocate: not tried again */
 
 static void ms_seed(VkSurf *s)
 {
@@ -7732,6 +8033,50 @@ static uint32_t ms_want(void)
     return n && (n & s_ms_bad) ? s_ms_good : n;
 }
 
+/* At the flip, after the presented surface s has its n samples: the scene target's (see THE SCENE TARGET) */
+static void ms_scene(VkSurf *s, uint32_t n)
+{
+    static int on = -1;
+    int t = s_ms_top;
+    VkSurf *x;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VK_MSAA_SCENE");
+        on = !(e && *e == '0');
+    }
+    if (!on)
+        return;
+    if (t >= 0 && (&s_surf[t] == s || s_surf[t].va == s_ms_scene_fail_va))
+        t = -1;                                 /* the presented one has its own; a failed one stays without */
+    if (t == s_ms_cand) {
+        if (s_ms_cand_n < 30)
+            s_ms_cand_n++;
+    } else {
+        s_ms_cand = t;
+        s_ms_cand_n = 1;
+    }
+    if (s_ms_cand_n >= 30 && t != s_ms_scene) {
+        if (s_ms_scene >= 0) {
+            x = &s_surf[s_ms_scene];
+            if (x != s && x->ms)
+                ms_drop(x);
+            x->ms_again = 0;
+        }
+        s_ms_scene = t;
+    }
+    if (s_ms_scene < 0)
+        return;
+    x = &s_surf[s_ms_scene];
+    if (!x->image || x == s || x->ms == n || x->ms_again)
+        return;                                 /* gone, presented now, done, or back after a resize (ms_flip) */
+    if (ms_set(x, n)) {
+        LOGE("MSAA %ux: scene target 0x%08X %ux%u\n", n, x->va, x->pw, x->ph);
+    } else {
+        LOGE("MSAA %ux: scene target 0x%08X %ux%u failed to allocate -- it stays without\n", n, x->va, x->pw, x->ph);
+        s_ms_scene_fail_va = x->va;
+        s_ms_scene = -1;
+    }
+}
+
 /* At the flip (outside rendering): MSAA for the presented surface s */
 static void ms_flip(VkSurf *s)
 {
@@ -7749,10 +8094,23 @@ static void ms_flip(VkSurf *s)
         VkSurf *x = &s_surf[k];
         if (x->image && x->ms && x->ms != n)
             ms_drop(x);                         /* another count, or off */
+        if (!n)
+            x->ms_again = 0;
     }
     if (!n) {
         s_ms_good = 0;
         return;
+    }
+    for (k = 0; k < VK_MAX_SURF; k++) {
+        VkSurf *x = &s_surf[k];
+        if (!x->ms_again || !x->image || x == s || x->ms)
+            continue;
+        x->ms_again = 0;                        /* resized: its MSAA back (once; a failure stays off) */
+        if (ms_set(x, n))
+            LOGE("MSAA %ux: surface 0x%08X %ux%u (again after a resize)\n", n, x->va, x->pw, x->ph);
+        else
+            LOGE("MSAA %ux: surface 0x%08X %ux%u failed to allocate after a resize -- it stays without\n",
+                 n, x->va, x->pw, x->ph);
     }
     if (!s || !s->image)
         return;
@@ -7766,6 +8124,7 @@ static void ms_flip(VkSurf *s)
         LOGE("MSAA %ux: surface 0x%08X %ux%u\n", n, s->va, s->pw, s->ph);
     }
     s_ms_good = n;
+    ms_scene(s, n);
 }
 
 int nv2a_vk_antialiasing_fits(int mode)
@@ -8252,6 +8611,27 @@ static void vk_flip(void)
         }
     }
     barrier_all();
+    {
+        static long every = -2;
+        int k;
+        if (every == -2) {
+            const char *e = getenv("RECOMP_VK_RT_STATS");
+            every = e && *e ? atol(e) : 0;
+        }
+        if (every > 0 && s_frame % (uint32_t)every == 0) {
+            fprintf(stderr, "[RT] f %u presented %08X:", s_frame, s ? s->va : 0u);
+            for (k = 0; k < VK_MAX_SURF; k++)
+                if (s_rt_draws[k] && s_surf[k].image)
+                    fprintf(stderr, " %08X %ux%u ms%u draws %u;", s_surf[k].va, s_surf[k].pw, s_surf[k].ph,
+                            s_surf[k].ms, s_rt_draws[k]);
+            fprintf(stderr, "\n");
+        }
+        s_ms_top = -1;                          /* MSAA: this frame's most-drawn target (ms_flip) */
+        for (k = 0; k < VK_MAX_SURF; k++)
+            if (s_rt_draws[k] >= 32 && s_surf[k].image && (s_ms_top < 0 || s_rt_draws[k] > s_rt_draws[s_ms_top]))
+                s_ms_top = k;
+        memset(s_rt_draws, 0, sizeof s_rt_draws);
+    }
     /* ANTIALIASING = MSAA: the presented surface's multisampled image, made
      * or dropped here for the next frame's passes */
     ms_flip(s);
@@ -8261,6 +8641,12 @@ static void vk_flip(void)
         pres = smaa_run(s);
     if (!pres)
         pres = s;
+    /* BLOOM: the glow onto the (anti-aliased) frame, presented in its place; OFF = no pass */
+    if (pres && s_drew_any && !s_headless && !s_boot_on) {
+        VkSurf *g = bloom_run(pres);
+        if (g)
+            pres = g;
+    }
     /* GAMMA RAMP: the title's ramp (RAMDAC on the console), before every present path; identity = none */
     if (pres && s_drew_any && !s_headless && !s_boot_on) {
         VkSurf *g = gamma_run(pres);

@@ -12,6 +12,10 @@
 #       [--cxx-headers]   libc++'s headers too (a developer bundle that builds glslang: build_glslang.sh)
 #       [--llvm-license <LICENSE.TXT>]  the LLVM project's licence text (the official Linux tarball has none;
 #                         llvm-mingw of the same LLVM release carries it)
+#       [--slim-bin <dir>]  a RELEASE bundle: clang + lld = the multicall binary <dir>/llvm from
+#                         build_slim_llvm.sh (X86 only, static C++ runtime, needs only glibc) instead of the
+#                         tarball's two big programs; no libstdc++ / libgcc_s / ICU shim next to it then. The
+#                         tarball still gives the resource headers, compiler-rt and the static libc++.
 #
 # Writes <out>/llvm (clang + lld + clang's resource headers + compiler-rt builtins/crt + sysroot/) and
 # <out>/python (python-build-standalone + capstone, the bulk the lifter never imports removed), then a smoke test
@@ -23,15 +27,16 @@
 # headers declare, SONAME libvulkan.so.1): the game finds the real loader of the system at run time - the GPU
 # driver belongs to the system, the launcher checks for it before it starts the game.
 #
-# The official LLVM build is big (clang 269 MB, lld 204 MB, all targets): fine for test packages; a slim
-# X86-only clang (-O2/-O3 + LTO, never -Os; the first start must not get slower) is a later, separate step.
+# The official LLVM build is big (clang 269 MB, lld 204 MB, all targets): fine for test packages; releases use
+# --slim-bin (build_slim_llvm.sh: X86-only multicall clang + lld, -O3 + ThinLTO, never -Os).
 # Needs: bash, cmake (its libarchive reads .tar.zst - WSL has no zstd tool), dpkg-deb, tar, the host's linker
 # (`ld`, once: the bundle's clang links lld's ICU shim with it before lld can run), objdump/readelf for the checks.
 set -euo pipefail
 
-LLVM_TAR= PY_TAR= DEBS= CAPSTONE= VKH= OUT= CXX_HEADERS=0 LLVM_LICENSE=
+LLVM_TAR= PY_TAR= DEBS= CAPSTONE= VKH= OUT= CXX_HEADERS=0 LLVM_LICENSE= SLIM_BIN=
 while [ $# -gt 0 ]; do
     case "$1" in
+        --slim-bin) SLIM_BIN="$(cd "$2" && pwd)"; shift 2 ;;
         --llvm-license) LLVM_LICENSE="$2"; shift 2 ;;
         --cxx-headers) CXX_HEADERS=1; shift ;;
         --llvm) LLVM_TAR="$2"; shift 2 ;;
@@ -73,11 +78,18 @@ RT="lib/clang/$VER_MAJOR"
     "$TOP/include/c++" "$TOP/include/x86_64-unknown-linux-gnu")
 L="$OUT/llvm"
 mkdir -p "$L/bin" "$L/$RT/lib/x86_64-unknown-linux-gnu"
-cp -a "$TMP/$TOP/bin/clang-$VER_MAJOR" "$L/bin/"
-ln -sf "clang-$VER_MAJOR" "$L/bin/clang"
-ln -sf "clang-$VER_MAJOR" "$L/bin/clang++"        # C++ mode, only for building the prebuilt libraries (glslang)
-cp -a "$TMP/$TOP/bin/lld" "$L/bin/"
-ln -sf lld "$L/bin/ld.lld"
+if [ -n "$SLIM_BIN" ]; then
+    # one multicall binary: the tool runs by the name it is started under (clang*, lld, ld.lld)
+    [ -f "$SLIM_BIN/llvm" ] || { echo "no llvm multicall binary in $SLIM_BIN (build_slim_llvm.sh)" >&2; exit 2; }
+    cp "$SLIM_BIN/llvm" "$L/bin/llvm"
+    for n in "clang-$VER_MAJOR" clang clang++ lld ld.lld; do ln -sf llvm "$L/bin/$n"; done
+else
+    cp -a "$TMP/$TOP/bin/clang-$VER_MAJOR" "$L/bin/"
+    ln -sf "clang-$VER_MAJOR" "$L/bin/clang"
+    ln -sf "clang-$VER_MAJOR" "$L/bin/clang++"    # C++ mode, only for building the prebuilt libraries (glslang)
+    cp -a "$TMP/$TOP/bin/lld" "$L/bin/"
+    ln -sf lld "$L/bin/ld.lld"
+fi
 # libc++ / libc++abi / libunwind, STATIC only: the C++ parts of the game (glslang) are linked into it, so the game
 # needs no C++ runtime from the player's system and asks for no GLIBCXX version (libstdc++ from GCC 13 would).
 mkdir -p "$L/lib/x86_64-unknown-linux-gnu"
@@ -105,8 +117,12 @@ find "$L/$RT/include" -maxdepth 1 \( -name 'arm*' -o -name 'riscv*' -o -name 'he
     -exec rm -rf {} +
 [ -f "$TMP/$TOP/LICENSE.TXT" ] && cp "$TMP/$TOP/LICENSE.TXT" "$L/LICENSE.TXT"
 OBJCOPY="$TMP/$TOP/bin/llvm-objcopy"       # from the tarball, only for this script (removed with the scratch)
-"$OBJCOPY" --strip-unneeded "$L/bin/clang-$VER_MAJOR"
-"$OBJCOPY" --strip-unneeded "$L/bin/lld"
+if [ -n "$SLIM_BIN" ]; then
+    "$OBJCOPY" --strip-unneeded "$L/bin/llvm"
+else
+    "$OBJCOPY" --strip-unneeded "$L/bin/clang-$VER_MAJOR"
+    "$OBJCOPY" --strip-unneeded "$L/bin/lld"
+fi
 echo "clang $("$L/bin/clang" --version | sed -n 1p)"
 
 # ── sysroot: glibc 2.35 from the Ubuntu 22.04 packages ──────────────────────
@@ -147,6 +163,13 @@ done < <(find "$S" -type l -print0)
 # sets of XML input - lld reads XML only for Windows (COFF) manifests, never for an ELF link - so a shim answers
 # ucnv_open with an error (libxml2 then reports the encoding as unsupported) and defines the other 6 functions.
 # libz.so.1 and liblzma.so.5 (XZ_5.0) are on every desktop distribution and stay the system's.
+if [ -n "$SLIM_BIN" ]; then
+    echo "== llvm run-time libraries: none (the slim binary needs only glibc)"
+    # libgcc_s.so.1 counts as glibc's: glibc itself loads it (thread cancellation), every glibc system has it
+    if readelf -d "$L/bin/llvm" | grep NEEDED | grep -vqE '\[(libc|libm|libpthread|libdl|librt|libgcc_s|ld-linux-x86-64)\.so'; then
+        echo "  FAIL: the slim binary needs more than glibc:" >&2; readelf -d "$L/bin/llvm" | grep NEEDED >&2; exit 1
+    fi
+else
 echo "== llvm run-time libraries"
 mkdir -p "$L/lib"
 for so in libstdc++.so.6 libgcc_s.so.1; do
@@ -180,6 +203,7 @@ for n in libicui18n libicudata; do               # NEEDED, but nothing is bound 
     echo "/* generated: an empty $n.so.70 (see libicuuc.so.70) */ int ${n}_shim_70;" > "$TMP/$n.c"
     "$L/bin/clang" -shared -fPIC -nostdlib -Wl,-soname,$n.so.70 -o "$L/lib/$n.so.70" "$TMP/$n.c"
 done
+fi
 echo "  $("$L/bin/ld.lld" --version | sed -n 1p)"
 
 # the Vulkan link stub (see the header)
@@ -297,21 +321,32 @@ for p in libc6 libc6-dev linux-libc-dev libgcc-11-dev libgcc-s1 libstdc++6; do
         echo "$p: no copyright file in the package; see https://packages.ubuntu.com/jammy/$p" > "$LIC/$p.copyright.txt"
     fi
 done
-cat > "$LIC/NOTICE.txt" <<EOF
-Compiler bundle of an xboxrecomp port release (tools/linux/make_toolchain_bundle.sh).
-
-bin/clang, bin/lld, lib/clang, lib/x86_64-unknown-linux-gnu (libc++, libc++abi, libunwind): LLVM $VER_MAJOR,
+if [ -n "$SLIM_BIN" ]; then
+    BIN_NOTE="bin/llvm (bin/clang*, bin/lld, bin/ld.lld are links to it): clang + lld of LLVM $VER_MAJOR built from the
+  official llvm-project-$VER_MAJOR source release by tools/linux/build_slim_llvm.sh (X86 target only, one
+  multicall binary, libc++ / libc++abi / libunwind of the same release linked in) - LLVM.txt.
+lib/clang, lib/x86_64-unknown-linux-gnu (libc++, libc++abi, libunwind): LLVM $VER_MAJOR, the official release
+  LLVM-*-Linux-X64.tar.zst, unchanged - LLVM.txt (Apache-2.0 with LLVM exceptions)."
+    RT_NOTE=""
+else
+    BIN_NOTE="bin/clang, bin/lld, lib/clang, lib/x86_64-unknown-linux-gnu (libc++, libc++abi, libunwind): LLVM $VER_MAJOR,
   the official release LLVM-*-Linux-X64.tar.zst, unchanged except stripped - LLVM.txt (Apache-2.0 with LLVM
-  exceptions).
-sysroot/: GNU C library 2.35, Linux kernel headers, GCC 11 startup files / libgcc from Ubuntu 22.04 packages -
-  libc6*.copyright.txt (LGPL-2.1+), linux-libc-dev.copyright.txt (GPL-2 headers, with the syscall note),
-  libgcc-11-dev.copyright.txt (GPL-3 with the GCC Runtime Library Exception).
-lib/libstdc++.so.6, lib/libgcc_s.so.1: the GCC 12 runtime from Ubuntu 22.04 (libstdc++6, libgcc-s1), loaded by
+  exceptions)."
+    RT_NOTE="lib/libstdc++.so.6, lib/libgcc_s.so.1: the GCC 12 runtime from Ubuntu 22.04 (libstdc++6, libgcc-s1), loaded by
   clang and lld only - libstdc++6.copyright.txt / libgcc-s1.copyright.txt (GPL-3 with the GCC Runtime Library
   Exception).
 lib/libicuuc.so.70, libicui18n.so.70, libicudata.so.70: NOT ICU. Small libraries generated by this script (the
   toolkit's own code, no ICU code or data): they define the seven ICU 70 function names lld's built-in libxml2
-  binds, and answer every call with an error. lld never converts XML character sets for an ELF link.
+  binds, and answer every call with an error. lld never converts XML character sets for an ELF link."
+fi
+cat > "$LIC/NOTICE.txt" <<EOF
+Compiler bundle of an xboxrecomp port release (tools/linux/make_toolchain_bundle.sh).
+
+$BIN_NOTE
+sysroot/: GNU C library 2.35, Linux kernel headers, GCC 11 startup files / libgcc from Ubuntu 22.04 packages -
+  libc6*.copyright.txt (LGPL-2.1+), linux-libc-dev.copyright.txt (GPL-2 headers, with the syscall note),
+  libgcc-11-dev.copyright.txt (GPL-3 with the GCC Runtime Library Exception).
+$RT_NOTE
 sysroot/usr/lib/x86_64-linux-gnu/libvulkan.so: NOT the Vulkan loader. A link stub generated by this script from
   the function names in the Vulkan headers (vulkan_core.h, Apache-2.0 OR MIT); it is never loaded - the game uses
   the Vulkan loader of the player's system.

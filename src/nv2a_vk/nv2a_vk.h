@@ -109,6 +109,16 @@ void nv2a_vk_set_antialiasing(int mode);
  * frame. Any thread. */
 int nv2a_vk_antialiasing_fits(int mode);
 
+/* BLOOM (a port-side look option, not on the console): bright parts of the presented frame glow. A bright pass
+ * (soft knee above a threshold) at a quarter of the surface's size, a separable Gaussian blur there (two rounds,
+ * 16-bit float), added onto the frame in one full-screen pass - after SMAA, before the gamma ramp, FXAA, the shader
+ * chain and the blit (render targets, readback, screenshots and the GL dumps stay untouched). OFF (the default: no
+ * pass, no images) or a strength 1..NV2A_VK_BLOOM_MAX: higher = a lower threshold and a stronger glow (5 = the
+ * middle). Never during the boot animation, never headless. Any thread; the next flip.
+ * RECOMP_VK_BLOOM=0..10 overrides it. */
+enum { NV2A_VK_BLOOM_OFF = 0, NV2A_VK_BLOOM_MAX = 10 };
+void nv2a_vk_set_bloom(int strength);
+
 /* SHADERS (shader module, porting_guide.md M6): a RetroArch slang preset
  * (.slangp, UTF-8 path) applied by librashader to the game picture -- after
  * the render scale and SMAA / MSAA, into the window's game rectangle only

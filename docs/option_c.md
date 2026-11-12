@@ -249,3 +249,20 @@ line says otherwise.
   lld, `libxr_glslang.so`).
 - **New tests:** `mmio_trap`, `mmio_decode_a64`, `kernel_file_posix`, `host_paths`, `compat_bionic`,
   `compat_events`, `host_stack_dump`.
+
+## 8. Changes since the v1.1.0 snapshot (Orta Recompiled v1.1.1)
+
+- **MSAA on the scene target** (`src/nv2a_vk/nv2a_vk.c`, `ms_scene`). Before, only the presented surface got the
+  multisampled image. Titles that draw their 3D world into a target of their own and copy it onto the presented
+  surface got no MSAA on the 3D (Panzer Dragoon Orta). Now the target with the most draws (at least 32, the most-drawn
+  one for 30 flips in a row) gets it too; shadow / reflection targets stay single-sampled. `RECOMP_VK_MSAA_SCENE=0`
+  = the presented surface only.
+- **MSAA after a resize:** a surface made again at a new size gets its multisampled image back at the next flip
+  (THPS 2X: its scene target changes its width when a level starts at 16:9 / 16:10). `RECOMP_VK_RT_STATS=<n>` logs
+  every n flips the render targets with their sample count and draws.
+- **BLOOM** (`nv2a_vk_set_bloom(strength)`, 0 = off, 1..10): a present pass - bright pass on luminance with a soft
+  knee at a quarter of the size, a separable 9-tap Gaussian (16-bit float), added onto the frame - after SMAA,
+  before the gamma ramp, FXAA and the shader chain. Render targets, readback and screenshots stay untouched.
+  `RECOMP_VK_BLOOM=0..10` overrides.
+- **Release tools:** `tools/linux/build_slim_llvm.sh` (a slim static x86-64 clang + lld for the AppImage, PGO), used
+  by `make_toolchain_bundle.sh --slim-bin`.
