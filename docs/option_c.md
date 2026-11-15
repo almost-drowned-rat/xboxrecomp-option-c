@@ -266,3 +266,12 @@ line says otherwise.
   `RECOMP_VK_BLOOM=0..10` overrides.
 - **Release tools:** `tools/linux/build_slim_llvm.sh` (a slim static x86-64 clang + lld for the AppImage, PGO), used
   by `make_toolchain_bundle.sh --slim-bin`.
+
+## 9. Changes since the v1.1.1 snapshot (Orta Recompiled v1.1.2)
+
+- **Menu controls on their default buttons** (`src/input/xinput_bind.c`, `xinput_device.c`): the opt-in
+  `xbox_InputBindSetMenuFixed(mask)`. While the binding is in menu mode (`xbox_InputBindSetMenu(1)`), each control in
+  the mask takes only its default sources, and those sources act for no other control - so a title keeps
+  "A confirms, B cancels" in its menus whatever the player's mapping says (Orta: OPTIONS > CONTROLS > MENU BUTTONS).
+  Mask 0, the default, keeps the old behaviour; `xbox_bind_eval` wraps the new `xbox_bind_eval_fixed`. Keyboard and
+  pad both go through it, so the pad script sees the same result as a real pad. `tests/input_bind` covers it.

@@ -249,23 +249,56 @@ void xbox_bind_eval(XboxBindKind kind, const XboxBindMap *own, const XboxBindMap
                     uint8_t (*value)(void *ctx, uint16_t src), void *ctx,
                     uint8_t out[XBOX_KEY_CONTROL_COUNT])
 {
+    xbox_bind_eval_fixed(kind, own, def, menu, 0, value, ctx, out);
+}
+
+/* Is src a default source of a control in fixed? */
+static int bind_fixed_src(const XboxBindMap *def, uint32_t fixed, int controls, uint16_t src)
+{
+    int c, i;
+    for (c = 0; c < controls; c++)
+        if (fixed & (1u << c))
+            for (i = 0; i < XBOX_BIND_SRC_MAX; i++)
+                if (def->src[c][i] == src)
+                    return 1;
+    return 0;
+}
+
+void xbox_bind_eval_fixed(XboxBindKind kind, const XboxBindMap *own, const XboxBindMap *def, int menu,
+                          uint32_t fixed, uint8_t (*value)(void *ctx, uint16_t src), void *ctx,
+                          uint8_t out[XBOX_KEY_CONTROL_COUNT])
+{
     int c, i, controls = xbox_bind_controls(kind);
 
+    if (!menu || !def)
+        fixed = 0;
     memset(out, 0, XBOX_KEY_CONTROL_COUNT);
     for (c = 0; c < controls; c++) {
+        if (fixed & (1u << c)) {
+            /* fixed in menus: the default sources only, the own binding does not count */
+            for (i = 0; i < XBOX_BIND_SRC_MAX; i++) {
+                uint16_t s = def->src[c][i];
+                uint8_t v;
+                if (s && (v = value(ctx, s)) > out[c])
+                    out[c] = v;
+            }
+            continue;
+        }
         for (i = 0; i < XBOX_BIND_SRC_MAX; i++) {
             uint16_t s = own->src[c][i];
             uint8_t v;
-            if (s && (v = value(ctx, s)) > out[c])
+            if (s && (!fixed || !bind_fixed_src(def, fixed, controls, s)) && (v = value(ctx, s)) > out[c])
                 out[c] = v;
         }
         if (!menu || !def)
             continue;
-        /* Lock-out rule: a default source the own binding does not use. */
+        /* Lock-out rule: a default source the own binding does not use (and, with fixed controls, not
+         * one of theirs). */
         for (i = 0; i < XBOX_BIND_SRC_MAX; i++) {
             uint16_t s = def->src[c][i];
             uint8_t v;
-            if (s && !xbox_bind_uses(kind, own, s) && (v = value(ctx, s)) > out[c])
+            if (s && !xbox_bind_uses(kind, own, s) && (!fixed || !bind_fixed_src(def, fixed, controls, s)) &&
+                (v = value(ctx, s)) > out[c])
                 out[c] = v;
         }
     }

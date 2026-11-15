@@ -89,6 +89,14 @@ void xbox_bind_set(XboxBindMap *m, int control, uint16_t src);
 void xbox_bind_eval(XboxBindKind kind, const XboxBindMap *own, const XboxBindMap *def, int menu,
                     uint8_t (*value)(void *ctx, uint16_t src), void *ctx,
                     uint8_t out[XBOX_KEY_CONTROL_COUNT]);
+/* The same with controls fixed in menus (bit c = control c; 0 = as above):
+ * in a menu a fixed control takes only its default binding's sources, and
+ * those sources act for no other control there -- e.g. A and B confirm and
+ * cancel on their default buttons whatever the own binding says. Outside
+ * menus the mask does nothing. */
+void xbox_bind_eval_fixed(XboxBindKind kind, const XboxBindMap *own, const XboxBindMap *def, int menu,
+                          uint32_t fixed, uint8_t (*value)(void *ctx, uint16_t src), void *ctx,
+                          uint8_t out[XBOX_KEY_CONTROL_COUNT]);
 
 /* ---- device registry (xinput_device.c) ---------------------------------
  * Where bindings are kept: the port's settings store (get returns def when
@@ -101,6 +109,10 @@ typedef void (*XboxBindSet)(const char *key, const char *value);
 void xbox_InputBindSetStore(XboxBindGet get, XboxBindSet set, const char *env_prefix);
 /* Menu or gameplay: the lock-out rule above applies in menus only. */
 void xbox_InputBindSetMenu(int menu);
+/* Controls fixed to their default sources in menus (bit c = XBOX_KEY_* c,
+ * xbox_bind_eval_fixed); 0 (the default) = none. Only acts while
+ * xbox_InputBindSetMenu(1) is set. */
+void xbox_InputBindSetMenuFixed(uint32_t controls);
 /* For a rebinding menu: the keyboard's own and default binding; store a new
  * own binding (written as text, empty when it equals the default). Returns 0,
  * or -1 when there is no store. */

@@ -136,6 +136,41 @@ int main(void)
     xbox_bind_eval(XBOX_BIND_PAD, &pown, &pdef, 1, key_value, NULL, v);
     check(v[XBOX_KEY_A] == 255 && v[XBOX_KEY_B] == 0, "pad swap, menu: east = A only");
     check(xbox_bind_format(XBOX_BIND_PAD, &pown, &pdef, buf, sizeof buf) > 0 && !strcmp(buf, "a:east,b:south"), "pad format");
+    /* A and B fixed in menus (Orta GitHub #5): B moved to the left shoulder, Black onto east, X onto south. In
+     * menus east cancels and south confirms only, the shoulder does nothing there; in gameplay the own binding
+     * as before; without the mask the old rule. */
+    {
+        const uint32_t ab = (1u << XBOX_KEY_A) | (1u << XBOX_KEY_B);
+        check(xbox_bind_parse(XBOX_BIND_PAD, "b:lshoulder,black:east,x:south", &pdef, &pown) == 0, "pad parse #5");
+        hold(XBOX_PAD_SRC_LSHOULDER, 0);
+        xbox_bind_eval_fixed(XBOX_BIND_PAD, &pown, &pdef, 1, ab, key_value, NULL, v);
+        check(v[XBOX_KEY_B] == 0 && v[XBOX_KEY_BLACK] == 0, "fixed, menu: shoulder is neither B nor Black");
+        xbox_bind_eval_fixed(XBOX_BIND_PAD, &pown, &pdef, 0, ab, key_value, NULL, v);
+        check(v[XBOX_KEY_B] == 255, "fixed, gameplay: shoulder = B");
+        xbox_bind_eval(XBOX_BIND_PAD, &pown, &pdef, 1, key_value, NULL, v);
+        check(v[XBOX_KEY_B] == 255, "no mask, menu: shoulder = B (old rule)");
+        hold(XBOX_PAD_SRC_EAST, 0);
+        xbox_bind_eval_fixed(XBOX_BIND_PAD, &pown, &pdef, 1, ab, key_value, NULL, v);
+        check(v[XBOX_KEY_B] == 255 && v[XBOX_KEY_BLACK] == 0, "fixed, menu: east = B only");
+        xbox_bind_eval_fixed(XBOX_BIND_PAD, &pown, &pdef, 0, ab, key_value, NULL, v);
+        check(v[XBOX_KEY_B] == 0 && v[XBOX_KEY_BLACK] == 255, "fixed, gameplay: east = Black");
+        hold(XBOX_PAD_SRC_SOUTH, 0);
+        xbox_bind_eval_fixed(XBOX_BIND_PAD, &pown, &pdef, 1, ab, key_value, NULL, v);
+        check(v[XBOX_KEY_A] == 255 && v[XBOX_KEY_X] == 0, "fixed, menu: south = A only");
+        hold(XBOX_PAD_SRC_DUP, 0);
+        xbox_bind_eval_fixed(XBOX_BIND_PAD, &pown, &pdef, 1, ab, key_value, NULL, v);
+        check(v[XBOX_KEY_DPAD_UP] == 255, "fixed, menu: other controls unchanged");
+        /* keyboard: A on P, the default A key K still confirms in menus and does not act as anything else */
+        check(xbox_bind_parse(XBOX_BIND_KEYBOARD, "a:sc19,y:sc14", &def, &own) == 0, "parse kbd #5");
+        hold(K, 0);
+        xbox_bind_eval_fixed(XBOX_BIND_KEYBOARD, &own, &def, 1, ab, key_value, NULL, v);
+        check(v[XBOX_KEY_A] == 255 && v[XBOX_KEY_Y] == 0, "fixed kbd, menu: K = A only");
+        hold(P, 0);
+        xbox_bind_eval_fixed(XBOX_BIND_KEYBOARD, &own, &def, 1, ab, key_value, NULL, v);
+        check(v[XBOX_KEY_A] == 0, "fixed kbd, menu: P is not A");
+        xbox_bind_eval_fixed(XBOX_BIND_KEYBOARD, &own, &def, 0, ab, key_value, NULL, v);
+        check(v[XBOX_KEY_A] == 255, "fixed kbd, gameplay: P = A");
+    }
     {
         char t[16];
         check(!strcmp(xbox_bind_source_name(XBOX_BIND_PAD, XBOX_PAD_SRC_RTRIGGER, t, sizeof t), "rtrigger") &&

@@ -36,6 +36,13 @@ void xbox_InputBindSetMenu(int menu)
     s_bind_menu = menu ? 1 : 0;
 }
 
+static volatile uint32_t s_bind_fixed;   /* controls fixed to their defaults in menus */
+
+void xbox_InputBindSetMenuFixed(uint32_t controls)
+{
+    s_bind_fixed = controls;
+}
+
 static int bind_reset(void)
 {
     char name[64];
@@ -250,7 +257,7 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
         xbox_bind_from_keymap(&s_kbd_def, s_keymap, s_keymap_len);
         kbd_bind_load();
     }
-    xbox_bind_eval(XBOX_BIND_KEYBOARD, &s_kbd_own, &s_kbd_def, s_bind_menu, key_value, NULL, held);
+    xbox_bind_eval_fixed(XBOX_BIND_KEYBOARD, &s_kbd_own, &s_kbd_def, s_bind_menu, s_bind_fixed, key_value, NULL, held);
 
     for (i = 0; i < 8; i++)
         if (held[XBOX_KEY_DPAD_UP + i])
@@ -584,9 +591,10 @@ static void pad_state(SDL_Gamepad *c, const XboxBindMap *own, XBOX_GAMEPAD *g)
     int i;
 
     /* Buttons and triggers through the pad's binding (the lock-out rule in
-     * menus); a trigger bound to a digital control counts past the console's
-     * analog threshold. */
-    xbox_bind_eval(XBOX_BIND_PAD, own, &s_pad_def, s_bind_menu, pad_value, c, v);
+     * menus, and the controls fixed there - xbox_InputBindSetMenuFixed); a
+     * trigger bound to a digital control counts past the console's analog
+     * threshold. */
+    xbox_bind_eval_fixed(XBOX_BIND_PAD, own, &s_pad_def, s_bind_menu, s_bind_fixed, pad_value, c, v);
     for (i = 0; i < 8; i++)
         if (v[XBOX_KEY_DPAD_UP + i] > XBOX_ANALOG_BUTTON_THRESHOLD)
             g->wButtons |= dig[i];
