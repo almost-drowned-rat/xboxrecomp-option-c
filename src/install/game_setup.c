@@ -720,18 +720,15 @@ static int install_image(const xr_game_setup_opts *o, xr_game_setup_result *r, c
         goto out;
     r->files = count;
     r->bytes = total;
-    if (o->image_path)
-        r->image_kept = 1;                  /* picked from elsewhere: the player's file, never deleted */
-    else if (!fs_remove_file(image_path)) {
-        r->image_kept = 1;
-        say(o, "the image %s could not be deleted - it can be removed by hand", r->image);
-    }
+    /* The image is never deleted, also when it lies in game/ (maintainer 2026-11-17, Orta GitHub #6: a player
+     * lost his only copy) - it is the player's file. The next start finds game/default.xbe and leaves it alone. */
+    r->image_kept = 1;
     progress(o, 1.0, "Done");
     r->code = XR_SETUP_INSTALLED;
-    snprintf(r->message, sizeof r->message, "%s installed from \"%s\": %u files, %llu MB%s.",
+    snprintf(r->message, sizeof r->message, "%s installed from \"%s\": %u files, %llu MB%s",
              o->game ? o->game : "The game", r->image, count, (unsigned long long)(total >> 20),
-             o->image_path ? " (the image stays where it is)"
-             : r->image_kept ? " (the image is still there)" : "; the image was deleted");
+             o->image_path ? " (the image stays where it is)."
+             : "; the image stays in game/ - you can delete it now to free the space.");
     say(o, "%s", r->message);
     rc = XR_SETUP_INSTALLED;
 out:

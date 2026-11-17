@@ -355,7 +355,8 @@ static void make_folders(L *l)
              "Put your own %s disc image here: one .iso file - or the extracted disc files\r\n"
              "(default.xbe and its folders directly in this folder).\r\n\r\n"
              "Then start \"%s\" again. The image is checked (game and version) and\r\n"
-             "installed into this folder; an .iso put here is deleted after a successful install.\r\n",
+             "installed into this folder. The .iso is kept; delete it yourself after the install\r\n"
+             "if you need the space.\r\n",
              c->disc, c->window_title);
     write_if_missing(l, l->game, "README.txt", text);
     join(p, sizeof p, l->root, "media");

@@ -309,8 +309,10 @@ D3D's busy-waits that call those handlers – the guest lock burnout3-sw has (`x
       player puts the extracted disc **or one disc image** (`.iso`/`.xiso`) into `game/`; the exe calls
       `xr_game_setup` before anything else (THPS 2X: `src/main.c` `thps_game_setup`). An image is extracted into
       `game/.extracting/`, **every file checked against its XDVDFS entry** (size + CRC-32 taken while writing and
-      again reading it back), moved up into `game/` (`default.xbe` last), then the image is deleted; any mismatch,
-      a damaged/truncated image, several images, a nested folder or a full disk → a clear message, the image kept.
+      again reading it back), moved up into `game/` (`default.xbe` last). **The image is never deleted**, also not
+      from `game/` (maintainer 2026-11-17, Orta GitHub #6: a player lost his only copy): the final message says it
+      stays and may be deleted by hand; from the next start `game/default.xbe` counts and the image is left alone.
+      Any mismatch, a damaged/truncated image, several images, a nested folder or a full disk → a clear message.
       No manifest, no journal (a stopped run starts over).
       **Version rules (maintainer, 2026-10-24):** `default.xbe` is extracted, read back and checked **first**, before
       any other file (fail fast): title ID ≠ the port's → "This is not the `<GAME>` image. Please provide the correct

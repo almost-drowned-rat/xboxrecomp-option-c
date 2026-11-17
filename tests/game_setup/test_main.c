@@ -370,7 +370,9 @@ int main(int argc, char **argv)
     CHECK(write_image(p, good), "image written");
     CHECK(run(&r, 0) == XR_SETUP_INSTALLED && r.title_id == TITLE, "installed, title ID read from the XBE");
     memcpy(s_sha_v0, r.xbe_sha1, sizeof s_sha_v0);
+    CHECK(exists(p), "the image is kept after the install");
     clear_game();
+    remove(p);                          /* the installer keeps it; the next case wants an empty game/ */
 
     printf("[empty game/]\n");
     CHECK(run(&r, 0) == XR_SETUP_NO_GAME, "no image, no default.xbe -> no-game");
@@ -470,7 +472,8 @@ int main(int argc, char **argv)
     CHECK(same_as_a(q), "data/a.bin byte-identical");
     path_in(q, sizeof q, s_game, "data" SEP "empty.bin");
     CHECK(file_len(q) == 0, "data/empty.bin there, empty");
-    CHECK(!exists(p) && !r.image_kept, "the image is deleted");
+    CHECK(exists(p) && r.image_kept, "the image is kept (never deleted)");
+    CHECK(strstr(r.message, "the image stays in game/") != NULL, "the message says the image stays");
     path_in(q, sizeof q, s_game, ".extracting" SEP "default.xbe");
     CHECK(!exists(q), "no .extracting left");
     path_in(q, sizeof q, s_root, "media" SEP "keep.txt");
@@ -478,8 +481,9 @@ int main(int argc, char **argv)
     path_in(q, sizeof q, s_root, "saves" SEP "keep.txt");
     CHECK(exists(q), "saves/ untouched");
 
-    printf("[next start]\n");
-    CHECK(run(&r, 0) == XR_SETUP_READY, "default.xbe there -> ready");
+    printf("[next start, the image still in game/]\n");
+    CHECK(run(&r, 0) == XR_SETUP_READY, "default.xbe there -> ready (no second install)");
+    CHECK(exists(p), "the image still there");
 
     printf("[an extracted folder of the wrong version]\n");
     path_in(q, sizeof q, s_game, "default.xbe");
@@ -505,7 +509,7 @@ int main(int argc, char **argv)
     CHECK(same_as_xbe(q, TITLE, 0), "default.xbe byte-identical");
     path_in(q, sizeof q, s_game, "data" SEP "a.bin");
     CHECK(same_as_a(q), "data/a.bin byte-identical");
-    CHECK(!exists(p), "the redump image is deleted");
+    CHECK(exists(p), "the redump image is kept");
 
     printf("%s\n", s_fail ? "FAILED" : "all checks passed");
     return s_fail ? 1 : 0;

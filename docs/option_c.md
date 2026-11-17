@@ -309,3 +309,10 @@ line says otherwise.
 - **nv2a_vk:** window events are pumped also without flips (a screen that waits for a button without drawing); HUD
   squash anchors by quarters and keeps boxes in the left quarter at the left edge; the session's first-compile
   totals are logged.
+
+## 11. Changes since the v1.2.0 snapshot (Orta Recompiled v1.2.1)
+
+- **The installer never deletes the disc image** (`src/install/game_setup.c`; Orta Recompiled GitHub #6): an image
+  found in `game/` used to be deleted after a verified install, one picked elsewhere was kept. Now every image stays
+  where it is; the message and `game/README.txt` say the player may delete it after the install. The next start finds
+  `game/default.xbe` first and never installs again because an image lies beside it (`tests/game_setup`).

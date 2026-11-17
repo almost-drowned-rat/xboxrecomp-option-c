@@ -8,8 +8,10 @@
  *   game/default.xbe there        ready (the image, if any, is left alone)
  *   one image in game/            its files are extracted into game/.extracting/,
  *                                 every file checked, moved up into game/
- *                                 (default.xbe last: it marks a whole install),
- *                                 then the image is deleted
+ *                                 (default.xbe last: it marks a whole install);
+ *                                 the image is never deleted (the player's file;
+ *                                 maintainer 2026-11-17) - from then on game/
+ *                                 counts as extracted, the image is left alone
  *   default.xbe one folder down   reported (the folder must be flat)
  *   several images, none, a       reported, nothing written
  *   damaged or foreign image
@@ -92,7 +94,7 @@ typedef struct {
     char     xbe_sha1[41];              /* of default.xbe, when it could be read */
     uint32_t title_id;                  /* from default.xbe's certificate (0: no XBE header) */
     const char *version;                /* the supported version it is, or NULL */
-    int      image_kept;                /* INSTALLED, but the image could not be deleted */
+    int      image_kept;                /* INSTALLED: always 1 since 2026-11-17 (the image is never deleted) */
     unsigned files;
     uint64_t bytes;
 } xr_game_setup_result;
