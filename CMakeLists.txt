@@ -1,17 +1,21 @@
 cmake_minimum_required(VERSION 3.20)
-project(xboxrecomp VERSION 0.9.0 LANGUAGES C)
+# Version of the option-c toolkit line: the public toolkit (xboxrecomp-option-c) was tagged v1.1.0..v1.1.2 with the
+# Orta releases; 1.2.0 = the state after the maintainer's 2026-11-15 order (the v0.x tags in this repo are upstream's).
+project(xboxrecomp VERSION 1.2.0 LANGUAGES C)
 
 # Xbox Static Recompilation Runtime Library
 # Provides link-time libraries for statically recompiled Xbox games.
-# Pattern: extract emulator subsystems (xemu) into reusable static libraries.
 #
 # Libraries:
-#   xbox_kernel    - Xbox kernel replacement layer (147 imports → Win32)
-#   xbox_d3d8      - D3D8 → D3D11 graphics compatibility
-#   xbox_dsound    - DirectSound → software mixer compatibility
-#   xbox_input     - Xbox gamepad → XInput compatibility
-#   xbox_apu       - MCPX APU audio emulation (extracted from xemu)
-#   xbox_nv2a      - NV2A GPU emulation (extracted from xemu)
+#   xbox_kernel    - Xbox kernel HLE (imports -> host), memory layout, pushbuffer executor
+#   xbox_nv2a_vk   - the renderer: the pushbuffer executor's Vulkan 1.3 back end (XBOXRECOMP_VULKAN)
+#   xbox_apu       - MCPX APU (voice processor, DSP; LLE, optional) - xbox_dsound is an alias of it
+#   xbox_usb       - MCPX OHCI host controllers (LLE, optional)
+#   xbox_input     - host pads (SDL3), keyboard, pad script
+#   xbox_xdk       - XDK libraries at API level (XInput, DirectSound)
+# The legacy D3D11 parts (xbox_d3d8, xbox_nv2a's D3D11 PGRAPH, the Media Foundation movie player) and the old
+# DirectSound mixer were removed 2026-11-16 (maintainer 2026-11-15: nv2a_vk is the one renderer of every Xbox port;
+# removed after the first passed new G3: Orta's regression + timing). History: option-c before that commit.
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -34,34 +38,33 @@ add_subdirectory(src/platform)
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
 
-# The D3D11 parts: xbox_d3d8 (D3D8 -> D3D11 for titles that call D3D through
-# the kernel), xbox_nv2a's D3D11 PGRAPH and the Media Foundation/D3D8 movie
-# player in xbox_video. A title whose D3D is lifted code feeding the
-# pushbuffer executor, rendered by nv2a_vk, needs none of them:
-# XBOXRECOMP_D3D11=OFF builds a Vulkan-only runtime without d3d11/dxgi.
-option(XBOXRECOMP_D3D11 "Build the D3D11 libraries (xbox_d3d8, xbox_nv2a, the D3D8 movie player)" ON)
-
-# Graphics: D3D8 → D3D11 compatibility layer
+# XBOXRECOMP_D3D11 is gone (2026-11-16, the D3D11 libraries were removed); a port that still sets it changes nothing.
 if(XBOXRECOMP_D3D11)
-    add_subdirectory(src/d3d)
+    message(WARNING "XBOXRECOMP_D3D11=ON: the D3D11 libraries were removed 2026-11-16; nv2a_vk is the renderer")
 endif()
 
 # LLE paths, compile-time optional (design principle A10): a title whose XDK
 # libraries run at API level (src/xdk) builds without them.
-option(XBOXRECOMP_LLE_APU "Build the MCPX APU emulation (and the old DirectSound mixer that needs it)" ON)
+option(XBOXRECOMP_LLE_APU "Build the MCPX APU emulation" ON)
 option(XBOXRECOMP_LLE_USB "Build the OHCI/USB host controller emulation" ON)
 
-if(XBOXRECOMP_LLE_APU)
-    # Audio: DirectSound → software mixer compatibility
-    add_subdirectory(src/audio)
-
-    # Audio: MCPX APU hardware emulation (voice processor, DSP)
-    add_subdirectory(src/apu)
+# The indirect-call feedback (src/kernel/icall_feedback.c: every indirect-branch target recorded for the seeds loop)
+# costs a store per indirect call in the generated code - a development aid, never in a release (maintainer
+# 2026-11-16). XBOXRECOMP_ICALL_FEEDBACK=ON turns it on for the toolkit and every target linking xbox_kernel (the
+# port's generated code included). A port that still defines RECOMP_ICALL_FEEDBACK itself in a Release build gets a
+# warning here (Orta did until its next pin).
+option(XBOXRECOMP_ICALL_FEEDBACK "Record indirect-call targets (development builds only, never a release)" OFF)
+get_directory_property(_xr_defs COMPILE_DEFINITIONS)
+if("RECOMP_ICALL_FEEDBACK" IN_LIST _xr_defs AND CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+    message(WARNING "RECOMP_ICALL_FEEDBACK is defined in a ${CMAKE_BUILD_TYPE} build: a development aid (a store per "
+                    "indirect call) - use XBOXRECOMP_ICALL_FEEDBACK=ON in development builds only")
 endif()
 
-# GPU: NV2A hardware emulation (register handlers, MMIO, push buffer)
-if(XBOXRECOMP_D3D11)
-    add_subdirectory(src/nv2a)
+if(XBOXRECOMP_LLE_APU)
+    # Audio: MCPX APU hardware emulation (voice processor, DSP)
+    add_subdirectory(src/apu)
+    # xbox_dsound: the old DirectSound mixer's target name, now an alias of xbox_apu (ports link it by name)
+    add_subdirectory(src/audio)
 endif()
 
 # USB: MCPX OHCI host controllers. A title's XAPI is statically linked and
@@ -73,13 +76,16 @@ endif()
 # Input: host pads (SDL3), keyboard, pad script
 add_subdirectory(src/input)
 
+# The port executable's host layer (xr_host.h: process, layout, log, crash handler, MMIO trap routing)
+add_subdirectory(src/porthost)
+
 # The user's media folder: custom soundtracks (scan, playlists, decoders)
 add_subdirectory(src/media)
 
 # XDK library HLE layer (XInput at API level; DirectSound next)
 add_subdirectory(src/xdk)
 
-# Shared FMV player (Media Foundation -> D3D8 texture)
+# Video helpers: framebuffer present hooks, guest surface dumps, the movie-player stubs
 add_subdirectory(src/video)
 
 # Vulkan renderer for the pushbuffer executor (nv2a_backend.h), from
@@ -112,13 +118,10 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_video
 )
 if(XBOXRECOMP_LLE_APU)
-    target_link_libraries(xboxrecomp INTERFACE xbox_dsound xbox_apu)
+    target_link_libraries(xboxrecomp INTERFACE xbox_apu)
 endif()
 if(XBOXRECOMP_LLE_USB)
     target_link_libraries(xboxrecomp INTERFACE xbox_usb)
-endif()
-if(XBOXRECOMP_D3D11)
-    target_link_libraries(xboxrecomp INTERFACE xbox_d3d8 xbox_nv2a)
 endif()
 if(XBOXRECOMP_VULKAN)
     target_link_libraries(xboxrecomp INTERFACE xbox_nv2a_vk)

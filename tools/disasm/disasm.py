@@ -39,8 +39,10 @@ class Disassembler:
                  force: bool = False,
                  extra_sections: Optional[list] = None,
                  seed_functions: Optional[list] = None,
-                 observed_seeds: Optional[set] = None):
+                 observed_seeds: Optional[set] = None,
+                 write_asm: bool = True):
         self.xbe_path = xbe_path
+        self.write_asm = write_asm   # False: no asm/ listings (--no-asm; nobody downstream reads them)
         self.analysis_json = analysis_json
         self.output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
         self.text_only = text_only
@@ -294,7 +296,7 @@ class Disassembler:
             writer = OutputWriter(
                 self.output_dir, self.engine, self.func_detector,
                 self.xrefs, self.labels, self.image, self.strings)
-            writer.write_all(sections_to_disasm=sections, verbose=self.verbose)
+            writer.write_all(sections_to_disasm=sections if self.write_asm else None, verbose=self.verbose)
 
             # Save cache
             json_path = self._find_analysis_json()

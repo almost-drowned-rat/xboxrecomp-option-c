@@ -1,6 +1,7 @@
 # @TITLE@ Recomp – Rules for Agents and Contributors
 
-Static recompilation of *@TITLE@* (Xbox, @REGION@) on the xboxrecomp fork (`vulkan-backend`).
+Static recompilation of *@TITLE@* (Xbox, @REGION@) on the xboxrecomp fork, branch **`option-c`** (the toolkit standard
+for every Xbox port since 2026-11-10; reference port: Panzer Dragoon Orta).
 Goal: playable on Windows, **Vulkan only** (same base for later Linux/Android ports).
 This repo holds only game-specific code; everything generic belongs in the toolkit.
 Workflow and pitfalls: toolkit `docs/porting_guide.md`, `docs/lessons_learned.md`, `docs/storage.md` – link
@@ -22,7 +23,7 @@ C/SDL3/Vulkan, no busy-waiting, LLE compile-time optional, ...): toolkit `docs/p
     @NAME@_recomp\       this repo
     private\             local inputs and outputs: extracted disc, generated C, install layout, logs (never committed)
   tools\
-    xboxrecomp\          toolkit fork (branch vulkan-backend)
+    xboxrecomp_<port>\   the toolkit (branch option-c), pinned in this port's own worktree
     refs\                read only – never modify; reference builds only out of tree
     private\             shared: deps, the global lock
 ```
@@ -59,7 +60,8 @@ Borrowed code: origin (repo, commit, file) in the header comment and in `docs/so
 ## Features
 
 - **Aspect ratios other than 4:3 (maintainer rule, every port; toolkit `docs/porting_guide.md`, M5):**
-  - **Only 4:3 and 16:9** (maintainer, 2026-10-18; every port, no 21:9 or others). 16:9 applies **only to gameplay**.
+  - **4:3, 16:9, 16:10 and 21:9** (maintainer 2026-11-07, THPS 2X GitHub #9 / #10; it was 4:3 and 16:9 only from
+    2026-10-18). The wider ones apply **only to gameplay**.
   - A game without native 16:9 support keeps menus, loading screens and movies at **4:3, pillarboxed** (never stretched); only gameplay is rendered in the chosen aspect ratio (wider projection/FOV, not stretching).
   - The in-game HUD during gameplay always follows the chosen aspect ratio (maintainer, 2026-10-18; every port):
   anchored to the screen edges of the wider view, never stretched.

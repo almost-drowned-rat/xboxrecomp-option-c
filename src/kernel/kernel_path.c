@@ -770,6 +770,18 @@ const char *xbox_path_data_dir_utf8(void)
     return utf8;
 }
 
+/* The extracted disc (game_dir) in UTF-8, read only (nv2a_vk's shipped pipeline list reads vertex programs from
+ * the player's own disc files). */
+const char *xbox_path_game_dir_utf8(void)
+{
+    static char utf8[XBOX_HOST_PATH * 3];
+    if (!s_game_dir[0])
+        return NULL;
+    if (!WideCharToMultiByte(CP_UTF8, 0, s_game_dir, -1, utf8, (int)sizeof utf8, NULL, NULL))
+        return NULL;
+    return utf8;
+}
+
 /* Empty a folder's contents (files and sub-folders), keeping the folder. */
 static void empty_dir_w(const WCHAR *dir)
 {
@@ -1295,6 +1307,11 @@ static int data_item(const char *rel)
 const char *xbox_path_data_dir_utf8(void)
 {
     return s_cache_dir[0] ? s_cache_dir : NULL;
+}
+
+const char *xbox_path_game_dir_utf8(void)
+{
+    return s_game_dir[0] ? s_game_dir : NULL;
 }
 
 /* The title formatted a cache partition (Win32 backend, same function): its volume's files live in

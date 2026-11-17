@@ -10,6 +10,7 @@
 #include "../platform/mmio_decode.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
+#include "../kernel/thread_name.h"
 #include "usb_gamepad.h"
 
 #include <stdio.h>
@@ -1188,6 +1189,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
 {
     X86Ctx thread_ctx = X86CTX_INIT;   /* this host thread's guest register set */
     X86Ctx *ctx = &thread_ctx;
+    xr_thread_name("xr usb ohci");
     xbox_diag_ctx_set(ctx);
     /* This thread calls recompiled code, so it needs what any thread running
      * recompiled code needs: its own TIB. The guest register set is already

@@ -23,7 +23,9 @@ REGS = r"(?:eax|ecx|edx|ebx|esp|ebp|esi|edi|seh_ebp|fs_base|eflags_sys|call_flag
 # Files whose code runs as, or on behalf of, guest code: no diagnostic lookups there.
 GUEST_REACHABLE = {"kernel_bridge.c", "kernel_hal.c", "kernel_rtl.c", "recomp_trace.c", "xdk_dsound.c",
                    "xdk_xinput.c", "apu_core.c", "ohci.c", "recomp_types.h"}
-DIAG_ALLOWED = {"xbox_memory_layout.c", "xbox_memory_layout.h", "main.c", "host_win32.c"}
+# host_win32.c / host_linux.c: the port host layer's crash handler (src/porthost since 2026-11-16; the template's
+# own host_win32.c before) prints the faulting thread's registers.
+DIAG_ALLOWED = {"xbox_memory_layout.c", "xbox_memory_layout.h", "main.c", "host_win32.c", "host_linux.c"}
 
 
 def _code(text):

@@ -23,6 +23,7 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "apu_aci.h"
+#include "../kernel/thread_name.h"
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
 /* ============================================================
@@ -808,6 +809,7 @@ static void *mcpx_apu_frame_thread(void *arg)
 {
     X86Ctx thread_ctx = X86CTX_INIT;   /* this host thread's guest register set */
     X86Ctx *ctx = &thread_ctx;
+    xr_thread_name("xr apu frame");
     xbox_diag_ctx_set(ctx);
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
     qemu_mutex_lock(&d->lock);

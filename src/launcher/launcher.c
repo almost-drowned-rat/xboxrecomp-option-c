@@ -69,10 +69,15 @@ static void lg(L *l, const char *fmt, ...)
         SDL_UnlockMutex(l->log_mx);
 }
 
+/* out may be a or b (join(p, sizeof p, p, name)): built in a buffer of its own first - snprintf reading the buffer it
+ * writes is undefined; glibc gave a wrong path there and ship_data skipped the shipped files on Linux (Orta
+ * Recompiled v1.2.0 test, 2026-11-17), the UCRT happened to get it right. */
 static void join(char *out, size_t n, const char *a, const char *b)
 {
+    char t[LP];
     size_t k = strlen(a);
-    snprintf(out, n, "%s%s%s", a, k && (a[k - 1] == '/' || a[k - 1] == '\\') ? "" : "/", b);
+    snprintf(t, sizeof t, "%s%s%s", a, k && (a[k - 1] == '/' || a[k - 1] == '\\') ? "" : "/", b);
+    snprintf(out, n, "%s", t);
 }
 
 static int is_file(const char *p)
@@ -932,10 +937,15 @@ static int lift_job(L *l, void *a)
         }
         argv[k] = NULL;
         lg(l, "lift: %s", raw[0]);
-        if (run_proc(l, argv, cwd, logp) != 0) {
-            lg(l, "lift step %s failed - see %s", raw[0], logp);
-            SDL_free(text);
-            return 1;
+        {
+            Uint64 t0 = SDL_GetTicks();
+            if (run_proc(l, argv, cwd, logp) != 0) {
+                lg(l, "lift step %s failed - see %s", raw[0], logp);
+                SDL_free(text);
+                return 1;
+            }
+            /* per step (2026-11-16, step 6a: the first start's breakdown) */
+            lg(l, "lift: %s done after %.1f s", raw[0], (double)(SDL_GetTicks() - t0) / 1000.0);
         }
         SDL_AddAtomicInt(&la->p.done_n, 1);
     }
@@ -1270,6 +1280,58 @@ static int read_bundled_release(L *l)
     return l->release[0] != 0;
 }
 
+/* Shipped data files (2026-11-16; Orta's pipeline list pipelist_orta_pal.bin belongs in
+ * data\, the payload unpacks to tools\ or is the AppImage's read-only share/<slug>/tools): every plain file in
+ * tools/data/ is copied to root/data/ when it is missing there or the release changed (data/shipped_release.txt).
+ * data\ stays safe to delete - the next start puts the files back. Top level only, names through safe_rel. */
+typedef struct { L *l; int force, copied, failed; } ShipArg;
+
+static int safe_rel(const char *p);
+
+static SDL_EnumerationResult SDLCALL ship_cb(void *u, const char *dir, const char *name)
+{
+    ShipArg *a = (ShipArg *)u;
+    char src[LP], dst[LP];
+    (void)dir;
+    if (!safe_rel(name) || !strcmp(name, ".") || !strcmp(name, ".."))
+        return SDL_ENUM_CONTINUE;
+    join(src, sizeof src, a->l->tools, "data");
+    join(src, sizeof src, src, name);
+    if (!is_file(src))
+        return SDL_ENUM_CONTINUE;
+    join(dst, sizeof dst, a->l->data, name);
+    if (!a->force && is_file(dst))
+        return SDL_ENUM_CONTINUE;
+    if (SDL_CopyFile(src, dst))
+        a->copied++;
+    else {
+        a->failed++;
+        lg(a->l, "shipped data: cannot copy %s: %s", name, SDL_GetError());
+    }
+    return SDL_ENUM_CONTINUE;
+}
+
+static void ship_data(L *l)
+{
+    char dir[LP], mark[LP], want[64], *have;
+    ShipArg a;
+    join(dir, sizeof dir, l->tools, "data");
+    if (!is_dir(dir))
+        return;
+    join(mark, sizeof mark, l->data, "shipped_release.txt");
+    snprintf(want, sizeof want, "%s\n", l->release);
+    have = read_text(mark);
+    memset(&a, 0, sizeof a);
+    a.l = l;
+    a.force = !have || strcmp(have, want) != 0;
+    SDL_free(have);
+    SDL_EnumerateDirectory(dir, ship_cb, &a);
+    if (a.copied || a.failed)
+        lg(l, "shipped data: %d file(s) copied to data/%s", a.copied, a.failed ? " (some failed)" : "");
+    if (a.force && !a.failed)
+        write_text(mark, want);
+}
+
 /* ── main ──────────────────────────────────────────────────────────────── */
 
 int xr_launcher_main(const XrLauncherConfig *cfg, int argc, char **argv)
@@ -1344,6 +1406,7 @@ int xr_launcher_main(const XrLauncherConfig *cfg, int argc, char **argv)
         }
     } else if (stamp_have && !strcmp(stamp_have, stamp_want) && is_file(xbe)) {
         SDL_free(stamp_have);
+        ship_data(&l);                  /* a deleted data\ gets its shipped files back */
         ok = no_start || start_game(&l);
         goto out;
     }
@@ -1420,6 +1483,7 @@ int xr_launcher_main(const XrLauncherConfig *cfg, int argc, char **argv)
         write_text(p, rel);
     }
     lg(&l, "built %s", xbe);
+    ship_data(&l);
     ok = no_start || start_game(&l);
 out:
     xr_setup_ui_close(l.ui);

@@ -212,6 +212,13 @@ port is built to link any subset of its versions into one exe:
 
 ## M3.5 – no emulation layer left (lessons from THPS 2X)
 
+> **Fixed exceptions (maintainer 2026-11-17, every port):** besides the NV2A pushbuffer executor (the renderer),
+> two device emulations stay by rule: **sound emulation (MCPX APU incl. the DSP56k, AC97)** and **OHCI (USB /
+> pads)**. Reason: both work, the cost is low, a rebuild brings no noticeable benefit. They are encapsulated as
+> their own modules (licence: docs/licence_apu_ac97_ohci.md); an HLE replacement of the APU is
+> deferred. So for Option C ports the item below reads: the LLE APU and USB stay ON; turning them off is only for
+> a title that runs fully on the HLE DirectSound / XInput of src/xdk (THPS 2X's own line).
+
 - [ ] Lift with `--weak-functions` (every function overridable from `recomp_manual.c` with a rebuild) and
       `--hooks config/hooks.toml` (per-game instruction hooks). Use them for diagnostics too: a census of a library's
       calls (count + time per call) is a strong override per function, no re-lift.
@@ -321,7 +328,12 @@ D3D's busy-waits that call those handlers – the guest lock burnout3-sw has (`x
       every written file is flushed to the disk (`FlushFileBuffers` / `fsync`) before it is read back. Reader: `xdvdfs.c` from takedawn-xboxrecomp (MIT, sp00nz). Test: `tests/game_setup`
       (synthetic image, fault injection).
 - [ ] **Aspect-ratio rule (maintainer, 2026-10-16, every port):**
-      - **Only 4:3 and 16:9** (maintainer, 2026-10-18; every port, no 21:9 or others). 16:9 applies **only to gameplay**.
+      - **4:3, 16:9, 16:10 and 21:9** (THPS 2X maintainer, 2026-11-07; was "only 4:3 and 16:9", 2026-10-18; taken
+        over from vulkan-backend a12fbf1 2026-11-16): `RECOMP_WIDESCREEN` = 1 / 16:9, 16:10, 21:9 (64:27),
+        `xbox_video_aspect()`. The wide aspects apply **only to gameplay**. Mouse cursor: hidden over the game window,
+        shown while it moves (nv2a_vk, RECOMP_CURSOR_IDLE_MS). The HUD at the wider aspects: the port moves its HUD to
+        the edges by its own sprite groups (Orta) or uses the toolkit's HUD squash (`nv2a_vk_set_hud_squash`,
+        `_edges`; THPS 2X).
       - A game without native 16:9 support keeps menus, loading screens and movies at **4:3, pillarboxed** (never stretched); only gameplay is rendered in the chosen aspect ratio (wider projection/FOV, not stretching).
       - The in-game HUD during gameplay always follows the chosen aspect ratio (maintainer, 2026-10-18; every port):
   anchored to the screen edges of the wider view, never stretched.
@@ -425,6 +437,25 @@ State: toolkit branch `launcher` (head 65019c1: `src/launcher/`, `src/install/ga
 THPS 2X on the dev machine (2 compile threads): download 14 s, lift 117 s, compile 55 s, `tools\` 773 MB, exe
 24.6 MB.
 
+**In the toolkit since 2026-11-16** (Panzer Dragoon Orta's generic parts, maintainer's order 2026-11-15, step 4) -
+a new port takes these instead of copying them from Orta or THPS:
+
+| Part | Toolkit | A port provides |
+|---|---|---|
+| Launcher main + setup window (Windows) + progress UI (SDL, Linux / Android) | `src/launcher/launcher_port.h`, target `xbox_launcher_port` (INTERFACE: compiled into the launcher exe, so its `xr_setup_ui_*` win) | `XrLauncherConfig` + `XrPortLauncher` (launcher file name, example folder, media README, Android Vulkan lib) and `return xr_launcher_port_main(&p, argc, argv);` |
+| Host layer (paths, log, crash handler, dialogs, restart, MMIO routing), Vulkan 1.3 check | `src/porthost` (`xr_host.h`, `xr_vk_check.h`) | `host_set_port(title, log name, env prefix)` first |
+| `saves/settings.ini` with `<PREFIX>_<KEY>` env overrides | `src/porthost/xr_settings.h` | `xr_settings_init(save_dir)` |
+| Pad read clock for USB-pad titles (XAPI handle) | `xbox_InputTitleOpened` / `xbox_InputTitleReadHandle` (`src/input/xinput_xbox.h`) | the two calls in its XInputOpen / XInputGetState wraps |
+| XLaunchNewImage: read, log, refuse | `src/xdk/xdk_launch.h` | the wrap + which paths it refuses |
+| D3D BlockOnTime without the spin | `src/xdk/xdk_d3d_wait.h` | the wrap with its four values |
+| Shipped data (keys-only pipeline list, ...) | `launcher.c` ship_data: `tools/data/*` -> `data/` when missing or the release changed | files under `data/` in the payload (`Data` in the release config) |
+| Release exe + zip (Windows), AppImage (Linux) | `tools/release/port_release.ps1`, `port_release_zip.ps1`, `port_release_linux.sh` | `tools/release.psd1` / a `.conf` with its names (headers of the scripts) |
+| Regression + timing + first-start E2E | `tools/g3` (`g3_regress.ps1`, `g3_series.ps1`, `g3_firststart.ps1`) | `tools/g3/<port>.psd1` (parts, scripts, minimum frames / draws) |
+| Rumble | the OHCI model forwards the title's output report (260af9e) | nothing |
+
+Still in the port: the Android packaging (Gradle app, loader, Vulkan shim) - its move into
+`templates/android/` is planned.
+
 ## M6 – settings in the game's own menu
 
 - [ ] RE the title's options menu; add entries (references: SCDA, black-pc, CoD3Recomp). One settings file in
@@ -447,7 +478,8 @@ THPS 2X on the dev machine (2 compile threads): download 14 s, lift 117 s, compi
         default BORDERLESS, applies at once), RENDER RESOLUTION, ASPECT RATIO (4:3 / 16:9), MENUS AT 16:9
         (PILLARBOXED / STRETCHED, shown only with 16:9; movies always stay 4:3), ANISOTROPIC FILTER,
         **ANTIALIASING ▸** (a sub-menu with every choice: OFF / FXAA / SMAA / MSAA 2X / MSAA 4X, default FXAA;
-        applies at once), **FRAME RATE ▸** (FRAME RATE, VSYNC, FPS COUNTER: OFF / FPS / FPS AND FRAME TIME / FRAME
+        applies at once), **FRAME RATE ▸** (FRAME RATE, FRAME PACING: DISPLAY / 60 HZ TIMER - see "Frame pacing"
+        below, VSYNC, FPS COUNTER: OFF / FPS / FPS AND FRAME TIME / FRAME
         TIME), **SHADERS ▸** (the optional slang shaders, if the port has the module), **BOOT ANIMATION ▸ as the
         last line** (SHADERS before it - maintainer, 2026-10-27; a status line - BOOT.MPG FOUND / "NEEDS BOOT MPG IN
         THE MEDIA FOLDER" / "CONVERT BOOT VIDEO TO BOOT.MPG  SEE README" when only a boot.mp4 / mkv is there - then
@@ -560,6 +592,21 @@ THPS 2X on the dev machine (2 compile threads): download 14 s, lift 117 s, compi
         does everything that needs it in one go: the real display gate (the setting, no test switch), the cost series
         original vs 120 and the maintainer's frame-pacing / adaptive-sync check. Then it says so, and the display is
         disconnected again. Nothing is replugged during that session.
+        **Frame pacing (maintainer, 2026-11-05: a fixed part of the port guidelines, every recomp integrates it;
+        text from vulkan-backend 9945b7b, option-c has had the code since 7bbc0bc / 573d984 / 7f6e557):**
+        on a display whose rate is a whole multiple of the guest's vblank rate (120 / 180 / 240 Hz for a 60 Hz
+        title) the guest vblank follows the **display's own vblank** - every game frame stays exactly 2 / 3 / 4
+        refreshes - instead of a free-running 60 Hz software timer, which drifts against the refresh (frames shown
+        for 1 and 3 refreshes in turn = judder). Toolkit: `platform/host_vblank.{h,c}` (Windows gdi32
+        `D3DKMTWaitForVerticalBlankEvent`, no DXGI; other hosts fall back to the timer until `VK_KHR_present_wait`
+        is wired), the pacing thread in `kernel/xbox_memory_layout.c` (measures 60 intervals; engages only on a
+        steady 120 / 180 / 240 Hz display, multiple of 60 within 1 %, every interval within 1 ms - variable refresh
+        and 60 / 144 / 165 Hz stay on the timer; the 60 Hz game-time count follows the display too, so game time
+        and frames never drift; counts re-based on every change, monotonic), `xbox_GuestDisplayPacing(hwnd)` from
+        the renderer at window creation and display / mode changes. The port's line: **FRAME PACING: DISPLAY
+        (default) / 60 HZ TIMER** in FRAME RATE, after a restart (`RECOMP_FRAME_PACING=timer`). Check with
+        `RECOMP_PACING_STATS=1` (refreshes per presented frame, every 10 s) on a 120 Hz display, timer vs display.
+        References: Orta (option-c), THPS 2X (vulkan-backend).
         **PAL60 rule** (maintainer, 2026-10-24; every port): a PAL title that supports PAL60 never runs at 50 Hz in
         the recomp – no 50 Hz option, no 50 Hz override, its PAL variant always answers PAL60 (a 30-fps title:
         30 instead of 25 fps). A PAL title without PAL60 keeps 50 Hz; improved later only by interpolation over
@@ -603,7 +650,8 @@ THPS 2X on the dev machine (2 compile threads): download 14 s, lift 117 s, compi
 | `tools\scan_table_seeds.py` (game repo) | data-section pointers to unlifted functions → seeds |
 | `tools/gap_check.py` (toolkit) | every unresolved stub explained (gap / inside / outside), seeds for gaps |
 | `RECOMP_DISASM_SKIP`, `RECOMP_DISASM_EXTRA` | bisect / opt into disassembler passes (`alias_closure`, `nop_boundary`) |
-| `RECOMP_ICALL_FEEDBACK` | unresolved indirect-call targets → seeds |
+| `RECOMP_ICALL_FEEDBACK` (CMake `XBOXRECOMP_ICALL_FEEDBACK=ON`, development builds only - never a release, maintainer 2026-11-16) | unresolved indirect-call targets → seeds |
+| `RECOMP_TIMER_WAKE=1` (opt-in, off) | KeSetTimer / KeInsertQueueDpc wake the timer thread at once; changes the pad-report timing, so old replays no longer match - check later with new recordings |
 | `RECOMP_STUB_LOG=1` | a reached unresolved stub (a silent no-op) logs its address and caller |
 | `RECOMP_WATCHDOG_SECS`, `RECOMP_PEEK` | where a hang is, guest globals |
 | `RECOMP_GL_DUMP`, `RECOMP_FRAME_TRACE`, pad-script `shot=` | pictures and draw traces |

@@ -94,6 +94,10 @@ void nv2a_vk_set_window_crop(int on);
  * below 1 at 16:10 - widened back). Any thread; per frame. k == 1 or hash 0:
  * off. */
 void nv2a_vk_set_hud_squash(uint32_t program_hash, double k);
+/* 1 (default): squashed draws anchor by quarters (left edge / centre / right
+ * edge); 0: all at the centre - for full-screen 2D screens the title draws
+ * with its HUD program (menus over gameplay, name entry), kept together. */
+void nv2a_vk_set_hud_squash_edges(int on);
 
 /* ANTIALIASING (porting_guide.md M6): OFF, FXAA (the present pass, the default
  * -- the picture as before the option), SMAA (iryoku/smaa, three passes at the
@@ -132,6 +136,11 @@ void nv2a_vk_set_bloom(int strength);
 enum { NV2A_VK_SHADER_OFF, NV2A_VK_SHADER_LOADING, NV2A_VK_SHADER_ON, NV2A_VK_SHADER_FAILED,
        NV2A_VK_SHADER_NO_LIBRARY };
 void nv2a_vk_set_shader_preset(const char *path);
+/* The port's shipped pipeline list (keys only, recorded in test play with RECOMP_VK_PIPELIST_RECORD=<file>):
+ * prewarmed at the device's start, before the player's own caches, so the first session compiles less on the fly.
+ * Call before the window is made; RECOMP_VK_PIPELIST=<file> does the same. NULL = none. (nv2a_vk.c "shipped
+ * pipeline list"; maintainer 2026-11-15, step 6.) */
+void nv2a_vk_set_pipeline_list(const char *path);
 /* A parameter of the current preset (its #pragma parameter name), applied now
  * or once the preset is built. Any thread. */
 void nv2a_vk_set_shader_param(const char *name, float value);

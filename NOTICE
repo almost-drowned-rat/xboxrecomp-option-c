@@ -30,17 +30,12 @@ LGPL-2.1-or-later — extracted from xemu
                           (c) 2012 espes; 2018-2019 Jannik Vogel;
                           2019-2025 Matt Borgerson
     src/apu/fpconv.h      (c) 2020-2025 Matt Borgerson
-    src/nv2a/nv2a_regs.h  NV2A register definitions
-                          (c) 2012 espes; 2015 Jannik Vogel
-    src/nv2a/nv2a_core.c  NV2A core register handlers, adapted
-                          (c) 2012 espes; 2015 Jannik Vogel;
-                          2018-2025 Matt Borgerson
-    src/nv2a/nv2a_state.h NV2A device state, adapted from nv2a_int.h
-                          (c) 2012 espes; 2015 Jannik Vogel;
-                          2018-2025 Matt Borgerson
     src/apu/apu.h         MCPX APU public API
                           (header has no copyright line)
-      (the three above listed after sp00n e2909fd by kaskabayev, #233)
+      (src/nv2a/nv2a_regs.h, nv2a_core.c and nv2a_state.h, listed here after
+      sp00n e2909fd by kaskabayev #233, were removed with the old NV2A model on
+      option-c in 2026-11 (ca22928); the pushbuffer executor in src/kernel
+      replaced them)
     src/nv2a_gl/gl_vsh_ff.c  fixed-function vertex lighting and REFLECTION_MAP
                           texgen with the texture matrix (GLSL) and the
                           specular exponent, after glsl/vsh-ff.c, glsl/vsh.c
@@ -178,15 +173,15 @@ Public domain / MIT-0 / MIT — vendored unchanged (branch vulkan-backend)
 Derived algorithms — credited, independently implemented
 --------------------------------------------------------
 
-  src/d3d/d3d8_swizzle.h
+  src/kernel/d3d8_swizzle.h  (was src/d3d/; moved 2026-11, ca22928)
     Implements Xbox Z-order (Morton) texture unswizzling. The
     masked-increment technique is Fabian Giesen's, published on his blog;
     xemu's hw/xbox/nv2a/pgraph/swizzle.c is cited in the file as the
     reference that pointed us at it.
 
-  src/d3d/d3d8_combiners.h
-    NV2A register-combiner translation. Cites xemu's pgraph combiner
-    implementation as a reference for the hardware's behaviour.
+  (src/d3d/d3d8_combiners.h, an NV2A register-combiner translation citing
+  xemu's pgraph combiner as a hardware reference, was removed with the legacy
+  D3D11 renderer on option-c in 2026-11, ca22928.)
 
   src/apu/apu_lowpass.h  (branch option-c)
     The voice processor's per-voice low-pass: Hal Chamberlin's digital state

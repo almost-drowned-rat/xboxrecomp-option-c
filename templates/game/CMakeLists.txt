@@ -36,13 +36,7 @@ option(@PREFIX@_VULKAN "Render through the toolkit's Vulkan back end (nv2a_vk)" 
 # Reserved switch: the toolkit module (dashboard music store -> soundtracks/ folder) is not implemented yet.
 option(@PREFIX@_CUSTOM_SOUNDTRACKS "Dashboard custom soundtracks (only titles on the porting-guide list)" OFF)
 set(XBOXRECOMP_VULKAN ${@PREFIX@_VULKAN} CACHE BOOL "" FORCE)
-# Vulkan only: no D3D11 libraries in the toolkit build (xbox_d3d8, xbox_nv2a,
-# the D3D8 movie player) -- CLAUDE.md, M2 stage 5.
-if(@PREFIX@_VULKAN)
-    set(XBOXRECOMP_D3D11 OFF CACHE BOOL "" FORCE)
-else()
-    set(XBOXRECOMP_D3D11 ON CACHE BOOL "" FORCE)
-endif()
+# Vulkan only: the toolkit has no D3D11 libraries any more (removed 2026-11-16).
 
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
@@ -66,11 +60,8 @@ if(@PREFIX@_OUTPUT_DIR)
     set_target_properties(${PROJECT_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${@PREFIX@_OUTPUT_DIR}")
 endif()
 
-# The toolkit libraries the game uses, named one by one instead of the
-# umbrella target `xboxrecomp`: that one also pulls in xbox_d3d8 (D3D8 ->
-# D3D11 for titles without their own D3D) and xbox_nv2a (an older D3D11
-# PGRAPH path). @TITLE@'s D3D is lifted code driving the NV2A pushbuffer, so
-# with nv2a_vk neither is needed -- Vulkan only (CLAUDE.md).
+# The toolkit libraries the game uses, named one by one. @TITLE@'s D3D is lifted code driving the NV2A
+# pushbuffer, rendered by nv2a_vk -- Vulkan only (CLAUDE.md). xbox_dsound is an alias of xbox_apu.
 target_link_libraries(${PROJECT_NAME} PRIVATE
     xbox_kernel xbox_dsound xbox_input xbox_usb xbox_apu xbox_video)
 if(@PREFIX@_VULKAN)

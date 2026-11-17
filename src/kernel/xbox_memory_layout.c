@@ -16,6 +16,7 @@
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "platform/host_wait.h"
+#include "thread_name.h"
 #include "platform/host_vblank.h" /* FRAME PACING Display */
 #include <math.h>
 #include "frame_time.h"           /* xbox_ft_vblank_wait: flip waits in the renderer's lines */
@@ -1210,6 +1211,7 @@ static int dp_measure(int64_t *period_ns, uint64_t *last_ns)
 static DWORD WINAPI dp_thread(LPVOID unused)
 {
     (void)unused;
+    xr_thread_name("xr display pacing");
     for (;;) {
         LONG gen = InterlockedCompareExchange(&s_dp_gen, 0, 0);
         int64_t period = 0;
@@ -1975,11 +1977,40 @@ static void nv2a_thread_pause(int busy)
 #endif
 }
 
+/* The flag thread also (2026-11-15, option-c order step 3; measured first: Orta gameplay, flag thread ~1 % and
+ * tick thread 0.2 % of a core, G3 timing):
+ *  - keeps the kernel's tick count (KDATA_TICK_COUNT) - the tick thread's 1 ms loop is gone (one host thread and
+ *    ~1000 wakeups a second less); its pass is <= 200 us on Windows, <= 1 ms on POSIX, so the count is as fresh;
+ *  - wakes the ack thread when the title moved PUT (a kickoff): the executor starts within one flag pass instead
+ *    of the ack thread's 1 ms timer - the same wake the THPS 2X hooks give (recomp_spin_wake), for every port.
+ * Not folded into the kernel timer thread as first planned: that one sleeps to the next vblank / timer (up to
+ * 16 ms), and a title spinning on a busy bit (D3D's kickoff flush) would wait that long each time - the X-Men
+ * Legends loading-screen freeze this thread exists for.
+ * RECOMP_TICK_THREAD=1: the old tick thread; RECOMP_NV2A_PUT_WAKE=0: no kickoff wake. */
+static int s_tick_in_flags = 1, s_put_wake = 1;
+
+static void tick_count_store(void)
+{
+    *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) + g_memory_offset) = GetTickCount();
+}
+
 static DWORD WINAPI nv2a_flag_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    volatile uint32_t *put = (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+    uint32_t last_put = *put;
+    xr_thread_name("xr nv2a flags");
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         nv2a_ack_flags(regs);
+        if (s_tick_in_flags)
+            tick_count_store();
+        if (s_put_wake) {
+            uint32_t p = *put;
+            if (p != last_put) {
+                last_put = p;
+                recomp_spin_wake();            /* the ack thread, if it sleeps; also answers the kickoff flush */
+            }
+        }
 #if defined(_WIN32)
         {
             static int us = -1;
@@ -1997,6 +2028,7 @@ static DWORD WINAPI nv2a_flag_thread(LPVOID param)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    xr_thread_name("xr nv2a exec");
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         nv2a_ack_flags(regs);
         {
@@ -2201,9 +2233,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 static DWORD WINAPI tick_count_thread(LPVOID unused)
 {
     (void)unused;
+    xr_thread_name("xr tick");
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = GetTickCount();
+        tick_count_store();
         Sleep(1);
     }
     return 0;
@@ -2219,8 +2251,15 @@ static void xbox_Nv2aAckStart(void)
     /* Joined at shutdown like the ack thread: they read and write guest RAM
      * and the NV2A block, and one still mid-iteration while those are
      * unmapped crashed the process (memory_layout_posix, ~1 run in 60). */
+    {
+        const char *e = getenv("RECOMP_TICK_THREAD");
+        s_tick_in_flags = !(e && *e == '1');
+        e = getenv("RECOMP_NV2A_PUT_WAKE");
+        s_put_wake = !(e && *e == '0');
+    }
+    tick_count_store();                          /* a valid count before any guest code reads it */
     g_nv2a_flag_thread_h = CreateThread(NULL, 0, nv2a_flag_thread, g_nv2a_memory, 0, NULL);
-    g_tick_thread_h = CreateThread(NULL, 0, tick_count_thread, NULL, 0, NULL);
+    g_tick_thread_h = s_tick_in_flags ? NULL : CreateThread(NULL, 0, tick_count_thread, NULL, 0, NULL);
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
@@ -2785,6 +2824,7 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 {
     const uint8_t *mem;
     uint32_t esp, i;
+    xr_thread_name("xr watchdog");
 
     (void)unused;
     Sleep(s_watchdog_secs * 1000u);
@@ -4229,10 +4269,8 @@ void xbox_ProtectMirrorsForDebug(void)
 
 void xbox_MemoryLayoutShutdown(void)
 {
-    if (g_kernel_memory) {
-        VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
-        g_kernel_memory = NULL;
-    }
+    /* The register threads first: the tick count they write lives in the kernel data area (g_kernel_memory), so
+     * freeing that before the join let the last pass write into released memory (order fixed 2026-11-15). */
     if (g_nv2a_ack_thread || g_nv2a_flag_thread_h || g_tick_thread_h) {
         HANDLE *h[3] = { &g_nv2a_ack_thread, &g_nv2a_flag_thread_h, &g_tick_thread_h };
         InterlockedExchange(&g_nv2a_ack_stop, 1);
@@ -4243,6 +4281,10 @@ void xbox_MemoryLayoutShutdown(void)
                 *h[i] = NULL;
             }
         }
+    }
+    if (g_kernel_memory) {
+        VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
+        g_kernel_memory = NULL;
     }
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);

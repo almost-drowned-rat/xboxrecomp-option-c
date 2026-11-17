@@ -47,8 +47,6 @@
  *
  * #include "kernel.h"
  * #include "xbox_memory_layout.h"
- * #include "d3d8_xbox.h"
- * #include "dsound_xbox.h"
  * #include "xinput_xbox.h"
  */
 

@@ -22,10 +22,8 @@ target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/HotPathLogging.cmake)
 xboxrecomp_hot_path_logging(xbox_apu)
 
-# qemu_shim.h lives in nv2a/ - shared QEMU type abstraction
-target_include_directories(xbox_apu PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../nv2a
-)
+# qemu_shim.h (the QEMU type abstraction) lives here since 2026-11-16 (it was in src/nv2a, removed); the APU's
+# include directory is PUBLIC already.
 
 if(MSVC)
     target_compile_options(xbox_apu PRIVATE

@@ -10,6 +10,13 @@ The key insight is that we don't need to *understand* the code. We translate eac
 
 ## Register Model
 
+> **Superseded on option-c (2026-10-17, step C.1; note added 2026-11-16).** The registers are no longer globals:
+> every generated function is `void sub_X(X86Ctx *__restrict ctx, uint8_t *base)` and the registers, x87 stack,
+> MMX/XMM and flags live in the 64-byte aligned `X86Ctx` (`templates/runtime/recomp_types.h`; `g_eax` etc. are
+> macros over `ctx->` there). Memory goes through the `MEM*` macros (volatile only in XDK library sections).
+> `docs/option_c.md` is the design and its history; the description below is the original model, kept for
+> reference.
+
 x86 has 8 general-purpose 32-bit registers. The lifter maps them to C variables:
 
 ### Global Registers (shared across all functions)

@@ -75,3 +75,7 @@ else()
 endif()
 
 target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)
+# XBOXRECOMP_ICALL_FEEDBACK (root CMakeLists.txt, OFF): PUBLIC, so the port's generated code records too.
+if(XBOXRECOMP_ICALL_FEEDBACK)
+    target_compile_definitions(xbox_kernel PUBLIC RECOMP_ICALL_FEEDBACK)
+endif()

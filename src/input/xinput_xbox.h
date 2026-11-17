@@ -138,6 +138,12 @@ void xbox_InputRecordFlush(void);   /* write out now (also at exit) */
  * xbox_InputGetState; a port whose title reads its pads in guest code (USB pad model) calls xbox_InputTitleRead from
  * its XInputGetState override, and from then on that port counts only those. */
 void xbox_InputTitleRead(int port);
+/* The same for a port whose XInputGetState override sees only the title's device handle (XAPI's XInputOpen gave it,
+ * e.g. Orta's sub_0030917C / sub_003093BC; 2026-11-16, from Orta's recomp_manual.c "pad read clock"): call
+ * xbox_InputTitleOpened(port, handle) after the title's XInputOpen returned the handle, and
+ * xbox_InputTitleReadHandle(handle) in its XInputGetState - it counts a read for the port the handle was opened on. */
+void xbox_InputTitleOpened(int port, uint32_t handle);
+void xbox_InputTitleReadHandle(uint32_t handle);
 unsigned long xbox_InputReadNow(int port);
 /* Set (on its own thread) while the runtime samples the pads for itself (movie skip): such a read is not one of
  * the title's - the script's "r<n>" read count and the recorder skip it, so replays stay deterministic. */

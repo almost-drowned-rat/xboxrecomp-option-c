@@ -5,6 +5,7 @@ Disassembles raw bytes from the XBE and organizes instructions
 into basic blocks within each function.
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_OP_IMM, CS_OP_MEM
@@ -22,7 +23,7 @@ COND_JUMPS = frozenset({
 }) | LOOP_JUMPS
 
 
-@dataclass
+@dataclass(slots=True)   # slots: ~1 M of these stay alive in the decode cache (2026-11-16, 6a)
 class Instruction:
     """A single disassembled x86 instruction."""
     address: int
@@ -76,7 +77,7 @@ class Instruction:
         return self.address + self.size
 
 
-@dataclass
+@dataclass(slots=True)
 class Operand:
     """Parsed instruction operand."""
     type: str  # "reg", "imm", "mem"
@@ -94,6 +95,9 @@ class Operand:
     # Xbox -- it is how a title reaches the TIB -- but dropping the prefix put
     # fs:[0] at linear address 0, which is also where a null pointer lands.
     mem_seg: str = None
+    # Register width some unit tests set on hand-built operands; the decoder never fills it and the lifter does
+    # not read it. A field because slots=True forbids ad-hoc attributes.
+    size: Optional[int] = None
 
 
 @dataclass
@@ -159,6 +163,12 @@ class Disassembler:
         self._cs = Cs(CS_ARCH_X86, CS_MODE_32)
         self._cs.detail = True
         _init_reg_names(self._cs)
+        # disassemble_function results by (start, size, bytes, resync): the translator decodes every function
+        # ~3.5 times (static indirect targets, CFG ownership, jump tables, then the translation itself) - on
+        # Orta 66,685 calls for 18,716 functions, the biggest share of the first start's lift (2026-11-16,
+        # step 6a profile). The Instruction objects are only read after _decode_instruction, so the entries are
+        # shared; each call gets its own list. RECOMP_LIFT_DECODE_CACHE=0 turns it off.
+        self._fn_cache = None if os.environ.get("RECOMP_LIFT_DECODE_CACHE", "1") == "0" else {}
 
     def _decode_instruction(self, cs_insn):
         """Convert one Capstone instruction into the translator model."""
@@ -228,6 +238,16 @@ class Disassembler:
         if size <= 0 or size > len(raw_bytes):
             return []
 
+        if self._fn_cache is not None:
+            key = (start_va, size, bytes(raw_bytes[:size]), tuple(sorted(resync)) if resync else ())
+            hit = self._fn_cache.get(key)
+            if hit is None:
+                hit = self._disassemble_function(raw_bytes, start_va, end_va, size, resync)
+                self._fn_cache[key] = hit
+            return list(hit)
+        return self._disassemble_function(raw_bytes, start_va, end_va, size, resync)
+
+    def _disassemble_function(self, raw_bytes, start_va, end_va, size, resync):
         decoded = {}
         for cs_insn in self._cs.disasm(raw_bytes[:size], start_va):
             decoded[cs_insn.address] = self._decode_instruction(cs_insn)

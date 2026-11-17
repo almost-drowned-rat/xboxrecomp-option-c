@@ -6,6 +6,7 @@ with instruction classification and operand analysis.
 """
 
 import bisect
+import itertools
 import struct
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -89,6 +90,8 @@ class DisasmEngine:
 
         # Sorted address list (built lazily for range queries)
         self._sorted_addrs: Optional[List[int]] = None
+        # Addresses decode_at added since the list was last sorted (merged by _ensure_sorted_addrs)
+        self._pending_addrs: List[int] = []
 
         # Embedded jump tables: table VA -> end VA (exclusive).
         # Populated by resync_jump_tables() from the indexed indirect jumps
@@ -388,7 +391,10 @@ class DisasmEngine:
             return 0
 
         added = 0
-        for cs_insn in self._cs.disasm(data[offset:], addr):
+        # At most max_insns new instructions (+ the first, which may already be known) of at most 15 bytes are
+        # decoded: copy only that window, not the whole rest of the section (2026-11-16, step 6a profile; the
+        # same instructions as before).
+        for cs_insn in self._cs.disasm(data[offset:offset + (max_insns + 1) * 15], addr):
             if cs_insn.address != addr and cs_insn.address in self.instructions:
                 break  # resynced with the existing stream
             if cs_insn.address not in self.instructions:
@@ -401,8 +407,12 @@ class DisasmEngine:
             if added >= max_insns:
                 break
 
-        if added:
-            self._sorted_addrs = None
+        if added and self._sorted_addrs is not None:
+            # Only additions: remember them; _ensure_sorted_addrs merges them into the sorted list when it is
+            # next read, instead of re-sorting ~1 M keys from the dict (2026-11-16, step 6a profile: 9 s of
+            # Orta's disassembly). The decoded addresses are the last `added` keys of the dict (insertion
+            # order), none of them in the list yet.
+            self._pending_addrs.extend(itertools.islice(reversed(self.instructions.keys()), added))
         return added
 
     def block_tail_jump(self, addr: int, max_insns: int = 256):
@@ -744,8 +754,8 @@ class DisasmEngine:
                 offset = addr - section.virtual_addr
                 if offset < 0 or offset >= len(data):
                     return False
-                decoded = next(self._cs.disasm(data[offset:], addr, count=1),
-                               None)
+                decoded = next(self._cs.disasm(data[offset:offset + 15], addr, count=1),
+                               None)   # one instruction: 15 bytes at most (no copy of the section's rest)
                 if decoded is None:
                     return False  # undecodable: not code
                 mnemonic = decoded.mnemonic.lower()
@@ -834,9 +844,14 @@ class DisasmEngine:
         return self.instructions.get(address)
 
     def _ensure_sorted_addrs(self):
-        """Build sorted address list if not cached."""
+        """Build sorted address list if not cached; merge the additions decode_at recorded since."""
         if self._sorted_addrs is None:
             self._sorted_addrs = sorted(self.instructions.keys())
+            self._pending_addrs = []
+        elif self._pending_addrs:
+            self._sorted_addrs.extend(self._pending_addrs)
+            self._sorted_addrs.sort()   # timsort: a sorted run + a short unsorted tail, near-linear
+            self._pending_addrs = []
 
     def instruction_covering(self, addr: int) -> Optional[Instruction]:
         """The decoded instruction whose bytes contain `addr` but do not start

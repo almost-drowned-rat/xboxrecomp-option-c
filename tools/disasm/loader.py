@@ -73,6 +73,7 @@ class BinaryImage:
     # Lookup tables built after loading
     _section_by_name: Dict[str, SectionInfo] = field(default_factory=dict, repr=False)
     _thunk_to_import: Dict[int, KernelImport] = field(default_factory=dict, repr=False)
+    _section_data: Dict[tuple, bytes] = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
         self._section_by_name = {s.name: s for s in self.sections}
@@ -126,8 +127,17 @@ class BinaryImage:
         return struct.unpack_from('<I', data)[0]
 
     def get_section_data(self, section: SectionInfo) -> bytes:
-        """Get the raw bytes for a section."""
-        return self.raw_data[section.raw_addr:section.raw_addr + section.raw_size]
+        """Get the raw bytes for a section.
+
+        Cached per (offset, size): raw_data is immutable bytes, and the slice
+        copied the whole section on every call - 38,457 calls cost 13 s of
+        Orta's first-start disassembly (2026-11-16, step 6a profile)."""
+        key = (section.raw_addr, section.raw_size)
+        data = self._section_data.get(key)
+        if data is None:
+            data = self.raw_data[section.raw_addr:section.raw_addr + section.raw_size]
+            self._section_data[key] = data
+        return data
 
     def get_kernel_import_at_thunk(self, thunk_addr: int) -> Optional[KernelImport]:
         """Look up a kernel import by its thunk address."""

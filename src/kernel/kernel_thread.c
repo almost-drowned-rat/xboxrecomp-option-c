@@ -14,6 +14,8 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
 #include "frame_time.h"           /* xbox_ft_sleep: sleeps in the [hitch] lines */
+#include <stdlib.h>               /* getenv (RECOMP_GUEST_PRIORITY) */
+#include "thread_name.h"
 
 /* ============================================================================
  * Thread Start Wrapper
@@ -31,6 +33,7 @@ typedef struct _XBOX_THREAD_START_INFO {
 static DWORD WINAPI xbox_thread_wrapper(LPVOID lpParameter)
 {
     XBOX_THREAD_START_INFO info = *(XBOX_THREAD_START_INFO*)lpParameter;
+    xr_thread_name("guest thread");
 
     /* Free the start info before calling the routine - the routine may
      * never return (calling PsTerminateSystemThread instead) */
@@ -267,6 +270,43 @@ LONG __stdcall xbox_KeSetBasePriorityThread(PVOID Thread, LONG Increment)
         Thread, Increment, new_win32, previous);
 
     return previous;
+}
+
+/* The title's base priority increment on the host thread behind its thread object (the kernel bridge's
+ * KeSetBasePriorityThread passes the host handle it keeps in its thread table). RECOMP_GUEST_PRIORITY:
+ *   1 (default)  applied, capped to LOWEST..HIGHEST: TIME_CRITICAL belongs to the time-critical gate
+ *                (kernel_bridge.c) - a host TIME_CRITICAL thread spinning on a lower one starves it on a host
+ *                with few cores (the Steam Deck has 4) -, and IDLE would let a busy host park a guest thread;
+ *   2            the full range, TIME_CRITICAL and IDLE too;
+ *   0            nothing, as before 2026-11-15 (no priority took effect then: the bridge passed the guest
+ *                KTHREAD as the host handle).
+ * On Linux the POSIX layer turns the level into the thread's nice, where the process may undo it
+ * (win32_compat.c apply_nice). */
+void xbox_host_thread_priority(HANDLE host, LONG increment)
+{
+    static int mode = -1;
+    int pr;
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_GUEST_PRIORITY");
+        mode = (e && *e >= '0' && *e <= '2') ? *e - '0' : 1;
+    }
+    if (!mode || !host)
+        return;
+    pr = xbox_priority_to_win32(increment);
+    if (mode == 1) {
+        if (pr > THREAD_PRIORITY_HIGHEST) pr = THREAD_PRIORITY_HIGHEST;
+        if (pr < THREAD_PRIORITY_LOWEST)  pr = THREAD_PRIORITY_LOWEST;
+    }
+    if (!SetThreadPriority(host, pr)) {
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_THREAD, "SetThreadPriority(%p, %d) failed (%lu)", host, pr,
+                 (unsigned long)GetLastError());
+    } else {
+        static volatile LONG said;
+        if (!InterlockedExchange(&said, 1))
+            fprintf(stderr, "  [KERNEL] guest thread priorities applied to the host threads (RECOMP_GUEST_PRIORITY=%d:"
+                            " %s); first: increment %ld -> host level %d\n", mode,
+                    mode == 1 ? "capped LOWEST..HIGHEST" : "full range", (long)increment, pr);
+    }
 }
 
 LONG __stdcall xbox_KeQueryBasePriorityThread(PVOID Thread)

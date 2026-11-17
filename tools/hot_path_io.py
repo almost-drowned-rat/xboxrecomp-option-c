@@ -68,7 +68,6 @@ FILE_IO_ALLOWED = {
     # Opt-in diagnostics, off by default, on host threads that hold no gate.
     ("src/kernel/frame_time.c", "start"): "opt-in RECOMP_FRAME_TIME: opened once at the first counted frame, written on the render thread",
     ("src/kernel/nv2a_pb_exec.c", "dump_surface_bmp"): "opt-in RECOMP_FB_DUMP, push-buffer executor thread",
-    ("src/kernel/nv2a_pb_exec.c", "dump_texture_bmp"): "opt-in RECOMP_TEX_DUMP, push-buffer executor thread",
     ("src/kernel/xbox_memory_layout.c", "xbox_StateSnapshot"): "opt-in snapshot a project calls explicitly",
     ("src/apu/apu_xaudio2.c", "apu_wav"): "opt-in RECOMP_APU_WAV, audio device thread",
     ("src/apu/apu_dsp.c", "apu_bin_diag"): "opt-in RECOMP_APU_GP_DUMP, once, APU frame thread (no gate)",

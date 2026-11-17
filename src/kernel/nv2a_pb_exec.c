@@ -13,8 +13,8 @@
  * and 2D overlays that way, so it is the first geometry to appear. Batches that
  * need a vertex program executed are counted and skipped rather than drawn
  * somewhere wrong -- see raster_batch(). Texturing, depth and vertex programs
- * are still a renderer, not a command decoder; the upgrade path is the D3D11
- * translator in src/nv2a/nv2a_pgraph_d3d11.c.
+ * are still a renderer, not a command decoder; the renderer is the back end
+ * (nv2a_backend.h: nv2a_vk, Vulkan 1.3).
  *
  * Everything this does not handle is counted and ranked by
  * nv2a_pb_exec_report(), so what remains is a list rather than a guess.
@@ -34,7 +34,7 @@
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
-#include "../d3d/d3d8_swizzle.h"
+#include "d3d8_swizzle.h"          /* here since 2026-11-16 (was src/d3d, removed) */
 #include "nv2a_backend.h"
 #include "nv2a_clear_color.h"   /* SET_COLOR_CLEAR_VALUE -> A8R8G8B8 */
 
@@ -56,7 +56,6 @@ static int pb_verbose(void)   { static int c = -1; return env_once("RECOMP_PB_EX
 /* RECOMP_PB_REPORT=1: only the ranked unhandled-method report every 600 flips (with the bits each
  * method ever carried, "or="), without the verbose trace -- cheap enough for timed runs. */
 static int pb_report(void)    { static int c = -1; return env_once("RECOMP_PB_REPORT", &c); }
-static int pb_ffp_trace(void) { static int c = -1; return env_once("RECOMP_FFP_TRACE", &c); }
 void nv2a_pb_exec_report(void);
 
 /* Would writing this surface land on the title's own image?
@@ -378,67 +377,8 @@ typedef struct {
     uint32_t offset, color, width, height, batches;
 } PbTexUse;
 static PbTexUse s_tex_use[PB_EXEC_MAX_TEXTURES];
-static int s_tex_use_count;
+static int s_tex_use_count;              /* filled by the CPU rasteriser until 2026-11-16; the report still lists it */
 
-/* Defined below, next to the sampler it goes through. */
-static void dump_texture_bmp(uint32_t seq);
-
-/* Repeat dumps are numbered from well past the first-use sequence, so a
- * listing sorts them after the textures they came from and no first-use file
- * is ever overwritten by one. */
-#define TEX_DUMP_SEQ_BASE 1000u
-#define TEX_DUMP_SEQ_MAX  40u
-
-static void note_texture_use(void)
-{
-    int i;
-
-    if (!s_gpu.tex.valid)
-        return;
-    for (i = 0; i < s_tex_use_count; i++) {
-        if (s_tex_use[i].offset == s_gpu.tex.offset
-         && s_tex_use[i].color  == s_gpu.tex.color) {
-            s_tex_use[i].batches++;
-            /* Dump a surface that is redrawn, every Nth time it is bound.
-             *
-             * First use alone cannot tell a decode error that is wrong in
-             * every frame from one that accumulates across them. A block
-             * transform that is wrong is wrong on its own, in the keyframe
-             * as much as anywhere; motion compensation that is wrong starts
-             * from a clean keyframe and smears further with each predicted
-             * frame after it. In a single frame the two look identical, and
-             * in a sequence they look nothing alike -- so the sequence is
-             * what has to be captured.
-             *
-             * It belongs on this side of the return: a video surface keeps
-             * one address for the whole film, so after the first frame it is
-             * only ever found here, and the first-use dump below never fires
-             * for it again. RECOMP_TEX_DUMP_EVERY=<n> sets the interval, and
-             * RECOMP_TEX_DUMP still names the files. */
-            {
-                static int every = -1;
-                static unsigned binds, seq;
-                if (every < 0) {
-                    const char *e = getenv("RECOMP_TEX_DUMP_EVERY");
-                    every = e ? atoi(e) : 0;
-                }
-                if (every > 0 && ++binds % (unsigned)every == 0
-                    && seq < TEX_DUMP_SEQ_MAX)
-                    dump_texture_bmp(TEX_DUMP_SEQ_BASE + seq++);
-            }
-            return;
-        }
-    }
-    if (s_tex_use_count < PB_EXEC_MAX_TEXTURES) {
-        s_tex_use[s_tex_use_count].offset  = s_gpu.tex.offset;
-        s_tex_use[s_tex_use_count].color   = s_gpu.tex.color;
-        s_tex_use[s_tex_use_count].width   = s_gpu.tex.width;
-        s_tex_use[s_tex_use_count].height  = s_gpu.tex.height;
-        s_tex_use[s_tex_use_count].batches = 1;
-        s_tex_use_count++;
-        dump_texture_bmp((uint32_t)s_tex_use_count - 1);
-    }
-}
 
 /* The last value written to every Kelvin method, as the GPU's register file
  * would hold it. State the executor does not model explicitly (lights,
@@ -1041,12 +981,6 @@ static void dump_surface_bmp(void)
                 path, w, h, s_gpu.color_offset, bpp);
 }
 
-/* Defined below, next to the rest of the rasteriser; the clear path uses it
- * for RECOMP_RASTER_TEST. */
-static void raster_triangle(const float a[2], const float b[2],
-                            const float c[2], uint32_t argb,
-                            const float uv[3][2]);
-
 /* ── Render back end (nv2a_backend.h) ───────────────────────── */
 
 static const Nv2aBackend *s_backend;
@@ -1207,36 +1141,8 @@ static void clear_surface(uint32_t param)
         }
     }
 
-    /* Prove the pixel path end to end, independent of whether the title has
-     * given us any geometry yet.
-     *
-     * "Nothing on screen" has three very different causes -- the surface
-     * address or pitch is wrong, the rasteriser is broken, or the title's
-     * vertex buffers are empty -- and they are indistinguishable from a black
-     * window. RECOMP_RASTER_TEST draws one known triangle into the surface
-     * just cleared, so a visible triangle rules out the first two and leaves
-     * only the third. On Wreckless it is the third: attribute 0 decodes
-     * correctly (float, size 2, stride 16) and the buffer it points at stays
-     * zero.
-     *
-     * ponytail: bring-up aid, not a feature. It costs one branch per clear. */
-    if (getenv("RECOMP_RASTER_TEST")) {
-        static int announced;
-        /* Every clear, not once: the title clears each frame and double-buffers,
-         * so a triangle drawn a single time is erased before anyone sees it. */
-        if (s_gpu.clip_w && s_gpu.clip_h) {
-            float a[2], b[2], c[2];
-            a[0] = s_gpu.clip_w * 0.5f; a[1] = s_gpu.clip_h * 0.15f;
-            b[0] = s_gpu.clip_w * 0.85f; b[1] = s_gpu.clip_h * 0.85f;
-            c[0] = s_gpu.clip_w * 0.15f; c[1] = s_gpu.clip_h * 0.85f;
-            raster_triangle(a, b, c, 0xFFFF00FFu, NULL);  /* magenta: never a clear colour */
-            if (announced++ == 0)
-            fprintf(stderr, "  [GPU] raster self-test: triangle (%.0f,%.0f)"
-                            " (%.0f,%.0f) (%.0f,%.0f) into 0x%08X %ubpp\n",
-                    a[0], a[1], b[0], b[1], c[0], c[1],
-                    s_gpu.color_offset, surface_bpp());
-        }
-    }
+    /* (RECOMP_RASTER_TEST, a magenta triangle drawn by the CPU rasteriser into
+     * every cleared surface, went with that rasteriser on 2026-11-16.) */
 
     /* Show the surface actually being drawn into. A title that double-buffers
      * renders into the back buffer, so following AvSetDisplayMode's address
@@ -1273,16 +1179,15 @@ static void clear_surface(uint32_t param)
  * correction, and only batches whose attribute 0 is already in screen space.
  * A title running a vertex program hands over object-space positions that mean
  * nothing without executing the program, so those batches are counted and
- * skipped rather than drawn somewhere wrong. Upgrade path is the D3D11
- * translator in src/nv2a/nv2a_pgraph_d3d11.c once vertex programs are
- * translated; this exists to get the first geometry on screen for every title,
+ * skipped rather than drawn somewhere wrong. The real renderer is the back end
+ * (nv2a_vk); this exists to get the first geometry on screen for every title,
  * which in practice is UI, HUD and 2D overlays -- all pre-transformed.
  */
 
 /* One texel, in the title's own format.
  *
  * The codes are the NV097 colour field, which is the Xbox D3DFMT_ enum --
- * src/d3d/d3d8_xbox.h is the table, and it is the table to check against
+ * the removed src/d3d/d3d8_xbox.h (option-c a0b6fb3) is the table, and it is the table to check against
  * rather than recollection: 0x1E is LIN_X8R8G8B8 and not, as this first read
  * it, a byte-reversed BGRA. Getting that one wrong turned an opaque black
  * render target into a screen of pure blue, which is the kind of wrong that
@@ -1493,228 +1398,8 @@ static int sample_texture(const Texture *t, uint32_t u, uint32_t v, uint32_t *ar
     }
 }
 
-/* Write a bound texture out as a BMP, through the sampler rather than around it.
- *
- * "Which texture is this" is not answerable from an address and a format, and
- * it is the question behind most of the ones that matter -- is that a font
- * page or an icon atlas, did the swizzle decode, is the alpha inverted. Going
- * through sample_texture means the file shows exactly what the rasteriser
- * sees, so a decode bug appears here rather than only as a wrong-looking
- * triangle.
- *
- * ponytail: RGB only, alpha dropped. A glyph page is alpha and would come out
- * black, so alpha is composited onto mid-grey to stay legible; that is a
- * viewing choice, not a decode. One file per distinct texture, first use only.
- */
-static void dump_texture_bmp(uint32_t seq)
-{
-    const char *prefix = getenv("RECOMP_TEX_DUMP");
-    uint32_t w = s_gpu.tex.width, h = s_gpu.tex.height, x, y;
-    uint32_t row_bytes, pad, filesz;
-    uint8_t hdr[54];
-    char path[512];
-    FILE *f;
 
-    if (!prefix || !w || !h || w > 4096 || h > 4096)
-        return;
-    row_bytes = w * 3;
-    pad = (4 - (row_bytes & 3)) & 3;
-    filesz = 54 + (row_bytes + pad) * h;
 
-    snprintf(path, sizeof path, "%s%02u_%08X_fmt%02X.bmp",
-             prefix, seq, s_gpu.tex.offset, s_gpu.tex.color);
-    f = fopen(path, "wb");
-    if (!f)
-        return;
-    memset(hdr, 0, sizeof hdr);
-    hdr[0] = 'B'; hdr[1] = 'M';
-    memcpy(hdr + 2, &filesz, 4);
-    hdr[10] = 54; hdr[14] = 40;
-    memcpy(hdr + 18, &w, 4);
-    memcpy(hdr + 22, &h, 4);
-    hdr[26] = 1; hdr[28] = 24;
-    fwrite(hdr, 1, sizeof hdr, f);
-
-    for (y = 0; y < h; y++) {
-        for (x = 0; x < w; x++) {
-            uint32_t argb = 0, a;
-            uint8_t px[3];
-            if (!sample_texture(&s_gpu.tex, x, h - 1 - y, &argb))
-                argb = 0;
-            a = (argb >> 24) & 0xFFu;
-            /* over mid-grey, so an alpha-only page is visible either way */
-            px[0] = (uint8_t)(((argb & 0xFFu) * a + 128u * (255u - a)) / 255u);
-            px[1] = (uint8_t)((((argb >> 8) & 0xFFu) * a + 128u * (255u - a)) / 255u);
-            px[2] = (uint8_t)((((argb >> 16) & 0xFFu) * a + 128u * (255u - a)) / 255u);
-            fwrite(px, 1, 3, f);
-        }
-        if (pad) {
-            static const uint8_t zero[3] = {0, 0, 0};
-            fwrite(zero, 1, pad, f);
-        }
-    }
-    fclose(f);
-    fprintf(stderr, "  [TEXDUMP] %s (%ux%u fmt 0x%02X)\n",
-            path, w, h, s_gpu.tex.color);
-    fflush(stderr);
-}
-
-/* The surface, resolved once per batch.
- *
- * dma_resolve consults the contiguous arena's high-water mark and
- * surface_hits_image walks the image range; both were being done per pixel
- * -- dma_resolve twice -- which cost more than the rasterisation they
- * guarded. Neither answer can change inside a batch, because the colour
- * offset arrives as a method and a method cannot arrive mid-triangle.
- *
- * This is not a micro-optimisation for its own sake: the loader's video
- * paces on frames actually presented, so the rasteriser's throughput is the
- * playback rate. */
-static uint8_t *s_surface;          /* host address of surface row 0 */
-
-static int surface_begin_batch(const uint8_t *mem)
-{
-    uint32_t base = dma_resolve(s_gpu.color_offset);
-
-    if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
-        return 0;
-    s_surface = (uint8_t *)mem + base;
-    return 1;
-}
-
-static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
-{
-    uint8_t *row;
-
-    (void)mem;
-    if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w))
-        return;
-    if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
-        return;
-    s_gpu.pixels++;
-    if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
-        s_gpu.pixel_max = argb;
-    row = s_surface + (size_t)y * s_gpu.pitch;
-
-    /* src*srcAlpha + dst*(1-srcAlpha), and only that pair.
-     *
-     * Any other factor combination falls through to an opaque write rather
-     * than being approximated: a wrong blend is harder to recognise on
-     * screen than no blend, and this is the only pair this title sets.
-     *
-     * Fully opaque is left alone deliberately. It is the same arithmetic,
-     * but skipping it keeps the full-screen quads -- which are drawn with
-     * blending enabled and alpha 255 -- on exactly the path they were on
-     * before, so this cannot change what they produce. */
-    if (s_gpu.blend_enable
-        && s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
-        && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA
-        && (argb >> 24) != 0xFF) {
-        uint32_t sa = argb >> 24;
-        uint32_t dst = 0;
-        if (sa == 0)
-            return;                        /* nothing of the source survives */
-        if (bpp == 4) {
-            dst = ((const uint32_t *)row)[x];
-        } else if (bpp == 2) {
-            uint32_t t = ((const uint16_t *)row)[x];
-            dst = (((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
-                 | ((t & 0x001Fu) << 3));
-        }
-        {
-            uint32_t r = (((argb >> 16) & 0xFF) * sa
-                        + ((dst >> 16) & 0xFF) * (255u - sa) + 127u) / 255u;
-            uint32_t g = (((argb >>  8) & 0xFF) * sa
-                        + ((dst >>  8) & 0xFF) * (255u - sa) + 127u) / 255u;
-            uint32_t b = (((argb      ) & 0xFF) * sa
-                        + ((dst      ) & 0xFF) * (255u - sa) + 127u) / 255u;
-            argb = 0xFF000000u | (r << 16) | (g << 8) | b;
-        }
-    }
-
-    if (bpp == 4) {
-        ((uint32_t *)row)[x] = argb;
-    } else if (bpp == 2) {
-        ((uint16_t *)row)[x] = (uint16_t)(((argb >> 8) & 0xF800)
-                                        | ((argb >> 5) & 0x07E0)
-                                        | ((argb >> 3) & 0x001F));
-    }
-}
-
-/* Half-space fill. Barycentric edge functions rather than scanline slopes:
- * the same test decides both windings, so a title that emits clockwise
- * triangles does not silently render nothing. */
-static void raster_triangle(const float a[2], const float b[2],
-                            const float c[2], uint32_t argb,
-                            const float uv[3][2])
-{
-    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bpp = surface_bpp();
-    float area;
-    int minx, maxx, miny, maxy, x, y;
-    int textured = uv && s_gpu.tex.valid;
-
-    if (bpp != 4 && bpp != 2)
-        return;
-
-    area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
-    if (area == 0.0f)
-        return;                            /* degenerate */
-
-    /* Where this batch writes. The same check the per-pixel path made, made
-     * once: a surface address landing on the title's own image is no safer
-     * one pixel at a time than 4.9 MB at once. */
-    if (!surface_begin_batch(mem))
-        return;
-
-    minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
-    maxx = (int)ceilf (fmaxf(a[0], fmaxf(b[0], c[0])));
-    miny = (int)floorf(fminf(a[1], fminf(b[1], c[1])));
-    maxy = (int)ceilf (fmaxf(a[1], fmaxf(b[1], c[1])));
-
-    if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
-    if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
-    if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
-    if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
-    if (minx >= maxx || miny >= maxy) {
-        s_gpu.tris_skipped_offscreen++;
-        return;
-    }
-
-    for (y = miny; y < maxy; y++) {
-        for (x = minx; x < maxx; x++) {
-            float px = (float)x + 0.5f, py = (float)y + 0.5f;
-            float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
-            float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
-            float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
-            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
-               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
-                continue;
-            if (textured) {
-                /* Barycentric, straight from the edge functions already
-                 * computed: w1 is the area opposite a, w2 opposite b, w0
-                 * opposite c, and the three sum to the whole triangle.
-                 *
-                 * No perspective divide. These are screen-space vertices with
-                 * no w to divide by -- which is exactly the case a full-screen
-                 * pass is, and the only case that reaches here. */
-                uint32_t texel;
-                float su = (w1 * uv[0][0] + w2 * uv[1][0] + w0 * uv[2][0]) / area;
-                float sv = (w1 * uv[0][1] + w2 * uv[1][1] + w0 * uv[2][1]) / area;
-                if (su < 0.0f) su = 0.0f;
-                if (sv < 0.0f) sv = 0.0f;
-                if (sample_texture(&s_gpu.tex, (uint32_t)su, (uint32_t)sv, &texel)) {
-                    put_pixel(mem, bpp, x, y, texel);
-                    continue;
-                }
-            }
-            put_pixel(mem, bpp, x, y, argb);
-        }
-    }
-    s_gpu.tris_drawn++;
-    s_gpu.drawn_offset = s_gpu.color_offset;
-    s_gpu.drawn_pitch = s_gpu.pitch;
-}
 
 /* Attribute 3 is diffuse colour in every NV2A layout that sets one. Absent it,
  * white -- a visible wrong colour beats an invisible correct one during
@@ -2034,10 +1719,6 @@ static void for_each_triangle(void (*emit)(uint32_t, uint32_t, uint32_t, void *)
     }
 }
 
-/* How many post-draw captures to keep: enough to see whether the geometry
- * is stable from frame to frame, few enough not to fill a directory. */
-#define FB_DUMP_AFTER_DRAW 8
-static int s_drawn_dumps;
 
 static void dump_surface_bmp(void);
 
@@ -2118,63 +1799,6 @@ static int clip_triangle(const Nv2aVertex v[3], clip_emit_fn emit, void *ctx)
 }
 
 static int backend_vertex(uint32_t index, Nv2aVertex *out);
-
-struct raster_clip_ctx { uint32_t argb; int textured; };
-
-static void raster_clipped(const Nv2aVertex *a, const Nv2aVertex *b,
-                           const Nv2aVertex *c, void *vctx)
-{
-    const struct raster_clip_ctx *rc = (const struct raster_clip_ctx *)vctx;
-    float p[3][4], uv[3][2];
-    const Nv2aVertex *t[3] = { a, b, c };
-    int i;
-
-    for (i = 0; i < 3; i++) {
-        p[i][0] = t[i]->x; p[i][1] = t[i]->y;
-        p[i][2] = t[i]->z; p[i][3] = t[i]->rhw;
-        uv[i][0] = t[i]->u; uv[i][1] = t[i]->v;
-    }
-    raster_triangle(p[0], p[1], p[2], rc->argb,
-                    rc->textured ? (const float (*)[2])uv : NULL);
-}
-
-static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
-{
-    float p[3][4], uv[3][2];
-    int textured;
-
-    if (!fetch_position(i0, p[0])
-     || !fetch_position(i1, p[1])
-     || !fetch_position(i2, p[2]))
-        return;
-    textured = fetch_texcoord(i0, uv[0])
-            && fetch_texcoord(i1, uv[1])
-            && fetch_texcoord(i2, uv[2]);
-
-    if (p[0][3] < 0.0f || p[1][3] < 0.0f || p[2][3] < 0.0f
-     || (p[0][3] > 1.0f / NEAR_W) || (p[1][3] > 1.0f / NEAR_W)
-     || (p[2][3] > 1.0f / NEAR_W)) {
-        /* Crosses the near plane: clip, then rasterise the pieces. */
-        Nv2aVertex v[3];
-        struct raster_clip_ctx rc;
-        if (!backend_vertex(i0, &v[0]) || !backend_vertex(i1, &v[1])
-         || !backend_vertex(i2, &v[2]))
-            return;
-        rc.argb = argb;
-        rc.textured = textured;
-        clip_triangle(v, raster_clipped, &rc);
-        return;
-    }
-
-    raster_triangle(p[0], p[1], p[2], argb,
-                    textured ? (const float (*)[2])uv : NULL);
-}
-
-static void raster_tri(uint32_t i0, uint32_t i1, uint32_t i2, void *ctx)
-{
-    (void)ctx;
-    raster_indexed(i0, i1, i2, vertex_color(i0));
-}
 
 /* Hand the batch to the registered back end as a triangle list, using the
  * same topology rules as the CPU path below. */
@@ -3507,63 +3131,12 @@ static void raster_batch(void)
         s_gpu.drawn_pitch = s_gpu.pitch;
         return;
     }
-    if (batch_is_ffp()) {
-        s_gpu.batches_ffp++;
-        /* RECOMP_FFP_TRACE: the matrix and the first vertices of the first few
-         * fixed-function batches, raw and transformed -- the one view that
-         * tells a wrong matrix layout from wrong vertex data. */
-        if (pb_ffp_trace() && s_gpu.batches_ffp <= 4) {
-            const float *m = s_gpu.composite;
-            float in[4], out[4];
-            uint32_t k;
-            fprintf(stderr, "  [FFP] batch %u prim %u n %u mode 0x%X vp_off %.2f %.2f %.2f"
-                            " clip %ux%u+%u+%u\n"
-                            "  [FFP]   M = %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n",
-                    s_gpu.batches_ffp, s_gpu.prim, s_gpu.idx_count, s_gpu.xform_mode,
-                    s_gpu.vp_offset[0], s_gpu.vp_offset[1], s_gpu.vp_offset[2],
-                    s_gpu.clip_w, s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y,
-                    m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
-                    m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
-            for (k = 0; k < s_gpu.idx_count && k < 4; k++) {
-                fetch_attr(&s_gpu.attr[0], s_gpu.idx[k], in);
-                fetch_position(s_gpu.idx[k], out);
-                fprintf(stderr, "  [FFP]   v%u (%g %g %g %g) -> (%g %g %g %g)\n",
-                        s_gpu.idx[k], in[0], in[1], in[2], in[3],
-                        out[0], out[1], out[2], out[3]);
-            }
-        }
-    }
-
-    /* Count why, once per batch: the texture stage cannot change inside one. */
-    {
-        const VertexAttr *tc = texcoord_attr();
-
-        if (!(tc->offset && tc->stride))
-            s_gpu.batches_no_uv++;
-        else if (!s_gpu.tex.valid)
-            s_gpu.batches_no_tex++;
-        else {
-            s_gpu.batches_textured++;
-            note_texture_use();
-        }
-    }
-
-    for_each_triangle(raster_tri, NULL);
-
-    if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
-        fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
-
-    /* Capture the surface while the geometry is still on it.
-     *
-     * The periodic report dumps too, but a title clears every frame and draws
-     * in only some of them, so a report almost always lands on a surface that
-     * was wiped a moment ago -- which reads as "nothing was drawn" when the
-     * triangles went down correctly just before it. A few frames that actually
-     * contain geometry are worth more than any number of clears. */
-    if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW) {
-        s_drawn_dumps++;
-        dump_surface_bmp();
-    }
+    /* No back end: the batch is decoded and counted, not drawn. The CPU
+     * rasteriser that drew screen-space batches here (flat / textured
+     * triangles into guest memory, a bring-up aid from before nv2a_vk) was
+     * removed 2026-11-16 (the maintainer's order 2026-11-15: nv2a_vk is the one
+     * renderer; last version option-c 2198591). */
+    (void)before;
 }
 
 /* What a batch actually contains. Before anything can be rasterised, the

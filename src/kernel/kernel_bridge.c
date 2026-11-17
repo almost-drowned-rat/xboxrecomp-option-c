@@ -29,6 +29,7 @@
 #include "guest_vmem.h"
 #include "xbox_memory_layout.h"
 #include "xbox_settings.h"
+#include "thread_name.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
@@ -545,6 +546,7 @@ typedef struct {
     int closed;                 /* the title's handle is gone */
     int refs;                   /* ObReferenceObjectByHandle not yet dereferenced */
     volatile int rt;            /* KeSetBasePriorityThread raised it to TIME_CRITICAL (time-critical gate) */
+    LONG base_inc;              /* the title's base priority increment (KeSet/KeQueryBasePriorityThread) */
 } ThreadObj;
 static ThreadObj s_thread_objs[THREAD_OBJ_MAX];
 static volatile LONG s_thread_obj_lock;
@@ -806,9 +808,21 @@ static uint32_t thread_obj_current(void)
     uint32_t obj;
     if (g_thread_obj < 0) {
         int e = thread_obj_new();
+        HANDLE self = NULL;
         if (e < 0)
             return 0;
         g_thread_obj = e;
+        /* a real handle of this thread, for KeSetBasePriorityThread from any thread (the pseudo handle would
+         * name the caller) */
+        if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self, 0, FALSE,
+                            DUPLICATE_SAME_ACCESS)) {
+            thread_obj_lock();
+            if (!s_thread_objs[e].host)
+                s_thread_objs[e].host = self;
+            else
+                CloseHandle(self);
+            thread_obj_unlock();
+        }
     }
     thread_obj_lock();
     obj = thread_obj_make_ref(&s_thread_objs[g_thread_obj]);
@@ -834,6 +848,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
     X86Ctx thread_ctx = X86CTX_INIT;   /* this host thread's guest register set */
     X86Ctx *ctx = &thread_ctx;
+    xr_thread_name("guest thread");
     xbox_diag_ctx_set(ctx);
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
@@ -2681,9 +2696,32 @@ static int dpc_queue_insert(uint32_t dpc, uint32_t arg1, uint32_t arg2)
     return 1;
 }
 
+static RECOMP_TLS int t_timer_thread;          /* this is the kernel timer thread (it drains its own queue) */
+HANDLE xbox_irq_line_event(void);               /* xbox_devbus.c: the timer thread's wake-up */
+
+/* RECOMP_TIMER_WAKE=1 (2026-11-16, OFF by default): KeSetTimer and KeInsertQueueDpc from other threads wake the
+ * timer thread at once, and it no longer wakes every 10 ms (cap 100 ms, kernel_timer_wait). It changes what a title
+ * sees: Orta's USB DPCs (pad reports) arrive as soon as the OHCI thread queues them instead of at the next vblank /
+ * 10 ms tick, so the title reads its pad at a different rate - the maintainer's standard replay (keyed to pad
+ * reads) no longer reached the level (bisect 2026-11-16). Closer to the console or not is
+ * open; off until that is decided. */
+static int timer_wake_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_TIMER_WAKE");
+        on = e && *e == '1';
+    }
+    return on;
+}
+
 static void bridge_KeInsertQueueDpc(X86Ctx *ctx)
 {
     g_eax = (uint32_t)dpc_queue_insert(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2));
+    /* The DPC runs on the timer thread's next pass: wake it now (2026-11-15). Before, a guest thread's DPC waited
+     * for the next vblank or the timer thread's 10 ms tick; on the console it runs as soon as IRQL drops. */
+    if (g_eax && !t_timer_thread && timer_wake_on())
+        SetEvent(xbox_irq_line_event());
 }
 
 /* Cancel a queued DPC: take it out of the queue if it is still there. */
@@ -3331,22 +3369,49 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
-/* Sleep until a device interrupt, the next guest vblank (when vblank
- * interrupts are delivered, RECOMP_VBLANK) or 10 ms: a high-resolution timer,
- * so the vblank interrupt follows the guest clock instead of the 10 ms poll. */
+/* Milliseconds until the earliest armed KTIMER is due (0 = due now), -1 when none is armed. */
+static long long timer_ms_to_next(void)
+{
+    long long now = (long long)GetTickCount64(), best = -1;
+    int i;
+    EnterCriticalSection(&g_timer_lock);
+    for (i = 0; i < XBOX_MAX_TIMERS; i++)
+        if (g_timers[i].timer_va) {
+            long long d = g_timers[i].due_ms - now;
+            if (d < 0) d = 0;
+            if (best < 0 || d < best) best = d;
+        }
+    LeaveCriticalSection(&g_timer_lock);
+    return best;
+}
+
+/* Sleep until a device interrupt, the next guest vblank (when vblank interrupts are delivered, RECOMP_VBLANK) or
+ * the earliest armed KTIMER - on a high-resolution timer, so the vblank interrupt follows the guest clock.
+ * Before 2026-11-15 it woke every 10 ms at the latest as well, because nothing else told it about new work: now
+ * KeSetTimer and KeInsertQueueDpc from other threads set the IRQ line event (their own wake), and only a safety cap
+ * stays (RECOMP_TIMER_CAP_MS, default 100; 10 = the old behaviour). Orta: the timer thread was 3-5 % of a core. */
 static void kernel_timer_wait(void)
 {
     static int vblank = -1;
+    static long long cap_ms = -1;
+    long long ms, tm;
     if (vblank < 0) {
         const char *e = getenv("RECOMP_VBLANK");
         vblank = e && strcmp(e, "0");
+        e = getenv("RECOMP_TIMER_CAP_MS");
+        cap_ms = e && atoi(e) > 0 ? atoi(e) : timer_wake_on() ? 100 : 10;   /* 10 = the old poll, unless woken */
     }
+    ms = cap_ms;
+    tm = timer_ms_to_next();
+    if (tm >= 0 && tm < ms)
+        ms = tm < 1 ? 1 : tm;
 #if !defined(_WIN32)
     if (vblank && xbox_GuestHz() > 0) {
-        int64_t ms = (xbox_GuestNsToNextVblank() + 999999) / 1000000;
-        WaitForSingleObject(xbox_irq_line_event(), (DWORD)(ms < 1 ? 1 : ms > 10 ? 10 : ms));
-        return;
+        int64_t vb = (xbox_GuestNsToNextVblank() + 999999) / 1000000;
+        if (vb < ms)
+            ms = vb < 1 ? 1 : vb;
     }
+    WaitForSingleObject(xbox_irq_line_event(), (DWORD)ms);
 #else
     static HANDLE timer;                     /* only the timer thread waits here */
     if (vblank && xbox_GuestHz() > 0) {
@@ -3356,8 +3421,8 @@ static void kernel_timer_wait(void)
         if (!timer)
             timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */,
                                            0x1F0003 /* TIMER_ALL_ACCESS */);
-        if (ns > 10000000)
-            ns = 10000000;
+        if (ns > ms * 1000000)
+            ns = ms * 1000000;
         due.QuadPart = -(LONGLONG)(ns / 100 + 1);
         h[0] = xbox_irq_line_event();
         h[1] = timer;
@@ -3366,14 +3431,16 @@ static void kernel_timer_wait(void)
             return;
         }
     }
+    WaitForSingleObject(xbox_irq_line_event(), (DWORD)ms);
 #endif
-    WaitForSingleObject(xbox_irq_line_event(), 10);
 }
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     X86Ctx thread_ctx = X86CTX_INIT;   /* this host thread's guest register set */
     X86Ctx *ctx = &thread_ctx;
+    xr_thread_name("xr timer dpc");
+    t_timer_thread = 1;
     xbox_diag_ctx_set(ctx);
     int slot = xbox_worker_stack_alloc();
 
@@ -3479,6 +3546,10 @@ static void kernel_set_timer(X86Ctx *ctx, uint32_t timer_va, long long due_100ns
         g_timers[free_slot].period_ms = period_ms;
     }
     LeaveCriticalSection(&g_timer_lock);
+    /* The timer thread sleeps until the next vblank or the earliest due timer (kernel_timer_wait): a new one may be
+     * due sooner - wake it so it takes the new due time. */
+    if (free_slot >= 0 && !t_timer_thread && timer_wake_on())
+        SetEvent(xbox_irq_line_event());
 
     /* A freshly set timer starts unsignaled, like the real KeSetTimer. */
     {
@@ -4017,10 +4088,10 @@ static void bridge_NtCreateFile(X86Ctx *ctx)
      * Off unless RECOMP_FMV_HOST is set: it is a substitute for the title's
      * own output, and that should be a decision rather than a default. */
     if (g_eax == 0 && getenv("RECOMP_FMV_HOST")) {
-        /* Declared here rather than included: the player lives in xbox_video,
-         * which links xbox_d3d8, and having the kernel include its header
-         * would make the dependency circular for no gain. Both land in the
-         * same executable. */
+        /* Declared here rather than included: the player's entry points live in
+         * xbox_video, which links the kernel. Since 2026-11-16 they are stubs
+         * (video_stub.c: the Media Foundation player went with the D3D11
+         * layer), so RECOMP_FMV_HOST falls back to the title's own movie. */
         extern int xbox_VideoPlayFile(const char *host_path);
         extern int xbox_VideoIsPlaying(void);
 
@@ -5236,42 +5307,68 @@ static void bridge_KeDisconnectInterrupt(X86Ctx *ctx)
 /* KeQueryBasePriorityThread (ordinal 124, 1 arg). The implementation has
  * existed in kernel_thread.c all along; only the bridge wrapper was
  * missing, so the thunk fell through to the fallback and returned 0. */
+/* Both get the guest KTHREAD pointer (XAPI Get/SetThreadPriority: ObReferenceObjectByHandle, then this). Before
+ * 2026-11-15 the bridge passed that pointer on as a host HANDLE - it is none: Windows refused it, the POSIX layer
+ * read guest memory as a thread object -, so no priority ever took effect and the query answered from nothing.
+ * Now the thread table maps the KTHREAD to its entry: the increment is kept there (the query and the previous
+ * value answer from it) and xbox_host_thread_priority applies it to the host thread behind the entry
+ * (RECOMP_GUEST_PRIORITY, kernel_thread.c). A KTHREAD the table does not know changes nothing and returns 0. */
 static void bridge_KeQueryBasePriorityThread(X86Ctx *ctx)
 {
-    g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+    uint32_t kthread = STACK_ARG(0);
+    LONG inc = 0;
+    int i;
+    thread_obj_lock();
+    for (i = 0; i < THREAD_OBJ_MAX; i++)
+        if (kthread && s_thread_objs[i].used && s_thread_objs[i].obj == kthread) {
+            inc = s_thread_objs[i].base_inc;
+            break;
+        }
+    thread_obj_unlock();
+    g_eax = (uint32_t)inc;
 }
 
-/* KeSetBasePriorityThread gets the guest KTHREAD pointer (XAPI SetThreadPriority: ObReferenceObjectByHandle, then
- * this). The host call below takes it for a host HANDLE, which it is not, so host priorities have no effect -
- * unchanged on purpose: on a many-core host a priority does not keep two threads apart anyway, and making them
- * effective changes every port's scheduling. What does keep them apart is TIME_CRITICAL: the time-critical gate
- * (above, at the thread objects). A change is logged with the thread the object belongs to. */
+/* TIME_CRITICAL keeps its own handling: the time-critical gate (above, at the thread objects). A gate change is
+ * logged with the thread the object belongs to. */
 static void bridge_KeSetBasePriorityThread(X86Ctx *ctx)
 {
     uint32_t kthread = STACK_ARG(0), token = 0;
-    LONG inc = (LONG)STACK_ARG(1);
-    int i;
+    LONG inc = (LONG)STACK_ARG(1), prev = 0;
+    int i, found = 0;
 
     int rt_was = -1, rt_now = 0;
 
     thread_obj_lock();
     for (i = 0; i < THREAD_OBJ_MAX; i++)
         if (kthread && s_thread_objs[i].used && s_thread_objs[i].obj == kthread) {
-            token = s_thread_objs[i].token;
+            ThreadObj *t = &s_thread_objs[i];
+            found = 1;
+            token = t->token;
             /* TIME_CRITICAL (15, or 16 = saturation): the time-critical gate. Only the change is logged. */
             rt_now = inc >= 15 && rt_gate_init();
-            rt_was = s_thread_objs[i].rt;
-            s_thread_objs[i].rt = rt_now;
+            rt_was = t->rt;
+            t->rt = rt_now;
+            prev = t->base_inc;
+            t->base_inc = inc;
+            if (i == g_thread_obj)                      /* its own entry (also before the spawner registered the handle) */
+                xbox_host_thread_priority(GetCurrentThread(), inc);
+            else if (t->host && !t->closed && !t->ended)   /* under the lock: the handle cannot be closed meanwhile */
+                xbox_host_thread_priority(t->host, inc);
             break;
         }
     thread_obj_unlock();
     if (rt_was != rt_now)
         fprintf(stderr, "  [KERNEL] KeSetBasePriorityThread: kthread 0x%08X (handle 0x%08X) increment %ld, from thread"
-                " %lu%s\n", kthread, token, (long)inc, GetCurrentThreadId(),
+                " %lu%s\n", kthread, token, (long)inc, (unsigned long)GetCurrentThreadId(),
                 rt_now ? " - time-critical: runs alone until it blocks" : rt_was == 1 ? " - normal again"
-                                                                            : " - not applied");
-    g_eax = (uint32_t)xbox_KeSetBasePriorityThread(XBOX_TO_NATIVE(kthread), inc);
+                                                                            : " - gate off");
+    if (!found) {
+        static volatile LONG said;
+        if (!InterlockedExchange(&said, 1))
+            fprintf(stderr, "  [KERNEL] KeSetBasePriorityThread: kthread 0x%08X is no thread object of the bridge"
+                            " - ignored (shown once)\n", kthread);
+    }
+    g_eax = (uint32_t)prev;
 }
 
 /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */

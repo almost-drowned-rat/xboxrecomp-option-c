@@ -3,10 +3,13 @@
 Hardware emulation of the Xbox's MCPX APU (Audio Processing Unit), extracted from [xemu](https://github.com/xemu-project/xemu). The APU is a custom chip with three processors:
 
 - **VP (Voice Processor)** — 256 hardware voices, ADPCM/PCM decode, pitch shifting, envelopes, HRTF 3D audio
-- **GP (Global Processor)** — DSP for global effects (reverb, chorus). Currently **stubbed** — effects bypass.
-- **EP (Encode Processor)** — DSP for AC3/DTS encoding. Currently **stubbed** — passthrough.
+- **GP (Global Processor)** — DSP for global effects (reverb, chorus): the title's GP image runs on the DSP56300
+  interpreter every frame (`apu_gp.c`; this README said "stubbed" until 2026-11-16 - it was not for a while).
+- **EP (Encode Processor)** — DSP for AC3/DTS encoding. Passthrough.
 
-Audio output uses Windows `waveOut` at 48kHz stereo 16-bit.
+Audio output: SDL3 audio on Linux / Android, XAudio2 or waveOut on Windows (48 kHz stereo 16-bit).
+The APU is one of the emulated parts the maintainer wants replaced step by step (2026-11-15: first an API-level
+DirectSound with 3D and mix bins, `src/xdk/xdk_dsound.c`; plan first).
 
 ## Files
 
@@ -170,6 +173,6 @@ Full register definitions in `apu_regs.h`.
 
 ## Dependencies
 
-- `qemu_shim.h` (from `../nv2a/`) — QEMU type abstraction layer
+- `qemu_shim.h` (here since 2026-11-16; it was in `../nv2a/`, removed) — QEMU type abstraction layer
 - `kernel32.lib` — Win32 threading
 - `winmm.lib` — waveOut audio output

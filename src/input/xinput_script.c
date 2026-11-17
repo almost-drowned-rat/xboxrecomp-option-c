@@ -578,6 +578,26 @@ void xbox_InputTitleRead(int port)
     }
 }
 
+static volatile uint32_t s_title_handle[USB_GAMEPAD_MAX];   /* the title's XInputOpen handle per port, 0 = none */
+
+void xbox_InputTitleOpened(int port, uint32_t handle)
+{
+    if (port >= 0 && port < USB_GAMEPAD_MAX && handle)
+        s_title_handle[port] = handle;
+}
+
+void xbox_InputTitleReadHandle(uint32_t handle)
+{
+    int p;
+    if (!handle)
+        return;
+    for (p = 0; p < USB_GAMEPAD_MAX; p++)
+        if (s_title_handle[p] == handle) {
+            xbox_InputTitleRead(p);
+            return;
+        }
+}
+
 unsigned long xbox_InputReadNow(int port)
 {
     return (port >= 0 && port < USB_GAMEPAD_MAX) ? s_read_now[port] : 0;

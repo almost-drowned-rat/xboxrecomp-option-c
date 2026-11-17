@@ -1,5 +1,10 @@
 # Runtime Implementation Guide
 
+> **Note (2026-11-16):** this guide is the upstream introduction to the runtime's parts. On option-c the toolkit
+> already provides all four (kernel HLE, memory layout, the pushbuffer executor with the Vulkan renderer nv2a_vk,
+> SDL3 input) and the port's host layer (`src/porthost`, `xr_host.h`); the D3D11 / XInput paths it mentions are gone.
+> Start a port from `docs/porting_guide.md` and `templates/game`.
+
 The recompiled C code needs a host environment to run. This directory documents the four major runtime subsystems you need to build for each game.
 
 ## The Four Pillars

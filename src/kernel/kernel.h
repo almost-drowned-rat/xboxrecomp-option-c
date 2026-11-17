@@ -634,6 +634,8 @@ int xbox_path_utility_formatted(const xbox_host_char *image);
 /* The data folder (data_dir, else save_dir) in UTF-8; NULL before xbox_path_init. Host tools that write into the
  * port folder (the pad recorder) use it - nothing is written outside the port folder. */
 const char *xbox_path_data_dir_utf8(void);
+/* The extracted disc (game_dir) in UTF-8, NULL before xbox_path_init; read only. */
+const char *xbox_path_game_dir_utf8(void);
 /* NtFsControlFile FSCTL_DISMOUNT_VOLUME (0x00090020) on a file handle: format semantics above; STATUS_SUCCESS. */
 NTSTATUS xbox_file_dismount(HANDLE h);
 const xbox_host_char *xbox_path_pending_dir(void);
@@ -882,6 +884,9 @@ NTSTATUS __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus);
 NTSTATUS __stdcall xbox_KeDelayExecutionThread(KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Interval);
 LONG     __stdcall xbox_KeSetBasePriorityThread(PVOID Thread, LONG Increment);
 LONG     __stdcall xbox_KeQueryBasePriorityThread(PVOID Thread);
+/* The bridge's KeSetBasePriorityThread: the increment on the host thread behind the title's thread object
+ * (RECOMP_GUEST_PRIORITY 0 / 1 capped, default / 2 full; kernel_thread.c). */
+void xbox_host_thread_priority(HANDLE host, LONG increment);
 NTSTATUS __stdcall xbox_KeAlertThread(PVOID Thread, KPROCESSOR_MODE AlertMode);
 NTSTATUS __stdcall xbox_NtYieldExecution(void);
 NTSTATUS __stdcall xbox_NtDuplicateObject(HANDLE SourceHandle, PHANDLE TargetHandle, ULONG Options);

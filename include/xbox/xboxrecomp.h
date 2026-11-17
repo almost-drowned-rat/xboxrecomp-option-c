@@ -1,58 +1,31 @@
 /**
- * xboxrecomp.h - Xbox Static Recompilation Runtime
+ * xboxrecomp.h - Xbox Static Recompilation Runtime (umbrella header)
  *
- * Master header for the xboxrecomp link-time library.
- * Include this from your game-specific recompilation project.
+ * Ports normally include the module headers they use (templates/game/src/platform/host_win32.c does); this header
+ * pulls in the common ones at once.
  *
- * Usage:
- *   1. Build xboxrecomp as a static library (cmake --build)
- *   2. Link against the 'xboxrecomp' umbrella target (or individual libs)
- *   3. Implement the required callbacks (see "Game Integration Points" below)
- *   4. Call xbox_memory_init() to set up the 64MB Xbox address space
- *   5. Call xbox_kernel_init() / xbox_kernel_bridge_init() to wire up kernel imports
+ * Libraries (CMakeLists.txt):
+ *   xbox_kernel   - Xbox kernel HLE (memory, file I/O, threading, sync, crypto), memory layout, pushbuffer executor
+ *   xbox_nv2a_vk  - the renderer: the executor's Vulkan 1.3 back end (nv2a_vk.h)
+ *   xbox_apu      - MCPX APU (LLE, optional; xbox_dsound is an alias of it)
+ *   xbox_usb      - MCPX OHCI host controllers (LLE, optional)
+ *   xbox_input    - host pads (SDL3), keyboard, pad script
+ *   xbox_xdk      - XDK libraries at API level
  *
- * Libraries provided:
- *   xbox_kernel  - Xbox kernel → Win32 (memory, file I/O, threading, sync, crypto)
- *   xbox_d3d8    - D3D8 → D3D11 graphics
- *   xbox_dsound  - DirectSound → software mixer
- *   xbox_apu     - MCPX APU audio emulation (from xemu)
- *   xbox_nv2a    - NV2A GPU emulation (from xemu)
- *   xbox_input   - Xbox gamepad → XInput
+ * The register model, guest memory macros and the lifter's runtime contract: templates/runtime/recomp_types.h
+ * (functions are void sub_X(X86Ctx *ctx, uint8_t *base); docs/porting_guide.md). The game provides
+ * recomp_lookup / recomp_lookup_manual (the lifter's dispatch tables plus its manual overrides).
  *
- * ═══════════════════════════════════════════════════════════════
- * Game Integration Points (YOU must implement these)
- * ═══════════════════════════════════════════════════════════════
- *
- * The kernel bridge calls these to resolve recompiled function addresses:
- *
- *   typedef void (*recomp_func_t)(void);
- *   recomp_func_t recomp_lookup(uint32_t xbox_va);
- *   recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
- *
- * Your recompiler output generates these dispatch tables.
- * See templates/runtime/recomp_types.h for the register model and macros.
- *
- * Global state (defined in xbox_memory_layout.c):
- *   extern ptrdiff_t g_xbox_mem_offset;  // Native-to-Xbox VA offset
- *   extern uint32_t  g_eax, g_ecx, g_edx, g_esp;  // Volatile registers
- *   extern uint32_t  g_ebx, g_esi, g_edi;          // Callee-saved registers
- *   extern uint32_t  g_seh_ebp;                      // SEH frame pointer
+ * 2026-11-16: the D3D8 -> D3D11 layer (d3d8_xbox.h), the old DirectSound mixer (dsound_xbox.h) and the D3D11 NV2A
+ * (nv2a_state.h, nv2a_regs.h) were removed; qemu_shim.h moved to src/apu.
  */
 
 #ifndef XBOXRECOMP_H
 #define XBOXRECOMP_H
 
-/* Individual module headers */
 #include "kernel.h"             /* Xbox kernel types and functions */
-#include "xbox_memory_layout.h" /* Memory layout API */
-#include "d3d8_xbox.h"          /* D3D8 compatibility interface */
-#include "dsound_xbox.h"        /* DirectSound compatibility */
+#include "xbox_memory_layout.h" /* memory layout API */
 #include "xinput_xbox.h"        /* XInput compatibility */
 #include "apu.h"                /* MCPX APU public API */
-
-/* NV2A headers */
-#include "nv2a_state.h"         /* NV2A GPU state */
-#include "nv2a_regs.h"          /* NV2A register definitions */
-#include "qemu_shim.h"          /* QEMU type abstraction */
 
 #endif /* XBOXRECOMP_H */

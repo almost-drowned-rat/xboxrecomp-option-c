@@ -25,6 +25,7 @@
 #undef fflush
 
 #include "platform/xbox_winnt.h"
+#include "thread_name.h"
 #include <string.h>
 
 #define LOG_SLOTS 2048                  /* power of two */
@@ -110,6 +111,7 @@ static int consume(void)
 static DWORD WINAPI logger_thread(LPVOID unused)
 {
     (void)unused;
+    xr_thread_name("xr logger");
     for (;;) {
         consume();
         InterlockedExchange(&s_idle, 1);

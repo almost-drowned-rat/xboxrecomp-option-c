@@ -67,6 +67,12 @@ def main():
              "e.g., --extra-sections XIPS,DOLBY)",
     )
     parser.add_argument(
+        "--no-asm",
+        action="store_true",
+        help="Do not write the per-section .asm listings (asm/). They are for people reading the disassembly; "
+             "no later lift step reads them. The player's first start passes it (release lift.txt).",
+    )
+    parser.add_argument(
         "--game-config",
         metavar="TOML",
         help="The game's config/game.toml (tools/gameconfig.py): the variant matching this XBE's "
@@ -135,6 +141,7 @@ def main():
             extra_sections=extra,
             seed_functions=seed_funcs,
             observed_seeds=observed,
+            write_asm=not args.no_asm,
         )
         success = disassembler.run()
         sys.exit(0 if success else 1)

@@ -36,6 +36,9 @@ static const uint32_t ORD[N_SLOTS] = {
     143,   /* KeSetBasePriorityThread */
 };
 static volatile LONG s_rt_phase;         /* the time-critical routine: 1 raised, 2 lowering, 3 normal again */
+/* KeSetBasePriorityThread's answers (the previous increment) and the worker's host priority after each call
+ * (2026-11-15: the increment reaches the host thread, capped at HIGHEST by default) */
+static volatile LONG s_rt_prev_first = -99, s_rt_prev_second = -99, s_rt_host_raised = -99, s_rt_host_normal = -99;
 static uint32_t s_scratch_va;            /* scratch, for the routine (set in main) */
 static uint32_t slot_va[N_SLOTS];
 static HANDLE s_go;                      /* the first routine waits for it, so it can be seen running */
@@ -86,11 +89,15 @@ static void routine_rt(RECOMP_PARAMS)
     obj = *(uint32_t *)((uintptr_t)(s_scratch_va + RT_OUT_VA_OFF) + xbox_GetMemoryOffset());
     a[0] = obj; a[1] = 16;
     routine_kcall(ctx, S_SETPRIO, 2, a);
+    s_rt_prev_first = (LONG)g_eax;
+    s_rt_host_raised = GetThreadPriority(GetCurrentThread());
     InterlockedExchange(&s_rt_phase, obj ? 1 : -1);
     Sleep(300);                          /* guest code: no kernel call */
     InterlockedExchange(&s_rt_phase, 2);
     a[0] = obj; a[1] = 0;
     routine_kcall(ctx, S_SETPRIO, 2, a);
+    s_rt_prev_second = (LONG)g_eax;
+    s_rt_host_normal = GetThreadPriority(GetCurrentThread());
     InterlockedExchange(&s_rt_phase, 3);
     g_eax = 0;
     g_esp += 4;
@@ -308,6 +315,11 @@ int main(int argc, char **argv)
         after_ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
         snprintf(d, sizeof d, "%.1f ms", after_ms);
         check(s_rt_phase == 3 && after_ms < 20.0, "back to normal: kernel calls are quick again", d);
+        snprintf(d, sizeof d, "previous %ld then %ld", (long)s_rt_prev_first, (long)s_rt_prev_second);
+        check(s_rt_prev_first == 0 && s_rt_prev_second == 16, "KeSetBasePriorityThread returns the previous increment", d);
+        snprintf(d, sizeof d, "host %ld then %ld", (long)s_rt_host_raised, (long)s_rt_host_normal);
+        check(s_rt_host_raised == THREAD_PRIORITY_HIGHEST && s_rt_host_normal == THREAD_PRIORITY_NORMAL,
+              "the host thread follows it (16 capped to HIGHEST, then NORMAL)", d);
     }
 
     printf("\n%d failure(s)\n", failures);

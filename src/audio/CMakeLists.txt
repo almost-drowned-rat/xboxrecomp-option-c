@@ -1,28 +1,9 @@
-# Xbox DirectSound Compatibility Layer
-# Software mixer with waveOut/XAudio2 backend
-
-add_library(xbox_dsound STATIC
-    dsound_device.c
-    wma_decoder.c
-)
-
-target_include_directories(xbox_dsound PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-
-# Links to APU emulation for mixer voices
-target_link_libraries(xbox_dsound PUBLIC xbox_apu)
-
-# platform carries the src/ include path (and on Linux the POSIX Win32
-# primitives), so both hosts need it for "platform/xbox_winnt.h".
-target_link_libraries(xbox_dsound PUBLIC platform)
-
-# Windows uses the same Media Foundation stack as xbox_video so ordinary WMA
-# assets can be decoded to PCM without adding another codec dependency.
-if(WIN32)
-    target_link_libraries(xbox_dsound PUBLIC mfplat mfreadwrite mfuuid mf ole32)
-endif()
-
-if(MSVC)
-    target_compile_options(xbox_dsound PRIVATE /W4 /O2)
-else()
-    target_compile_options(xbox_dsound PRIVATE -Wall -Wextra -O2)
-endif()
+# xbox_dsound - the old DirectSound mixer's target name, kept as an alias of xbox_apu.
+#
+# The mixer itself (dsound_device.c: IDirectSound8 on a software mixer, plus a Media Foundation WMA decoder) was
+# removed 2026-11-16 (maintainer 2026-11-15, step 4 of the option-c order): no port called it - their DirectSound
+# is the title's own lifted XDK code on the emulated MCPX APU (src/apu), and the API-level DirectSound is
+# src/xdk/xdk_dsound.c. Ports still name xbox_dsound in their link lists (Orta, the game template), so the name
+# stays and pulls in xbox_apu. Last version with the mixer: option-c a0b6fb3.
+add_library(xbox_dsound INTERFACE)
+target_link_libraries(xbox_dsound INTERFACE xbox_apu)

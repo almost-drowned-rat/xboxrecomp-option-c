@@ -20,3 +20,24 @@ if(MSVC)
 else()
     target_compile_options(xbox_launcher PRIVATE -Wall -Wextra -O2)
 endif()
+
+# xbox_launcher_port (launcher_port.h, 2026-11-16, from Orta's launcher): the port launcher's main, setup window
+# and progress UI in the look of my other ports' launchers. INTERFACE sources, so they are compiled INTO the port's launcher exe:
+# its xr_setup_ui_* then always win over game_setup_ui.c's archive member. The Vulkan check is compiled in too
+# (xr_vk_check.c + host_port.c, the port's title) - xbox_porthost itself would pull the APU / USB into the launcher.
+# Use: target_link_libraries(<port>_launcher PRIVATE xbox_launcher_port) and a main calling xr_launcher_port_main.
+set(_xr_porthost_dir ${CMAKE_CURRENT_SOURCE_DIR}/../porthost)   # not CMAKE_SOURCE_DIR: that is the port's root
+add_library(xbox_launcher_port INTERFACE)
+if(WIN32)
+    target_sources(xbox_launcher_port INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/launcher_port.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/port_setup_win32.c ${_xr_porthost_dir}/xr_vk_check.c
+                   ${_xr_porthost_dir}/host_port.c)
+    target_link_libraries(xbox_launcher_port INTERFACE comdlg32 shell32 ole32 gdi32 user32)
+else()
+    target_sources(xbox_launcher_port INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/launcher_port.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/port_setup_ui_sdl.c ${_xr_porthost_dir}/xr_vk_check.c
+                   ${_xr_porthost_dir}/host_port.c)
+    target_link_libraries(xbox_launcher_port INTERFACE ${CMAKE_DL_LIBS})
+endif()
+target_include_directories(xbox_launcher_port INTERFACE ${CMAKE_CURRENT_SOURCE_DIR} ${_xr_porthost_dir})
+target_link_libraries(xbox_launcher_port INTERFACE xbox_launcher)

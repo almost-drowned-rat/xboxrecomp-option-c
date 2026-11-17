@@ -45,6 +45,10 @@
 #if defined(XR_COMPAT_MEMFD_SYSCALL)
 #include <sys/syscall.h>
 #endif
+#if defined(__linux__)
+#include <sys/resource.h>   /* SetThreadPriority: per-thread nice (setpriority on the thread id) */
+#include <sys/syscall.h>
+#endif
 
 /* bionic (Android) has no pthread_cancel; glibc / musl / Darwin do. A port build can force the bionic path
  * on glibc with -DXR_COMPAT_NO_PTHREAD_CANCEL (tests/compat_bionic does). */
@@ -271,11 +275,29 @@ typedef enum { K_EVENT, K_SEM, K_MUTEX, K_THREAD, K_TIMER, K_HEAP,
 
 #define W32_MAX_APC 16
 
+/* A WaitForMultipleObjects waiter: it registers one link on every object it waits on, and that object's
+ * signalling (obj_wake) bumps `seq` and wakes it at once. Before 2026-11-15 a multi-object wait polled every
+ * handle with a 0 ms wait plus usleep(1000): up to 1 ms late, and it never counted as an event waiter, so a
+ * PulseEvent / an auto-reset SetEvent with only it waiting released nobody (the token fix of 427b8c8 covered
+ * single waits only). Lock order: object lock, then the waiter's mx - a waiter never takes an object lock while
+ * it holds its own mx. */
+typedef struct w32_mwait {
+    pthread_mutex_t mx;
+    pthread_cond_t  cv;
+    unsigned        seq;
+} w32_mwait;
+
+typedef struct mw_link {
+    w32_mwait      *w;
+    struct mw_link *next;
+} mw_link;
+
 typedef struct w32_object {
     w32_kind        kind;
     LONG            refcount;
     pthread_mutex_t lock;
     pthread_cond_t  cond;
+    mw_link        *mw_head;        /* multi-object waiters on this object (under lock) */
 
     /* event */
     int             signaled;
@@ -310,6 +332,7 @@ typedef struct w32_object {
     LPTHREAD_START_ROUTINE start;
     LPVOID          start_param;
     int             priority;
+    long            host_tid;       /* Linux thread id (setpriority), 0 = not known */
     PAPCFUNC        apc_func[W32_MAX_APC];
     ULONG_PTR       apc_data[W32_MAX_APC];
     int             apc_count;
@@ -352,6 +375,8 @@ DWORD GetCurrentThreadId(void)
 DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
 HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
+
+static w32_object *current_thread_obj(void);   /* with the thread functions below */
 
 static w32_object *obj_alloc(w32_kind kind)
 {
@@ -417,7 +442,7 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
 {
     (void)srcProc; (void)dstProc; (void)access; (void)inherit;
     if (!dst) return FALSE;
-    if (src == PSEUDO_CURRENT_THREAD)  src = GetCurrentThread();
+    if (src == PSEUDO_CURRENT_THREAD)  src = (HANDLE)current_thread_obj();   /* a real handle, as on Windows */
     if (src == PSEUDO_CURRENT_PROCESS) { *dst = src; return TRUE; }
     if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
     w32_object *o = (w32_object *)src;
@@ -477,6 +502,68 @@ static int waitable_due(w32_object *o)
     return 1;
 }
 
+/* Wakes everything waiting on o: single waiters (o->cond) and multi-object waiters (their links). Caller holds
+ * o->lock. */
+static void obj_wake(w32_object *o)
+{
+    pthread_cond_broadcast(&o->cond);
+    for (mw_link *l = o->mw_head; l; l = l->next) {
+        pthread_mutex_lock(&l->w->mx);
+        l->w->seq++;
+        pthread_cond_signal(&l->w->cv);
+        pthread_mutex_unlock(&l->w->mx);
+    }
+}
+
+/* Would a wait that began at event generation gen0 return for o now? Takes nothing. Caller holds o->lock. */
+static int ready_locked(w32_object *o, unsigned gen0)
+{
+    switch (o->kind) {
+    case K_EVENT:
+        return o->signaled
+            || (o->manual_reset && o->ev_gen != gen0)           /* set / pulsed while we waited */
+            || (!o->manual_reset && o->ev_tokens > 0);          /* a release token (SetEvent / PulseEvent) */
+    case K_THREAD: return o->exited;
+    case K_SEM:    return o->sem_count > 0;
+    case K_MUTEX:  return o->mtx_owner == 0 || o->mtx_owner == GetCurrentThreadId();
+    case K_WAITABLE_TIMER: return waitable_due(o);
+    default:       return 1;
+    }
+}
+
+/* An event waiter leaves (returned or timed out): a token nobody is left to take (a waiter timed out) is kept
+ * as the event's state. Caller holds o->lock. */
+static void ev_leave_locked(w32_object *o)
+{
+    o->ev_waiters--;
+    if (o->ev_tokens > o->ev_waiters) {
+        o->ev_tokens = o->ev_waiters;
+        if (!o->manual_reset) o->signaled = 1;
+    }
+}
+
+/* The wait returns for o (ready_locked said yes under the same lock hold): an auto-reset event is taken - its
+ * state, or one release token when it is reset -, a semaphore counted down, a mutex owned; an event waiter
+ * leaves. Caller holds o->lock. */
+static void take_locked(w32_object *o)
+{
+    switch (o->kind) {
+    case K_EVENT: {
+        int took_token = 0;
+        if (!o->manual_reset && !o->signaled && o->ev_tokens > 0) { o->ev_tokens--; took_token = 1; }
+        ev_leave_locked(o);
+        if (!o->manual_reset && !took_token) o->signaled = 0;
+        break;
+    }
+    case K_WAITABLE_TIMER:
+        if (!o->waitable_manual_reset) { o->waitable_triggered = 0; o->waitable_armed = 0; }
+        break;
+    case K_SEM:   o->sem_count--; break;
+    case K_MUTEX: o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion++; break;
+    default: break;
+    }
+}
+
 /*
  * Wait on a single object. The object lock must NOT be held.
  * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT.
@@ -490,26 +577,10 @@ static DWORD wait_single(w32_object *o, DWORD ms)
     pthread_mutex_lock(&o->lock);
     DWORD result = WAIT_OBJECT_0;
     unsigned gen0 = o->ev_gen;
-    int took_token = 0;
     if (o->kind == K_EVENT) o->ev_waiters++;
 
     for (;;) {
-        int ready = 0;
-        switch (o->kind) {
-        case K_EVENT:
-            if (o->signaled) ready = 1;
-            else if (o->manual_reset && o->ev_gen != gen0) ready = 1;              /* set / pulsed while we waited */
-            else if (!o->manual_reset && o->ev_tokens > 0) { o->ev_tokens--; took_token = 1; ready = 1; }
-            break;
-        case K_THREAD: ready = o->exited;   break;
-        case K_SEM:    ready = (o->sem_count > 0); break;
-        case K_MUTEX:
-            ready = (o->mtx_owner == 0 || o->mtx_owner == GetCurrentThreadId());
-            break;
-        case K_WAITABLE_TIMER: ready = waitable_due(o); break;
-        default:       ready = 1; break;
-        }
-        if (ready) break;
+        if (ready_locked(o, gen0)) break;
 
         /* An armed timer has its own deadline. Waiting on the caller's alone
          * would sleep straight past the due time, so take whichever comes
@@ -528,24 +599,10 @@ static DWORD wait_single(w32_object *o, DWORD ms)
         }
     }
 
-    if (o->kind == K_EVENT) {
-        o->ev_waiters--;
-        if (o->ev_tokens > o->ev_waiters) {      /* a token nobody is left to take (a waiter timed out): keep it as the state */
-            o->ev_tokens = o->ev_waiters;
-            if (!o->manual_reset) o->signaled = 1;
-        }
-    }
-    if (result == WAIT_OBJECT_0) {
-        switch (o->kind) {
-        case K_EVENT: if (!o->manual_reset && !took_token) o->signaled = 0; break;
-        case K_WAITABLE_TIMER:
-            if (!o->waitable_manual_reset) { o->waitable_triggered = 0; o->waitable_armed = 0; }
-            break;
-        case K_SEM:   o->sem_count--; break;
-        case K_MUTEX: o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion++; break;
-        default: break;
-        }
-    }
+    if (result == WAIT_OBJECT_0)
+        take_locked(o);
+    else if (o->kind == K_EVENT)
+        ev_leave_locked(o);
     pthread_mutex_unlock(&o->lock);
     return result;
 }
@@ -565,45 +622,181 @@ DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
 }
 
 /*
- * WaitForMultipleObjects: polling implementation. Adequate for the light
- * multi-object waits the Xbox kernel HLE issues; not a high-throughput path.
+ * WaitForMultipleObjects: a real waiter (w32_mwait above). It counts as a waiter of every event in the set (so
+ * SetEvent / PulseEvent hand it a release token like a single wait), sleeps until one of the objects is
+ * signalled (obj_wake), the deadline or an armed waitable timer's due time, and with alertable also wakes for
+ * a user APC queued to the calling thread. waitAll takes the objects only when all of them are ready, under all
+ * their locks at once (taken in address order). A NULL / pseudo handle counts as signalled, as in
+ * WaitForSingleObject.
  */
 DWORD WaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL waitAll, DWORD ms)
 {
     return WaitForMultipleObjectsEx(count, handles, waitAll, ms, FALSE);
 }
 
+static void unlink_mw(w32_object *o, mw_link *l)
+{
+    for (mw_link **pp = &o->mw_head; *pp; pp = &(*pp)->next)
+        if (*pp == l) { *pp = l->next; return; }
+}
+
 DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                                DWORD ms, BOOL alertable)
 {
+    w32_object *obj[MAXIMUM_WAIT_OBJECTS];
+    unsigned    gen0[MAXIMUM_WAIT_OBJECTS];
+    int         taken[MAXIMUM_WAIT_OBJECTS];
+    DWORD       order[MAXIMUM_WAIT_OBJECTS];   /* waitAll: indices by object address (lock order) */
+    mw_link     link[MAXIMUM_WAIT_OBJECTS + 1];
+    w32_mwait   w;
+    w32_object *self = alertable ? t_self_obj : NULL;
     struct timespec ts;
     int timed = (ms != INFINITE);
+    DWORD result = WAIT_TIMEOUT;
+    DWORD i, j;
+
+    if (!handles || count == 0 || count > MAXIMUM_WAIT_OBJECTS) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return WAIT_FAILED;
+    }
+    if (alertable && drain_apcs() > 0)
+        return WAIT_IO_COMPLETION;
     if (timed) deadline_from_ms(ms, &ts);
 
+    pthread_mutex_init(&w.mx, NULL);
+    pthread_cond_init(&w.cv, NULL);
+    w.seq = 0;
+    for (i = 0; i < count; i++) {
+        HANDLE h = handles[i];
+        obj[i] = (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS) ? NULL : (w32_object *)h;
+        taken[i] = 0;
+        order[i] = i;
+        if (!obj[i]) continue;
+        pthread_mutex_lock(&obj[i]->lock);
+        gen0[i] = obj[i]->ev_gen;
+        if (obj[i]->kind == K_EVENT) obj[i]->ev_waiters++;
+        link[i].w = &w;
+        link[i].next = obj[i]->mw_head;
+        obj[i]->mw_head = &link[i];
+        pthread_mutex_unlock(&obj[i]->lock);
+    }
+    if (self) {                                  /* QueueUserAPC wakes this wait */
+        pthread_mutex_lock(&self->lock);
+        link[count].w = &w;
+        link[count].next = self->mw_head;
+        self->mw_head = &link[count];
+        pthread_mutex_unlock(&self->lock);
+    }
+    if (waitAll)                                 /* insertion sort, count <= 64 */
+        for (i = 1; i < count; i++)
+            for (j = i; j > 0 && (uintptr_t)obj[order[j - 1]] > (uintptr_t)obj[order[j]]; j--) {
+                DWORD t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
+            }
+
     for (;;) {
-        if (alertable && drain_apcs() > 0)
-            return WAIT_IO_COMPLETION;
+        unsigned seen;
+        struct timespec until;
+        int bounded = timed;
+        if (timed) until = ts;
 
-        if (waitAll) {
-            DWORD got = 0;
-            for (DWORD i = 0; i < count; i++)
-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) got++;
-            if (got == count) return WAIT_OBJECT_0;
-        } else {
-            for (DWORD i = 0; i < count; i++)
-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0)
-                    return WAIT_OBJECT_0 + i;
+        pthread_mutex_lock(&w.mx);
+        seen = w.seq;                            /* a wake after this point is not lost */
+        pthread_mutex_unlock(&w.mx);
+
+        if (self) {
+            int apc;
+            pthread_mutex_lock(&self->lock);
+            apc = self->apc_count > 0;
+            pthread_mutex_unlock(&self->lock);
+            if (apc) { result = WAIT_IO_COMPLETION; break; }
         }
-
+        if (!waitAll) {
+            for (i = 0; i < count && result == WAIT_TIMEOUT; i++) {
+                w32_object *o = obj[i];
+                if (!o) { result = WAIT_OBJECT_0 + i; break; }
+                pthread_mutex_lock(&o->lock);
+                if (ready_locked(o, gen0[i])) {
+                    take_locked(o);
+                    taken[i] = 1;
+                    result = WAIT_OBJECT_0 + i;
+                } else if (o->kind == K_WAITABLE_TIMER && o->waitable_armed &&
+                           (!bounded || timespec_before(&o->waitable_due_time, &until))) {
+                    until = o->waitable_due_time;
+                    bounded = 1;
+                }
+                pthread_mutex_unlock(&o->lock);
+            }
+        } else {
+            int all = 1;
+            w32_object *prev = NULL;
+            for (i = 0; i < count; i++) {       /* every lock, in address order (a duplicate once) */
+                w32_object *o = obj[order[i]];
+                if (o && o != prev) pthread_mutex_lock(&o->lock);
+                prev = o;
+            }
+            for (i = 0; i < count; i++) {
+                w32_object *o = obj[i];
+                if (!o || ready_locked(o, gen0[i])) continue;
+                all = 0;
+                if (o->kind == K_WAITABLE_TIMER && o->waitable_armed &&
+                    (!bounded || timespec_before(&o->waitable_due_time, &until))) {
+                    until = o->waitable_due_time;
+                    bounded = 1;
+                }
+            }
+            if (all) {
+                prev = NULL;
+                for (i = 0; i < count; i++) {
+                    w32_object *o = obj[order[i]];
+                    if (o && o != prev) { take_locked(o); taken[order[i]] = 1; }
+                    prev = o;
+                }
+                result = WAIT_OBJECT_0;
+            }
+            prev = NULL;
+            for (i = 0; i < count; i++) {
+                w32_object *o = obj[order[i]];
+                if (o && o != prev) pthread_mutex_unlock(&o->lock);
+                prev = o;
+            }
+        }
+        if (result != WAIT_TIMEOUT)
+            break;
         if (timed) {
             struct timespec now;
             clock_gettime(CLOCK_REALTIME, &now);
-            if (now.tv_sec > ts.tv_sec ||
-                (now.tv_sec == ts.tv_sec && now.tv_nsec >= ts.tv_nsec))
-                return WAIT_TIMEOUT;
+            if (!timespec_before(&now, &ts))
+                break;                           /* checked once more after the deadline: WAIT_TIMEOUT */
         }
-        usleep(1000);
+        pthread_mutex_lock(&w.mx);
+        while (w.seq == seen) {
+            int rc = bounded ? pthread_cond_timedwait(&w.cv, &w.mx, &until)
+                             : pthread_cond_wait(&w.cv, &w.mx);
+            if (rc == ETIMEDOUT)
+                break;
+        }
+        pthread_mutex_unlock(&w.mx);
     }
+
+    for (i = 0; i < count; i++) {
+        w32_object *o = obj[i];
+        if (!o) continue;
+        pthread_mutex_lock(&o->lock);
+        unlink_mw(o, &link[i]);
+        if (o->kind == K_EVENT && !taken[i])
+            ev_leave_locked(o);
+        pthread_mutex_unlock(&o->lock);
+    }
+    if (self) {
+        pthread_mutex_lock(&self->lock);
+        unlink_mw(self, &link[count]);
+        pthread_mutex_unlock(&self->lock);
+    }
+    pthread_cond_destroy(&w.cv);
+    pthread_mutex_destroy(&w.mx);
+    if (result == WAIT_IO_COMPLETION)
+        drain_apcs();
+    return result;
 }
 
 /* ===================================================================== */
@@ -637,7 +830,7 @@ BOOL SetEvent(HANDLE h)
     } else {
         o->signaled = 1;
     }
-    pthread_cond_broadcast(&o->cond);
+    obj_wake(o);
     pthread_mutex_unlock(&o->lock);
     return TRUE;
 }
@@ -662,7 +855,7 @@ BOOL PulseEvent(HANDLE h)
     else if (o->ev_waiters > o->ev_tokens)
         o->ev_tokens++;                          /* one waiting thread is released */
     o->signaled = 0;
-    pthread_cond_broadcast(&o->cond);
+    obj_wake(o);
     pthread_mutex_unlock(&o->lock);
     return TRUE;
 }
@@ -693,7 +886,7 @@ BOOL ReleaseSemaphore(HANDLE h, LONG releaseCount, PLONG previousCount)
     if (previousCount) *previousCount = (LONG)o->sem_count;
     o->sem_count += releaseCount;
     if (o->sem_max && o->sem_count > o->sem_max) o->sem_count = o->sem_max;
-    pthread_cond_broadcast(&o->cond);
+    obj_wake(o);
     pthread_mutex_unlock(&o->lock);
     return TRUE;
 }
@@ -731,7 +924,7 @@ BOOL ReleaseMutex(HANDLE h)
     if (--o->mtx_recursion <= 0) {
         o->mtx_owner = 0;
         o->mtx_recursion = 0;
-        pthread_cond_broadcast(&o->cond);
+        obj_wake(o);
     }
     pthread_mutex_unlock(&o->lock);
     return TRUE;
@@ -748,6 +941,9 @@ static void *thread_trampoline(void *arg)
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+#if defined(__linux__)
+    o->host_tid = (long)syscall(SYS_gettid);
+#endif
     w32_thread_signal_setup();      /* alternate signal stack: a stack overflow still reaches the handlers */
 
     /* CREATE_SUSPENDED gate */
@@ -762,7 +958,7 @@ static void *thread_trampoline(void *arg)
     o->exit_code = rc;
     o->exited    = 1;
     o->signaled  = 1;
-    pthread_cond_broadcast(&o->cond);
+    obj_wake(o);
     pthread_mutex_unlock(&o->lock);
 
     obj_release(o);   /* drop the trampoline's reference */
@@ -808,7 +1004,7 @@ VOID ExitThread(DWORD exitCode)
         o->exit_code = exitCode;
         o->exited    = 1;
         o->signaled  = 1;
-        pthread_cond_broadcast(&o->cond);
+        obj_wake(o);
         pthread_mutex_unlock(&o->lock);
         obj_release(o);
     }
@@ -887,21 +1083,93 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
     o->exit_code = exitCode;
     o->exited    = 1;
     o->signaled  = 1;
-    pthread_cond_broadcast(&o->cond);
+    obj_wake(o);
     pthread_mutex_unlock(&o->lock);
     return TRUE;
 }
 
+/* The calling thread's object; a thread CreateThread did not make (the main thread, SDL's, a guest callback
+ * host) gets one the first time it is needed, owned by the thread and never released - GetCurrentThread() itself
+ * stays the pseudo handle, so a CloseHandle on it frees nothing. */
+static w32_object *current_thread_obj(void)
+{
+    if (!t_self_obj) {
+        w32_object *o = obj_alloc(K_THREAD);
+        o->tid = GetCurrentThreadId();
+        o->thread = pthread_self();
+#if defined(__linux__)
+        o->host_tid = (long)syscall(SYS_gettid);
+#endif
+        t_self_obj = o;
+    }
+    return t_self_obj;
+}
+
+#if defined(__linux__)
+/* Windows priority level -> nice. Applied only where this process may also undo it: unprivileged, RLIMIT_NICE
+ * decides how far below its start value a thread may go (default 0 = not at all), and raising nice is one-way
+ * there - a thread lowered once could not get back to normal. So: nothing is applied unless nice 0 is reachable
+ * again (root, or RLIMIT_NICE >= 20), and the value is clamped to what RLIMIT_NICE allows. */
+static void apply_nice(w32_object *o)
+{
+    static int floor_nice = 99;                  /* the lowest nice this process may set; 99 = not read yet */
+    int nice;
+    switch (o->priority) {
+    case THREAD_PRIORITY_IDLE:          nice = 19;  break;
+    case THREAD_PRIORITY_LOWEST:        nice = 10;  break;
+    case THREAD_PRIORITY_BELOW_NORMAL:  nice = 5;   break;
+    case THREAD_PRIORITY_ABOVE_NORMAL:  nice = -5;  break;
+    case THREAD_PRIORITY_HIGHEST:       nice = -10; break;
+    case THREAD_PRIORITY_TIME_CRITICAL: nice = -15; break;
+    default:                            nice = 0;   break;
+    }
+    if (floor_nice == 99) {
+        struct rlimit rl;
+        if (geteuid() == 0)
+            floor_nice = -20;
+        else if (getrlimit(RLIMIT_NICE, &rl) == 0)
+            floor_nice = rl.rlim_cur == RLIM_INFINITY ? -20 : 20 - (int)(rl.rlim_cur > 40 ? 40 : rl.rlim_cur);
+        else
+            floor_nice = 20;
+        if (floor_nice > 0)
+            fprintf(stderr, "[COMPAT] SetThreadPriority: RLIMIT_NICE does not let a lowered thread back to normal"
+                            " - thread priorities are recorded only\n");
+    }
+    if (floor_nice > 0 || !o->host_tid)
+        return;
+    if (nice < floor_nice)
+        nice = floor_nice;
+    if (setpriority(PRIO_PROCESS, (id_t)o->host_tid, nice) != 0) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "[COMPAT] SetThreadPriority: setpriority(%ld, %d) failed (errno %d)\n",
+                    o->host_tid, nice, errno);
+        }
+    }
+}
+#endif
+
+/* Before 2026-11-15 this only recorded the value, and it took any pointer for a thread object (the kernel bridge
+ * passed the guest KTHREAD, whose first word was read as the object kind). Now: a thread object or the pseudo
+ * handle, anything else is ERROR_INVALID_HANDLE as on Windows; on Linux the level becomes the thread's nice. */
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
-    if (o && o->kind == K_THREAD) o->priority = priority;
-    return TRUE;   /* real RT priorities need privileges; tracked only */
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? current_thread_obj() : (w32_object *)h;
+    if (!o || o->kind != K_THREAD) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    o->priority = priority;
+#if defined(__linux__)
+    apply_nice(o);
+#endif
+    return TRUE;
 }
 
 int GetThreadPriority(HANDLE h)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? current_thread_obj() : (w32_object *)h;
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
 }
 
@@ -918,6 +1186,7 @@ DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
         o->apc_data[o->apc_count] = data;
         o->apc_count++;
         ok = 1;
+        obj_wake(o);                             /* an alertable WaitForMultipleObjectsEx of that thread */
     }
     pthread_mutex_unlock(&o->lock);
     return ok;
@@ -1086,8 +1355,8 @@ BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
     (void)period;
     o->waitable_armed = 1;
     o->waitable_triggered = 0;
+    obj_wake(o);                                 /* waiters take the new due time */
     pthread_mutex_unlock(&o->lock);
-    pthread_cond_broadcast(&o->cond);
     return TRUE;
 }
 

@@ -275,3 +275,37 @@ line says otherwise.
   "A confirms, B cancels" in its menus whatever the player's mapping says (Orta: OPTIONS > CONTROLS > MENU BUTTONS).
   Mask 0, the default, keeps the old behaviour; `xbox_bind_eval` wraps the new `xbox_bind_eval_fixed`. Keyboard and
   pad both go through it, so the pad script sees the same result as a real pad. `tests/input_bind` covers it.
+
+## 10. Changes since the v1.1.2 snapshot (Orta Recompiled v1.2.0)
+
+- **One renderer, one audio path:** the legacy D3D11 renderer (`src/d3d`, `src/nv2a`), the old DirectSound software
+  mixer with its WMA decoder and the Media Foundation movie player are removed. `nv2a_vk` is the renderer of every
+  Xbox port; sound is the title's own XDK code on the emulated MCPX APU (`xbox_dsound` stays as an alias of
+  `xbox_apu`). The CPU rasteriser of the pushbuffer executor and the `__SWITCH__` branches are gone too. The sound
+  emulation (APU, DSP56k, AC97) and OHCI stay by rule; the licence review is `docs/licence_apu_ac97_ohci.md`.
+- **The port's generic parts moved into the toolkit** (from Orta Recompiled, the table in `docs/porting_guide.md`):
+  the host layer (`src/porthost`: paths, crash handler, settings.ini as `xr_settings`, the Vulkan 1.3 check
+  `xr_vk_check`), the whole port launcher (`src/launcher/launcher_port.h`, target `xbox_launcher_port`),
+  `XLaunchNewImage` (`src/xdk/xdk_launch.h`), D3D's fence wait without the spin (`src/xdk/xdk_d3d_wait.h`), and the
+  release scripts (`tools/release/port_release.ps1`, `port_release_zip.ps1`, `port_release_linux.sh`, the port's
+  names in a config file).
+- **The shipped pipeline list** (`nv2a_vk_set_pipeline_list`, `RECOMP_VK_PIPELIST`): a list of program and pipeline
+  keys - keys only, no game data - recorded in test play (`RECOMP_VK_PIPELIST_RECORD`), resolved to file + offset by
+  `tools/g3/pipelist_resolve.py`, shipped in `data/` and prewarmed when the device starts, so a player's first
+  session compiles far less on the fly. The launcher copies every file of the payload's `tools/data/` into `data/`
+  when it is missing or the release changed.
+- **Async shader compile** (`RECOMP_VK_ASYNC`, default 2): a program or pipeline that is not in a cache is built on a
+  worker thread; the frame waits up to 2.5 ms for it and otherwise skips that draw (1 = skip at once, 0 = build in
+  the frame as before). The start's prewarm stays synchronous.
+- **Faster first start:** the lifter's disassembly and translation are about 30-45 % faster with identical output
+  (no section copies, merged sorting, a decode cache, `slots` on the instruction classes, `--no-asm`), and
+  `--split 400` with a fresh weight-balanced partition layout gives even compile units. Orta's first start went from
+  321 s to 222 s, its peak memory from about 3.2 GB to 1.4 GB.
+- **Kernel and threads:** the runtime's host threads have names (`xr_thread_name`); the tick runs in the flag thread
+  and the timer thread no longer polls every 10 ms; guest thread priorities take effect; the POSIX
+  `WaitForMultipleObjects` is a real waiter. Opt-ins, off by default: `RECOMP_TIMER_WAKE=1` (timers and DPCs from
+  other threads wake the timer thread at once - it changes a title's pad-read timing) and the CMake option
+  `XBOXRECOMP_ICALL_FEEDBACK` (indirect-call feedback for development builds, never in a release).
+- **nv2a_vk:** window events are pumped also without flips (a screen that waits for a button without drawing); HUD
+  squash anchors by quarters and keeps boxes in the left quarter at the left edge; the session's first-compile
+  totals are logged.

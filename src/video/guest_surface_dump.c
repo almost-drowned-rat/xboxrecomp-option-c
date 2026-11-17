@@ -16,7 +16,7 @@
  * and YUY2; anything else is refused with the format code in the message.
  */
 #include "guest_surface_dump.h"
-#include "d3d/d3d8_swizzle.h"
+#include "kernel/d3d8_swizzle.h"   /* here since 2026-11-16 (was src/d3d, removed) */
 #include "kernel/xbox_memory_layout.h"
 
 #include <stdio.h>

@@ -7,6 +7,8 @@ add_library(xbox_xdk STATIC
     xdk_xinput.c
     xdk_dsound.c
     xdk_soundtrack.c
+    xdk_d3d_wait.c          # D3D BlockOnTime without the spin (xdk_d3d_wait.h)
+    xdk_launch.c            # XLaunchNewImage: read, log, refuse (xdk_launch.h)
 )
 
 target_include_directories(xbox_xdk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
