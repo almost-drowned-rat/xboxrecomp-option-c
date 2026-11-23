@@ -61,6 +61,11 @@ typedef struct {
 /* The whole launcher; returns the process exit code. */
 int xr_launcher_main(const XrLauncherConfig *cfg, int argc, char **argv);
 
+/* Optional (2026-11-23, the Linux launcher window): when no game is found, the port's window asks for the disc
+ * image on its own page instead of the launcher's message box. fn(ui, disc, iso, n, note): 1 = an image in iso,
+ * 0 = the player quit, -1 = not here (the box then). Set before xr_launcher_main; NULL = the box (as before). */
+void xr_launcher_set_image_page(int (*fn)(void *ui, const char *disc, char *iso, size_t n, const char *note));
+
 #ifdef __cplusplus
 }
 #endif

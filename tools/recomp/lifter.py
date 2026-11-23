@@ -285,6 +285,18 @@ def _operand_width(op):
     return None
 
 
+def _narrow_source(ops):
+    """An arithmetic source at the destination's width.
+
+    The disassembler sign-extends a narrow immediate to 32 bits, so
+    "adc ax, -1" arrives as 0xFFFFFFFF and its carry lands in the wrong bit."""
+    src = _fmt_operand_read(ops[1])
+    width = _operand_width(ops[0]) or 4
+    if ops[1].type == "imm" and width < 4:
+        return f"(({src}) & 0x{(1 << width * 8) - 1:X}u)"
+    return src
+
+
 def _fmt_operand_read(op):
     """Format reading any operand type."""
     if op.type == "reg":
@@ -357,7 +369,7 @@ _CMOVCC_TRACKED = _CMOVCC_LIFTED | {"cmovo", "cmovno"}
 # Instructions that set arithmetic flags (primary set, fully handled)
 FLAG_SETTERS = frozenset({
     "cmp", "test", "sub", "add", "and", "or", "xor",
-    "inc", "dec", "neg", "shl", "shr", "sar", "imul", "adc", "sbb",
+    "inc", "dec", "neg", "shl", "shr", "sar", "imul", "mul", "adc", "sbb",
     "comiss", "comisd", "ucomiss", "ucomisd",  # SSE float compare
 })
 
@@ -422,7 +434,10 @@ _LOCK_RMW = frozenset({"add", "sub", "and", "or", "xor", "adc", "sbb",
 
 # Instructions with undefined/unpredictable flags (clear tracking)
 _FLAGS_UNDEFINED = frozenset({
-    "mul", "div", "idiv",  # Flags partially undefined
+    # mul is no longer here (U2 2026-11-19, upstream sp00nz v0.17.0 #277, 47ea2b6): it leaves CF = OF ("the
+    # product did not fit") in _fa like imul. option-c keeps cpuid and its own popfd treatment below (upstream's
+    # popfd goes through a g_eflags model option-c does not have).
+    "div", "idiv",  # Flags partially undefined
     "rdtsc", "cpuid",      # Special instructions
     # popfd REPLACES every flag with whatever was pushed. Its flags are not
     # architecturally undefined -- they are simply not knowable from the
@@ -571,12 +586,18 @@ for _names, _expr in (
 def _flags_word(flag_setter, flag_ops, with_cf=True):
     """The tracked flags as an EFLAGS-layout C expression (pushfd's bits).
     with_cf=False leaves CF out: in a function that declares no _cf (nothing
-    in it reads CF) its condition would name an undeclared variable."""
+    in it reads CF) its condition would name an undeclared variable. The same
+    holds for any other bit derived from _cf - shl's OF is the result's sign
+    XOR the carry (U2, upstream #276): without _cf that bit is left out too,
+    as it was before #276 (found by Orta's relift 2026-11-19: a shift by cl
+    after a shl in sub_002F9460 / sub_002FD40E saved OF through _cf)."""
     bits = []
     for jcc, bit in (("jo", _OF), ("js", _SF), ("je", _ZF), ("jp", _PF), ("jb", _CF)):
         if bit == _CF and not with_cf:
             continue
         probe = _make_condition(jcc, flag_setter, flag_ops)
+        if probe and not with_cf and re.search(r"\b_cf\b", probe[0]):
+            continue
         if probe:
             bits.append(f"(({probe[0]}) ? 0x{bit:X}u : 0u)")
     return " | ".join(bits + ["0u"])
@@ -789,6 +810,71 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return (f"(({_sf_utype})(({_sf_utype})({a}) - ({_sf_utype})({b}))"
                 f" >> {_sf_top})")
 
+    # ── OF and PF of cmp, sub, add and the logic ops ──
+    # (U2 2026-11-19: upstream sp00nz v0.17.0 #276, NoRain211 00e9518, taken into option-c's lifter)
+    #
+    # The per-mnemonic rules below never defined jo/jno, nor jp/jnp after
+    # sub, add and the logic ops, so those fell to the untracked `_flags`
+    # fallback (always false), and a pushfd pushed OF and PF as whatever
+    # g_eflags held: `cmp al, bl; pushfd` with al = -128, bl = 1 (wraps to
+    # 127, OF set) saved OF clear. OF is set when the operands' signs make
+    # the result's sign impossible: for a - b they differ and the result's
+    # sign is not a's; for a + b they agree and the result's is not a's.
+    # sub and add kept only the result and the source, so a is recovered
+    # from them (a = r + b, a = r - b). Like SF, it is the top bit at the
+    # operand's width, in the unsigned type, so nothing overflows in C. The
+    # logic ops clear OF. PF is the parity of the result's low byte.
+    #
+    # adc and sbb keep their OF in _fb (it needs the operands and the
+    # carry-in, gone once the result is written), neg overflows only on the
+    # most negative value, and the shifts by one define it from the result:
+    # shr from the operand's old top bit, shl from the result's sign XOR the
+    # carry out, sar never. Counts above one leave OF undefined.
+    #
+    # This is the one OF derivation: publish_flags reads it through jo, as
+    # every other consumer does. Setters it does not cover return None, and
+    # a pushfd after them says so.
+    def _top_bit(expr):
+        return f"(({_sf_utype})({expr}) >> {_sf_top})"
+
+    def _overflow_flag():
+        t = _sf_utype
+        if flag_setter == "cmp":
+            a, b, r, same_sign = lhs, rhs, f"({lhs}) - ({rhs})", False
+        elif flag_setter == "sub" and rhs == "_fb":
+            a, b, r, same_sign = "(_fa + _fb)", "_fb", "_fa", False
+        elif flag_setter == "add" and rhs == "_fb":
+            a, b, r, same_sign = "(_fa - _fb)", "_fb", "_fa", True
+        elif flag_setter in ("and", "or", "xor", "test"):
+            return "0"
+        elif lhs != "_fa":
+            return None
+        elif flag_setter == "neg":
+            return f"(_fa == 0x{1 << _sf_top:X}u)"
+        elif flag_setter in ("adc", "sbb"):
+            return "_fb"
+        elif flag_setter == "shr":
+            return _top_bit("_fa << 1")
+        elif flag_setter in ("shl", "sal"):
+            return f"({_top_bit('_fa')} ^ (uint32_t)(_cf != 0))"
+        elif flag_setter == "sar":
+            return "0"
+        else:
+            return None
+        signs = f"(({t})({a}) ^ ({t})({b}))"
+        if same_sign:
+            signs = f"(({t})~{signs})"
+        return f"((({t})({signs} & (({t})({a}) ^ ({t})({r})))) >> {_sf_top})"
+
+    if jcc in ("jo", "jno"):
+        of = _overflow_flag()
+        if of is not None:
+            return (f"({of} != 0)" if jcc == "jo" else f"({of} == 0)"), desc
+    if (flag_setter in ("sub", "add", "and", "or", "xor") and lhs == "_fa"
+            and jcc in ("jp", "jpe", "jnp", "jpo")):
+        return ("RECOMP_PARITY8(_fa)" if jcc in ("jp", "jpe")
+                else "(!RECOMP_PARITY8(_fa))"), desc
+
     # ── bsf/bsr: ZF is the only flag they define ──
     #
     # ZF is set when the SOURCE was zero, not from any subtraction, and the
@@ -838,6 +924,37 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc == "jnp":
             return f"(!RECOMP_PARITY8(({lhs}) & ({rhs})))", desc
         return None
+
+    # ── mul/imul: _fa holds CF = OF, "the product did not fit" (#277) ──
+    # First: mul / imul are no result snapshot (their _fa is the overflow), so the block below must not see them.
+    if flag_setter in ("imul", "mul"):
+        if jcc in ("jo", "jb", "jnae", "jc"):
+            return "(_fa != 0)", desc
+        if jcc in ("jno", "jae", "jnb", "jnc"):
+            return "(_fa == 0)", desc
+        return None
+    # ── PF, OF and the signed conditions of the result snapshot setters (#276) ──
+    #
+    # _fa is the result at the operand's width and _fas its sign extension,
+    # so PF is the parity of _fa and SF is _fas < 0, and OF comes from
+    # _overflow_flag. jl/jge/jle/jg are then SF != OF, which the per-mnemonic
+    # rules below wrote as SF alone -- wrong whenever the result overflowed,
+    # and for 8/16-bit sub, whose rebuilt operand was compared at 32 bits.
+    if flag_setter in _RESULT_SNAPSHOT_SETTERS and lhs == "_fa":
+        if jcc in ("jp", "jpe"):
+            return "RECOMP_PARITY8(_fa)", desc
+        if jcc in ("jnp", "jpo"):
+            return "!RECOMP_PARITY8(_fa)", desc
+        of = _overflow_flag()
+        if of is not None:
+            less = f"((_fas < 0) != ({of} != 0))"
+            signed = {"jo": f"({of} != 0)", "jno": f"({of} == 0)",
+                      "jl": less, "jnge": less,
+                      "jge": f"!{less}", "jnl": f"!{less}",
+                      "jle": f"(_fa == 0 || {less})", "jng": f"(_fa == 0 || {less})",
+                      "jg": f"(_fa != 0 && !{less})", "jnle": f"(_fa != 0 && !{less})"}
+            if jcc in signed:
+                return signed[jcc], desc
 
     # ── carry conditions, from the _cf the arithmetic already produced ──
     #
@@ -987,6 +1104,11 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({lhs} == 0)", desc
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
+        # CF is "nonzero" and ZF "zero", so exactly one of them is set.
+        if jcc in ("jbe", "jna"):
+            return "1", desc
+        if jcc in ("ja", "jnbe"):
+            return "0", desc
         if jcc in ("jb", "jnae", "jc"):
             # CF=1 unless original was 0
             return f"({lhs} != 0)", desc
@@ -2150,7 +2272,7 @@ class Lifter:
             return [f"/* {m}: bad operands */"]
         c_op = {"add": "+", "sub": "-", "and": "&", "or": "|", "xor": "^"}[m]
         dst = _fmt_operand_read(ops[0])
-        src = _fmt_operand_read(ops[1])
+        src = _narrow_source(ops)
         # XOR reg, reg → zero
         if m == "xor" and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
             out = ["_cf = 0; /* xor clears CF */"] if self.needs_cf else []
@@ -2217,16 +2339,21 @@ class Lifter:
         if len(ops) < 2:
             return ["/* sbb: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        src = _fmt_operand_read(ops[1])
+        src = _narrow_source(ops)
         # sbb reg, reg is a common idiom: result is 0 or 0xFFFFFFFF depending on CF
         if ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
             return [_fmt_operand_write(ops[0], "_cf ? 0xFFFFFFFF : 0")
-                    + " /* sbb self (CF extend) */",
+                    + " /* sbb self (CF extend) */ _fb = 0;",
                     self._result_snapshot(ops, "sbb")]
         w = (_operand_width(ops[0]) or 4) * 8
+        # OF goes to _fb, as inc/dec keep theirs: it needs the operands and
+        # the carry-in, which are gone once the result is written.
         return ["{ uint64_t _t = (uint64_t)(%s) - (uint64_t)(%s) - (uint64_t)_cf;"
-                " _cf = (int)((_t >> %d) & 1); %s }  /* sbb */"
-                % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t")),
+                " _cf = (int)((_t >> %d) & 1);"
+                " _fb = (((uint32_t)(%s) ^ (uint32_t)(%s)) & ((uint32_t)(%s) ^ (uint32_t)_t)) >> %d & 1u;"
+                " %s }  /* sbb */"
+                % (dst, src, w, dst, src, dst, w - 1,
+                   _fmt_operand_write(ops[0], "(uint32_t)_t")),
                 self._result_snapshot(ops, "sbb")]
 
     def _lift_adc(self, insn, ops):
@@ -2234,11 +2361,14 @@ class Lifter:
         if len(ops) < 2:
             return ["/* adc: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        src = _fmt_operand_read(ops[1])
+        src = _narrow_source(ops)
         w = (_operand_width(ops[0]) or 4) * 8
         return ["{ uint64_t _t = (uint64_t)(%s) + (uint64_t)(%s) + (uint64_t)_cf;"
-                " _cf = (int)((_t >> %d) & 1); %s }  /* adc */"
-                % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t")),
+                " _cf = (int)((_t >> %d) & 1);"
+                " _fb = (((uint32_t)(%s) ^ (uint32_t)_t) & ((uint32_t)(%s) ^ (uint32_t)_t)) >> %d & 1u;"
+                " %s }  /* adc */"
+                % (dst, src, w, dst, src, w - 1,
+                   _fmt_operand_write(ops[0], "(uint32_t)_t")),
                 self._result_snapshot(ops, "adc")]
 
     def _lift_double_shift(self, insn, ops, m):
@@ -2288,33 +2418,39 @@ class Lifter:
     def _lift_imul(self, insn, ops):
         nops = len(ops)
         if nops == 1:
-            # One operand: edx:eax = eax * ops[0]
-            src = _fmt_operand_read(ops[0])
-            return [
-                f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
-                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
-            ]
-        elif nops == 2:
-            # Two operand: dst = dst * src
-            dst = _fmt_operand_read(ops[0])
-            src = _fmt_operand_read(ops[1])
-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} * (int32_t){src})")]
-        elif nops == 3:
-            # Three operand: dst = src1 * imm
-            src = _fmt_operand_read(ops[1])
-            imm = _fmt_operand_read(ops[2])
-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){src} * (int32_t){imm})")]
+            return self._lift_product(ops, signed=True)
+        elif nops in (2, 3):
+            # dst = dst * src, or dst = src * imm
+            a, b = _fmt_operand_read(ops[nops - 2]), _fmt_operand_read(ops[nops - 1])
+            sx = self._SNAP_SX.get(_operand_width(ops[0]) or 4, "(int32_t)")
+            return [f"_fa = ((int64_t){sx}({a}) * (int64_t){sx}({b})"
+                    f" != (int64_t){sx}((uint32_t)({a}) * (uint32_t)({b})));",
+                    _fmt_operand_write(ops[0], f"(uint32_t)((int32_t){a} * (int32_t){b})")]
         return ["/* imul: unexpected form */"]
+
+    def _lift_product(self, ops, signed):
+        width = (_operand_width(ops[0]) or 4) * 8
+        src = _fmt_operand_read(ops[0])
+        narrow = f"{'int' if signed else 'uint'}{width}_t"
+        wide = "int64_t" if signed else "uint64_t"
+        overflow = (f"_r != ({wide})({narrow})_r" if signed
+                    else f"(_r >> {width}) != 0")
+        if width == 8:
+            write = "SET_LO16(eax, _r);"
+        elif width == 16:
+            write = "SET_LO16(eax, _r); SET_LO16(edx, (uint64_t)_r >> 16);"
+        else:
+            write = "eax = (uint32_t)_r; edx = (uint32_t)((uint64_t)_r >> 32);"
+        carry = " _cf = (int)_fa;" if self.needs_cf else ""
+        return [f"{{ {wide} _r = ({wide})({narrow})eax * ({wide})({narrow})({src});",
+                f"  _fa = ({overflow});{carry} {write} }}"]
 
     def _lift_muldiv(self, insn, ops, m):
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
         src = _fmt_operand_read(ops[0])
         if m == "mul":
-            return [
-                f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",
-                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
-            ]
+            return self._lift_product(ops, signed=False)
         elif m == "div":
             return [
                 f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
@@ -2345,10 +2481,11 @@ class Lifter:
         out = []
         if self.needs_cf:
             w = (_operand_width(ops[0]) or 4) * 8
-            # CF is the last bit shifted out; a zero count leaves CF alone.
-            bit = f"({cnt}) - 1" if c_op == ">>" else f"{w} - ({cnt})"
-            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}"))
+            # Counts beyond a narrow operand have undefined CF, but the C
+            # must stay defined. A masked zero preserves the incoming carry.
+            bit = f"(({cnt}) - 1) & 31u" if c_op == ">>" else f"({w} - ({cnt})) & 31u"
+            out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({dst}) >> ({bit})) & 1u);")
+        out.append(_fmt_operand_write(ops[0], f"(uint32_t)({dst}) {c_op} {cnt}"))
         out.append(self._result_snapshot(ops, "shift"))
         return out
 
@@ -2388,7 +2525,7 @@ class Lifter:
         signed = f"(int32_t)(int{width}_t)({dst})"
         out = []
         if self.needs_cf:
-            out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({signed}) >> (({cnt}) - 1)) & 1);")
+            out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({signed}) >> ((({cnt}) - 1) & 31u)) & 1);")
         out.append(_fmt_operand_write(ops[0], f"(uint32_t)(({signed}) >> {cnt})"))
         out.append(self._result_snapshot(ops, "sar"))
         return out
@@ -3817,6 +3954,13 @@ class Lifter:
         """Basic FPU instruction translation using double locals."""
         # FPU is complex. We translate common patterns to double operations.
         # Full accuracy would require an x87 stack emulator.
+
+        if m in ("fnsave", "frstor") and ops and ops[0].type == "mem":
+            # Capstone reports this aggregate operand as a dword. The 66
+            # prefix, not mem_size, selects the 14-byte environment.
+            short_env = int(bytes.fromhex(insn.bytes_hex).split(b"\xdd", 1)[0].find(b"\x66") >= 0)
+            # option-c: the helpers read the x87 state through ctx (U2 2026-11-19, upstream #277 47ea2b6)
+            return [f"recomp_{m}(RECOMP_ARGS, {_fmt_mem(ops[0])}, {short_env});"]
 
         if m == "fld":
             if len(ops) >= 1:

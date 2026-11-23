@@ -319,6 +319,13 @@ uint32_t mcpx_apu_dsp_auto_doorbell(MCPXAPUState *d);
 
 /* Debug globals */
 extern MCPXAPUState *g_state;
-extern struct McpxApuDebug g_dbg, g_dbg_cache;
+extern struct McpxApuDebug g_dbg_cache;
+#if defined(XR_APU_MODULE)
+/* The APU module (apu_module.h): g_dbg is the exe's, so that a port's diagnostics read it as in a static build. */
+extern struct McpxApuDebug *xr_apu_dbg;
+#define g_dbg (*xr_apu_dbg)
+#else
+extern struct McpxApuDebug g_dbg;
+#endif
 extern int g_dbg_voice_monitor;
 extern uint64_t g_dbg_muted_voices[4];

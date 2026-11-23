@@ -425,6 +425,222 @@ void nv2a_fog_params(const uint32_t *regs, uint32_t xform, float out[4])
     out[3] = regs[0x02A4 / 4] ? 2.0f : 1.0f;     /* SET_FOG_ENABLE */
 }
 
+/* ── Uber fragment shader (SHADER COMPILE: HYBRID, docs/hybrid_ubershader.md) ──────────────────────────────────
+ * The same rules as nv2a_gl_psh above, interpreted at run time from the draw's Nv2aPshKey, which nv2a_vk appends to
+ * the fragment block as u_pk (38 words in the struct's order: colour ICW 0-7, colour OCW 8-15, alpha ICW 16-23,
+ * alpha OCW 24-31, control 32, final0 33, final1 34, shader_program 35, other_input 36, shadow 37). One source, built
+ * once. Not covered (the caller keeps such draws off it): CUBE_MAP and shadow-map stages, point sprites. A change to a
+ * rule above must be made here too - tests/uber_psh compares both. Vulkan GLSL only. */
+#define UBER_PSH_GLSL \
+    "#version 450\n" \
+    "layout(location = 0) in vec4 vD0; layout(location = 1) in vec4 vD1;\n" \
+    "layout(location = 2) in vec4 vT0; layout(location = 3) in vec4 vT1;\n" \
+    "layout(location = 4) in vec4 vT2; layout(location = 5) in vec4 vT3in;\n" \
+    "layout(location = 6) in float vFog;\n" \
+    "layout(set = 0, binding = 2) uniform sampler2D t0;\n" \
+    "layout(set = 0, binding = 3) uniform sampler2D t1;\n" \
+    "layout(set = 0, binding = 4) uniform sampler2D t2;\n" \
+    "layout(set = 0, binding = 5) uniform sampler2D t3;\n" \
+    "layout(std140, set = 0, binding = 1) uniform FsU {\n" \
+    "    vec2 u_tscale[4];\n" \
+    "    vec4 u_c0[8]; vec4 u_c1[8];\n" \
+    "    vec4 u_fc0; vec4 u_fc1;\n" \
+    "    vec4 u_fogcolor;\n" \
+    "    int u_alpha_func; float u_alpha_ref;\n" \
+    "    int u_psprite;\n" \
+    "    int u_mark;\n" \
+    "    vec4 u_fogp;\n" \
+    "    vec4 u_bumpmat[4];\n" \
+    "    vec4 u_bumpls[4];\n" \
+    "    uvec4 u_pk[10];\n" \
+    "};\n" \
+    "layout(location = 0) out vec4 fragColor;\n" \
+    NV2A_FOG_GLSL \
+    NV2A_BUMP_GLSL \
+    "uint pkw(int w) { return u_pk[w >> 2][w & 3]; }\n" \
+    /* The combiner registers as named variables, read / written through switches (2026-11-22): a dynamically   \
+     * indexed vec4 R[16] went to local memory on the drivers (forced-uber GPU time ~7x a specialised shader).     \
+     * Register numbers: 0 zero, 1 C0, 2 C1, 3 fog, 4 V0, 5 V1, 8-11 T0-T3, 12 R0, 13 R1, 14 V1R0, 15 EF.          \
+     * Tf0-Tf2: the stages' fetched values (the dependent fetches read these, not the registers). */               \
+    "vec4 Rc0, Rc1, Rfog, Rv0, Rv1, Rt0, Rt1, Rt2, Rt3, Rr0, Rr1, Rv1r0, Ref;\n" \
+    "vec4 Tf0, Tf1, Tf2;\n" \
+    "vec4 rreg(uint r) {\n" \
+    "    switch (r) {\n" \
+    "    case 1u: return Rc0; case 2u: return Rc1; case 3u: return Rfog; case 4u: return Rv0; case 5u: return Rv1;\n" \
+    "    case 8u: return Rt0; case 9u: return Rt1; case 10u: return Rt2; case 11u: return Rt3;\n" \
+    "    case 12u: return Rr0; case 13u: return Rr1; case 14u: return Rv1r0; case 15u: return Ref;\n" \
+    "    default: return vec4(0.0);\n" \
+    "    }\n" \
+    "}\n" \
+    /* a general-combiner input byte, mapped (input()) */ \
+    "vec3 gin3(uint b) {\n" \
+    "    uint r = b & 15u; vec4 s = rreg(r); vec3 x = r >= 14u ? vec3(0.0) : (((b >> 4) & 1u) != 0u ? vec3(s.a) : s.rgb);\n" \
+    "    uint m = (b >> 5) & 7u;\n" \
+    "    if (m == 0u) return max(x, 0.0);\n" \
+    "    if (m == 1u) return 1.0 - clamp(x, 0.0, 1.0);\n" \
+    "    if (m == 2u) return 2.0 * max(x, 0.0) - 1.0;\n" \
+    "    if (m == 3u) return 1.0 - 2.0 * max(x, 0.0);\n" \
+    "    if (m == 4u) return max(x, 0.0) - 0.5;\n" \
+    "    if (m == 5u) return 0.5 - max(x, 0.0);\n" \
+    "    if (m == 6u) return x;\n" \
+    "    return -x;\n" \
+    "}\n" \
+    "float gin1(uint b) {\n" \
+    "    uint r = b & 15u; vec4 s = rreg(r); float x = r >= 14u ? 0.0 : (((b >> 4) & 1u) != 0u ? s.a : s.b);\n" \
+    "    uint m = (b >> 5) & 7u;\n" \
+    "    if (m == 0u) return max(x, 0.0);\n" \
+    "    if (m == 1u) return 1.0 - clamp(x, 0.0, 1.0);\n" \
+    "    if (m == 2u) return 2.0 * max(x, 0.0) - 1.0;\n" \
+    "    if (m == 3u) return 1.0 - 2.0 * max(x, 0.0);\n" \
+    "    if (m == 4u) return max(x, 0.0) - 0.5;\n" \
+    "    if (m == 5u) return 0.5 - max(x, 0.0);\n" \
+    "    if (m == 6u) return x;\n" \
+    "    return -x;\n" \
+    "}\n" \
+    "vec3 sb3(vec3 v, uint op) {\n" \
+    "    if (op == 1u) v = v - 0.5; else if (op == 2u) v = v * 2.0; else if (op == 3u) v = (v - 0.5) * 2.0;\n" \
+    "    else if (op == 4u) v = v * 4.0; else if (op == 6u) v = v * 0.5;\n" \
+    "    return clamp(v, -1.0, 1.0);\n" \
+    "}\n" \
+    "float sb1(float v, uint op) {\n" \
+    "    if (op == 1u) v = v - 0.5; else if (op == 2u) v = v * 2.0; else if (op == 3u) v = (v - 0.5) * 2.0;\n" \
+    "    else if (op == 4u) v = v * 4.0; else if (op == 6u) v = v * 0.5;\n" \
+    "    return clamp(v, -1.0, 1.0);\n" \
+    "}\n" \
+    "void wr3(uint d, vec3 v) {\n" \
+    "    switch (d) {\n" \
+    "    case 4u: Rv0.rgb = v; break; case 5u: Rv1.rgb = v; break;\n" \
+    "    case 8u: Rt0.rgb = v; break; case 9u: Rt1.rgb = v; break; case 10u: Rt2.rgb = v; break; case 11u: Rt3.rgb = v; break;\n" \
+    "    case 12u: Rr0.rgb = v; break; case 13u: Rr1.rgb = v; break;\n" \
+    "    default: break;\n" \
+    "    }\n" \
+    "}\n" \
+    "void wr1(uint d, float v) {\n" \
+    "    switch (d) {\n" \
+    "    case 4u: Rv0.a = v; break; case 5u: Rv1.a = v; break;\n" \
+    "    case 8u: Rt0.a = v; break; case 9u: Rt1.a = v; break; case 10u: Rt2.a = v; break; case 11u: Rt3.a = v; break;\n" \
+    "    case 12u: Rr0.a = v; break; case 13u: Rr1.a = v; break;\n" \
+    "    default: break;\n" \
+    "    }\n" \
+    "}\n" \
+    "vec3 fin3(uint b) {\n" \
+    "    uint r = b & 15u; vec4 s = r == 1u ? u_fc0 : r == 2u ? u_fc1 : rreg(r);\n" \
+    "    vec3 x = clamp(((b >> 4) & 1u) != 0u ? vec3(s.a) : s.rgb, 0.0, 1.0);\n" \
+    "    return ((b >> 5) & 1u) != 0u ? 1.0 - x : x;\n" \
+    "}\n" \
+    "float fin1(uint b) {\n" \
+    "    uint r = b & 15u; vec4 s = r == 1u ? u_fc0 : r == 2u ? u_fc1 : rreg(r);\n" \
+    "    float x = clamp(((b >> 4) & 1u) != 0u ? s.a : s.b, 0.0, 1.0);\n" \
+    "    return ((b >> 5) & 1u) != 0u ? 1.0 - x : x;\n" \
+    "}\n" \
+    "int in_stage(int t) {\n" \
+    "    int s = t <= 1 ? 0 : int((pkw(36) >> (t == 2 ? 16u : 20u)) & 15u);\n" \
+    "    return s < t ? s : t - 1;\n" \
+    "}\n" \
+    "vec4 tex2d(int t, vec2 uv) {\n" \
+    "    if (t == 0) return texture(t0, uv); if (t == 1) return texture(t1, uv);\n" \
+    "    if (t == 2) return texture(t2, uv); return texture(t3, uv);\n" \
+    "}\n" \
+    "vec3 bumpf(int s, vec2 uv) {\n" \
+    "    if (s == 0) return nv2a_bump_fetch(t0, uv); if (s == 1) return nv2a_bump_fetch(t1, uv);\n" \
+    "    return nv2a_bump_fetch(t2, uv);\n" \
+    "}\n" \
+    "vec4 fetch(int t, vec4 tc) {\n" \
+    "    uint mode = (pkw(35) >> uint(5 * t)) & 31u;\n" \
+    "    if (mode == 0u) return vec4(0.0);\n" \
+    "    if (mode == 4u) return clamp(tc, 0.0, 1.0);\n" \
+    "    if (mode == 5u) { if (any(lessThan(tc, vec4(0.0)))) discard; return vec4(0.0); }\n" \
+    "    if (mode == 15u || mode == 16u) {\n" \
+    "        if (t == 0) return vec4(0.0);\n" \
+    "        int s = in_stage(t);\n" \
+    "        vec4 p = s == 0 ? Tf0 : s == 1 ? Tf1 : Tf2;\n" \
+    "        return tex2d(t, mode == 15u ? p.ar : p.gb);\n" \
+    "    }\n" \
+    "    if (mode == 6u || mode == 7u) {\n" \
+    "        if (t == 0) return vec4(0.0);\n" \
+    "        int s = in_stage(t);\n" \
+    "        vec4 ts = s == 0 ? vT0 : s == 1 ? vT1 : vT2;\n" \
+    "        vec3 b3 = bumpf(s, ts.xy * u_tscale[s]);\n" \
+    "        vec2 dsdt = mat2(u_bumpmat[t]) * b3.xy;\n" \
+    "        vec4 c = tex2d(t, (tc.xy + dsdt) * u_tscale[t]);\n" \
+    "        if (mode == 7u) c *= u_bumpls[t].x * b3.z + u_bumpls[t].y;\n" \
+    "        return c;\n" \
+    "    }\n" \
+    "    vec2 uv = (abs(tc.w) > 1e-8 && mode == 1u) ? tc.xy / tc.w : tc.xy;\n" \
+    "    return tex2d(t, uv * u_tscale[t]);\n" \
+    "}\n" \
+    "void main() {\n" \
+    "    vec4 vT3 = u_psprite != 0 ? vec4(gl_PointCoord, 1.0, 1.0) : vT3in;\n" \
+    "    Tf0 = fetch(0, vT0); Tf1 = fetch(1, vT1); Tf2 = fetch(2, vT2);\n" \
+    "    vec4 Tf3 = fetch(3, vT3);\n" \
+    "    uint ctl = pkw(32);\n" \
+    "    Rc0 = vec4(0.0); Rc1 = vec4(0.0); Rr1 = vec4(0.0); Rv1r0 = vec4(0.0); Ref = vec4(0.0);\n" \
+    "    Rfog = vec4(u_fogcolor.rgb, nv2a_fog(vFog));\n" \
+    "    Rv0 = vD0; Rv1 = vD1;\n" \
+    "    Rt0 = Tf0; Rt1 = Tf1; Rt2 = Tf2; Rt3 = Tf3;\n" \
+    "    Rr0 = vec4(0.0, 0.0, 0.0, Tf0.a);\n" \
+    "    int count = min(int(ctl & 255u), 8);\n" \
+    "    for (int i = 0; i < count; i++) {\n" \
+    "        uint cicw = pkw(i), cocw = pkw(8 + i), aicw = pkw(16 + i), aocw = pkw(24 + i);\n" \
+    "        Rc0 = u_c0[(ctl & (1u << 12)) != 0u ? i : 0];\n" \
+    "        Rc1 = u_c1[(ctl & (1u << 16)) != 0u ? i : 0];\n" \
+    "        vec3 cA = gin3(cicw >> 24), cB = gin3(cicw >> 16), cC = gin3(cicw >> 8), cD = gin3(cicw);\n" \
+    "        float aA = gin1(aicw >> 24), aB = gin1(aicw >> 16), aC = gin1(aicw >> 8), aD = gin1(aicw);\n" \
+    "        bool mux = (ctl & (1u << 8)) != 0u ? Rr0.a >= 0.5 : (int(Rr0.a * 255.0 + 0.5) & 1) != 0;\n" \
+    "        vec3 cAB = (cocw & (1u << 13)) != 0u ? vec3(dot(cA, cB)) : cA * cB;\n" \
+    "        vec3 cCD = (cocw & (1u << 12)) != 0u ? vec3(dot(cC, cD)) : cC * cD;\n" \
+    "        vec3 cS = (cocw & (1u << 14)) != 0u ? (mux ? cCD : cAB) : cAB + cCD;\n" \
+    "        float aAB = aA * aB, aCD = aC * aD;\n" \
+    "        float aS = (aocw & (1u << 14)) != 0u ? (mux ? aCD : aAB) : aAB + aCD;\n" \
+    "        uint cop = (cocw >> 15) & 7u, aop = (aocw >> 15) & 7u;\n" \
+    "        cAB = sb3(cAB, cop); cCD = sb3(cCD, cop); cS = sb3(cS, cop);\n" \
+    "        aAB = sb1(aAB, aop); aCD = sb1(aCD, aop); aS = sb1(aS, aop);\n" \
+    "        wr3((cocw >> 4) & 15u, cAB); wr3(cocw & 15u, cCD); wr3((cocw >> 8) & 15u, cS);\n" \
+    "        wr1((aocw >> 4) & 15u, aAB); wr1(aocw & 15u, aCD); wr1((aocw >> 8) & 15u, aS);\n" \
+    "        if ((cocw & (1u << 19)) != 0u) wr1((cocw >> 4) & 15u, cAB.b);\n" \
+    "        if ((cocw & (1u << 18)) != 0u) wr1(cocw & 15u, cCD.b);\n" \
+    "    }\n" \
+    "    uint cw0 = pkw(33), cw1 = pkw(34);\n" \
+    "    Rc0 = u_c0[0]; Rc1 = u_c1[0];\n" /* reg_name(.., stage 0): a final input never reads these (fin*) */ \
+    "    vec3 v1 = clamp(Rv1.rgb, 0.0, 1.0), r0 = clamp(Rr0.rgb, 0.0, 1.0);\n" \
+    "    Rv1r0 = vec4(((cw1 & 0x40u) != 0u ? 1.0 - v1 : v1) + ((cw1 & 0x20u) != 0u ? 1.0 - r0 : r0), 0.0);\n" \
+    "    if ((cw1 & 0x80u) != 0u) Rv1r0 = clamp(Rv1r0, 0.0, 1.0);\n" \
+    "    Ref = vec4(fin3(cw1 >> 24) * fin3(cw1 >> 16), 0.0);\n" \
+    "    vec3 fA = fin3(cw0 >> 24), fB = fin3(cw0 >> 16), fC = fin3(cw0 >> 8), fD = fin3(cw0);\n" \
+    "    fragColor = vec4(fA * fB + (1.0 - fA) * fC + fD, fin1(cw1 >> 8));\n" \
+    "    if (u_mark != 0) { fragColor = vec4(1.0, 0.0, 1.0, 1.0); return; }\n" \
+    "    fragColor = clamp(fragColor, 0.0, 1.0);\n" \
+    "    float ar = fragColor.a * 255.0;\n" \
+    "    bool pass = true;\n" \
+    "    if (u_alpha_func == 0x200) pass = false;\n" \
+    "    else if (u_alpha_func == 0x201) pass = ar <  u_alpha_ref;\n" \
+    "    else if (u_alpha_func == 0x202) pass = ar == u_alpha_ref;\n" \
+    "    else if (u_alpha_func == 0x203) pass = ar <= u_alpha_ref;\n" \
+    "    else if (u_alpha_func == 0x204) pass = ar >  u_alpha_ref;\n" \
+    "    else if (u_alpha_func == 0x205) pass = ar != u_alpha_ref;\n" \
+    "    else if (u_alpha_func == 0x206) pass = ar >= u_alpha_ref;\n" \
+    "    if (!pass) discard;\n" \
+    "}\n"
+
+int nv2a_uber_psh(char *buf, size_t cap)
+{
+    /* through printf like the rest: NV2A_BUMP_GLSL carries %% */
+    Out o = { buf, cap, 0 };
+    emit(&o, UBER_PSH_GLSL);
+    return o.overflow ? -1 : (int)(cap - o.left);
+}
+
+int nv2a_uber_psh_covers(const Nv2aPshKey *k)
+{
+    int t;
+    if (k->shadow & 0xFu)
+        return 0;                                    /* shadow-map stages */
+    for (t = 0; t < 4; t++)
+        if (((k->shader_program >> (5 * t)) & 0x1Fu) == 3u)
+            return 0;                                /* CUBE_MAP: a samplerCube binding */
+    return 1;
+}
+
 int nv2a_gl_psh(const Nv2aPshKey *k, char *buf, size_t cap)
 {
     Out o = { buf, cap, 0 };

@@ -11,3 +11,11 @@ from xemu and remaining the copyright of espes, Jannik Vogel and Matt Borgerson.
 
 Shipping the verbatim text alongside those files is an LGPL requirement, not
 a courtesy.
+
+Releases (licence option C, maintainer 2026-11-17): the generic release scripts
+(tools/release/port_release.ps1, port_release_linux.sh) put into every release
+`licenses/THIRD_PARTY_NOTICES.txt` (the top-level THIRD_PARTY_NOTICES.txt: every
+third-party part with its copyright and licence) and `licenses/source/` (from
+tools/release/lgpl_source.py: the complete source of the LGPL parts as built,
+with the headers they include and SOURCE.txt - toolkit commit, rebuild, relink).
+The licence review is docs/licence_apu_ac97_ohci.md.

@@ -836,6 +836,20 @@ typedef double   recomp_f64;
 #else
 #define RECOMP_PAUSE() ((void)0)
 #endif
+/* The back edge of a polling loop (tools/recomp/spin_detect.py, lifted with --spin-backoff / [recomp]
+ * spin_backoff): the barrier plus the runtime's backoff (src/kernel/kernel_spin.c) - the host hint first, then a
+ * yield, then short sleeps while the same wait goes on - so a guest waiting on another thread or the GPU does not
+ * burn a host core. */
+void xbox_spin_backoff(void);
+#define RECOMP_SPIN() do { RECOMP_BACKEDGE(); xbox_spin_backoff(); } while (0)
+/* After each read in a polling loop (spin_detect.py, always; step 6d): what the polled flag guards is read after
+ * the flag. ARM64: an acquire fence (dmb ishld). x86: a compiler barrier only - TSO orders the loads already; the
+ * MSVC 32-bit oracle gets the compiler barrier too (RECOMP_FENCE_LOAD would be an mfence there). */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define RECOMP_POLL_ACQUIRE() _ReadWriteBarrier()
+#else
+#define RECOMP_POLL_ACQUIRE() __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#endif
 #ifndef RECOMP_MEMQ
 #define RECOMP_MEMQ volatile
 #endif
@@ -866,6 +880,52 @@ typedef double   recomp_f64;
 #define VMEM8(addr)  (*(volatile recomp_u8  *)XBOX_PTR(addr))
 #define VMEM16(addr) (*(volatile recomp_u16 *)XBOX_PTR(addr))
 #define VMEM32(addr) (*(volatile recomp_u32 *)XBOX_PTR(addr))
+
+/* FSAVE's protected-mode image. Only state represented by the double-stack
+ * model is restored: CW, TOP, condition codes and eight registers.
+ * Tags, exception bits and the instruction/data pointers are not modeled; the
+ * image holds zeros there until the x87 environment is tracked.
+ * Upstream sp00nz v0.17.0 #277 (NoRain211, 47ea2b6); option-c form (U2 2026-11-19): the x87 state and guest
+ * memory come through the caller's ctx / base (the lifter emits recomp_fnsave(RECOMP_ARGS, ...)). */
+static inline void recomp_fnsave(RECOMP_PARAMS, uint32_t address, int short_env) {
+    unsigned stride = short_env ? 2u : 4u;
+    unsigned env = 7u * stride;
+    unsigned i;
+    (void)base;                     /* MEM* may use the global offset instead (XBOX_PTR outside generated code) */
+    for (i = 0; i < env; ++i) MEM8(address + i) = 0;
+    MEM16(address) = g_fp_control_word;
+    MEM16(address + stride) = (uint16_t)((g_fp_top << 11) | g_fp_cc);
+    for (i = 0; i < 8; ++i) {
+        uint64_t mant;
+        uint16_t se = recomp_f80_store(g_fp_stack[(g_fp_top + i) & 7u], &mant);
+        uint32_t slot = address + env + 10u * i;
+        MEM32(slot) = (uint32_t)mant;
+        MEM32(slot + 4) = (uint32_t)(mant >> 32);
+        MEM16(slot + 8) = se;
+    }
+    g_fp_control_word = 0x037fu;
+    g_fp_top = 0;
+    g_fp_cc = 0;
+    g_fp_cmp = 0;
+}
+
+static inline void recomp_frstor(RECOMP_PARAMS, uint32_t address, int short_env) {
+    unsigned stride = short_env ? 2u : 4u;
+    unsigned env = 7u * stride;
+    unsigned i;
+    (void)base;
+    uint16_t status = MEM16(address + stride);
+    g_fp_control_word = MEM16(address);
+    g_fp_top = (status >> 11) & 7u;
+    g_fp_cc = status & 0x4700u;
+    g_fp_cmp = (g_fp_cc & 0x0400u) ? 2 : (g_fp_cc & 0x4000u) ? 0
+        : (g_fp_cc & 0x0100u) ? -1 : 1;
+    for (i = 0; i < 8; ++i) {
+        uint32_t slot = address + env + 10u * i;
+        uint64_t mant = ((uint64_t)MEM32(slot + 4) << 32) | MEM32(slot);
+        g_fp_stack[(g_fp_top + i) & 7u] = recomp_f80_load(mant, MEM16(slot + 8));
+    }
+}
 
 /* ================================================================
  * SSE / XMM register state
@@ -1808,7 +1868,12 @@ static inline RecompMmx MMX_PSADBW_C(RecompMmx a, RecompMmx b) {
  * a count at or past the lane width gives zero (logical) or the sign (arithmetic),
  * the count being the whole 64-bit value. tests/mmx_sse2 compares both forms
  * on random inputs. RECOMP_MMX_SCALAR keeps the portable forms on x86 too.
- * Open item: a NEON path for ARM64 hosts, when Android work resumes. */
+ * ARM64 hosts get NEON forms (below, after the SSE2 ones; tests/mmx_neon). They
+ * were off until tests/mmx_neon passed on a real ARM64 device (maintainer
+ * 2026-11-18); L ran it on the S23 (SM8550, NDK r30 clang -O2) on 2026-11-19:
+ * PASS, 46 helpers, 920000 checks, NEON equal to the portable forms. Since then
+ * they are the default on ARM64; RECOMP_MMX_SCALAR keeps the portable forms
+ * (RECOMP_MMX_USE_NEON is no longer needed and still accepted). */
 #if !defined(RECOMP_MMX_SCALAR) && (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
 #include <emmintrin.h>
 #define RECOMP_MMX_SSE2 1
@@ -1875,6 +1940,92 @@ RECOMP_MMX_SSE2_PACK(MMX_PACKUSWB, _mm_packus_epi16)
 RECOMP_MMX_SSE2_PACK(MMX_PACKSSDW, _mm_packs_epi32)
 static inline uint32_t MMX_PMOVMSKB(RecompMmx a) { return (uint32_t)_mm_movemask_epi8(recomp_mmx_v(a)) & 0xFFu; }
 static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) { return recomp_mmx_r(_mm_sad_epu8(recomp_mmx_v(a), recomp_mmx_v(b))); }
+#elif !defined(RECOMP_MMX_SCALAR) && (defined(__aarch64__) || defined(_M_ARM64))
+/* -- NEON forms (ARM64 hosts; step 6d, maintainer 2026-11-16) ---
+ * The same helpers on one 64-bit D register each, with the portable forms'
+ * lane results (tests/mmx_neon compares both on random inputs, as tests/mmx_sse2
+ * does for x86). Shifts: NEON's vshl takes a signed per-lane count from the
+ * low byte, so the MMX rule (the whole 64-bit count; at or past the lane width
+ * zero, or the sign for the arithmetic shifts) is applied before it. */
+#include <arm_neon.h>
+#define RECOMP_MMX_NEON 1
+#define recomp_neon_id_u8(x) (x)
+#define vreinterpret_u8_u8 recomp_neon_id_u8     /* the u8 lanes of the macro below need no cast */
+static inline uint8x8_t recomp_mmx_n(RecompMmx a) { return vcreate_u8(a.q); }
+static inline RecompMmx recomp_mmx_nr(uint8x8_t v) { RecompMmx r; r.q = vget_lane_u64(vreinterpret_u64_u8(v), 0); return r; }
+#define RECOMP_MMX_NEON_BIN(NAME, T, SUF, EXPR) \
+    static inline RecompMmx NAME(RecompMmx a, RecompMmx b) { \
+        T x = vreinterpret_##SUF##_u8(recomp_mmx_n(a)), y = vreinterpret_##SUF##_u8(recomp_mmx_n(b)); \
+        return recomp_mmx_nr(vreinterpret_u8_##SUF(EXPR)); }
+RECOMP_MMX_NEON_BIN(MMX_PADDB, uint8x8_t, u8, vadd_u8(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PADDW, uint16x4_t, u16, vadd_u16(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PADDD, uint32x2_t, u32, vadd_u32(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PSUBB, uint8x8_t, u8, vsub_u8(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PSUBW, uint16x4_t, u16, vsub_u16(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PSUBD, uint32x2_t, u32, vsub_u32(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PADDSB, int8x8_t, s8, vqadd_s8(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PADDSW, int16x4_t, s16, vqadd_s16(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PSUBSB, int8x8_t, s8, vqsub_s8(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PSUBSW, int16x4_t, s16, vqsub_s16(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PADDUSB, uint8x8_t, u8, vqadd_u8(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PSUBUSB, uint8x8_t, u8, vqsub_u8(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PADDUSW, uint16x4_t, u16, vqadd_u16(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PSUBUSW, uint16x4_t, u16, vqsub_u16(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PMULLW, int16x4_t, s16, vmul_s16(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PMULHW, int16x4_t, s16, vshrn_n_s32(vmull_s16(x, y), 16))
+RECOMP_MMX_NEON_BIN(MMX_PAVGB, uint8x8_t, u8, vrhadd_u8(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PAVGW, uint16x4_t, u16, vrhadd_u16(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PMINSW, int16x4_t, s16, vmin_s16(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PMAXSW, int16x4_t, s16, vmax_s16(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PCMPEQB, uint8x8_t, u8, vceq_u8(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PCMPEQW, uint16x4_t, u16, vceq_u16(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PCMPEQD, uint32x2_t, u32, vceq_u32(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PCMPGTB, int8x8_t, s8, vreinterpret_s8_u8(vcgt_s8(x, y)))
+RECOMP_MMX_NEON_BIN(MMX_PCMPGTW, int16x4_t, s16, vreinterpret_s16_u16(vcgt_s16(x, y)))
+RECOMP_MMX_NEON_BIN(MMX_PCMPGTD, int32x2_t, s32, vreinterpret_s32_u32(vcgt_s32(x, y)))
+/* pmaddwd: the four 32-bit products, then adjacent pairs added (wrapping, as SSE2's) */
+static inline RecompMmx MMX_PMADDWD(RecompMmx a, RecompMmx b) {
+    int32x4_t p = vmull_s16(vreinterpret_s16_u8(recomp_mmx_n(a)), vreinterpret_s16_u8(recomp_mmx_n(b)));
+    int32x2_t s = vreinterpret_s32_u32(vpadd_u32(vreinterpret_u32_s32(vget_low_s32(p)), vreinterpret_u32_s32(vget_high_s32(p))));
+    return recomp_mmx_nr(vreinterpret_u8_s32(s));
+}
+#define RECOMP_MMX_NEON_SHIFT(NAME, T, SUF, ST, WIDTH, LEFT) \
+    static inline RecompMmx NAME(RecompMmx a, uint64_t cnt) { \
+        if (cnt >= (WIDTH)) return MMX_ZERO(); \
+        return recomp_mmx_nr(vreinterpret_u8_##SUF(vshl_##SUF(vreinterpret_##SUF##_u8(recomp_mmx_n(a)), \
+                                                             vdup_n_##ST(LEFT ? (int)cnt : -(int)cnt)))); }
+RECOMP_MMX_NEON_SHIFT(MMX_PSLLW, uint16x4_t, u16, s16, 16, 1)
+RECOMP_MMX_NEON_SHIFT(MMX_PSRLW, uint16x4_t, u16, s16, 16, 0)
+RECOMP_MMX_NEON_SHIFT(MMX_PSLLD, uint32x2_t, u32, s32, 32, 1)
+RECOMP_MMX_NEON_SHIFT(MMX_PSRLD, uint32x2_t, u32, s32, 32, 0)
+RECOMP_MMX_NEON_SHIFT(MMX_PSLLQ, uint64x1_t, u64, s64, 64, 1)
+RECOMP_MMX_NEON_SHIFT(MMX_PSRLQ, uint64x1_t, u64, s64, 64, 0)
+static inline RecompMmx MMX_PSRAW(RecompMmx a, uint64_t cnt) {
+    int c = cnt >= 16 ? 15 : (int)cnt;
+    return recomp_mmx_nr(vreinterpret_u8_s16(vshl_s16(vreinterpret_s16_u8(recomp_mmx_n(a)), vdup_n_s16((int16_t)-c))));
+}
+static inline RecompMmx MMX_PSRAD(RecompMmx a, uint64_t cnt) {
+    int c = cnt >= 32 ? 31 : (int)cnt;
+    return recomp_mmx_nr(vreinterpret_u8_s32(vshl_s32(vreinterpret_s32_u8(recomp_mmx_n(a)), vdup_n_s32(-c))));
+}
+/* Unpack: zip1 interleaves the low halves (the L form), zip2 the high halves (the H form). */
+RECOMP_MMX_NEON_BIN(MMX_PUNPCKLBW, uint8x8_t, u8, vzip1_u8(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PUNPCKHBW, uint8x8_t, u8, vzip2_u8(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PUNPCKLWD, uint16x4_t, u16, vzip1_u16(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PUNPCKHWD, uint16x4_t, u16, vzip2_u16(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PUNPCKLDQ, uint32x2_t, u32, vzip1_u32(x, y))
+RECOMP_MMX_NEON_BIN(MMX_PUNPCKHDQ, uint32x2_t, u32, vzip2_u32(x, y))
+/* Pack: both operands in one Q register, then the saturating narrow. */
+RECOMP_MMX_NEON_BIN(MMX_PACKSSWB, int16x4_t, s16, vreinterpret_s16_s8(vqmovn_s16(vcombine_s16(x, y))))
+RECOMP_MMX_NEON_BIN(MMX_PACKUSWB, int16x4_t, s16, vreinterpret_s16_u8(vqmovun_s16(vcombine_s16(x, y))))
+RECOMP_MMX_NEON_BIN(MMX_PACKSSDW, int32x2_t, s32, vreinterpret_s32_s16(vqmovn_s32(vcombine_s32(x, y))))
+static inline uint32_t MMX_PMOVMSKB(RecompMmx a) {
+    static const int8_t sh[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    return (uint32_t)vaddv_u8(vshl_u8(vshr_n_u8(recomp_mmx_n(a), 7), vld1_s8(sh)));
+}
+static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
+    RecompMmx r; r.q = (uint64_t)vaddlv_u8(vabd_u8(recomp_mmx_n(a), recomp_mmx_n(b))); return r;
+}
 #else
 #define MMX_PADDB MMX_PADDB_C
 #define MMX_PADDW MMX_PADDW_C

@@ -20,9 +20,21 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+#ifndef _WIN32
+#include <dirent.h>                         /* kill_tree: /proc */
+#include <signal.h>
+#include <sys/types.h>
+#endif
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>                        /* run_proc: the helpers' exit codes (OpenProcess / GetExitCodeProcess) */
+#endif
 
 #define LP 1024
 #define MAX_ARGS 256
+#define MAX_PROCS 72                        /* the build's tools at once (compilers: up to 64 threads) */
 #define TRAILER_MAGIC "XRPAYLD1"
 #define TRAILER_SIZE 48                 /* magic (8), payload offset (8, LE), release (32, NUL padded) */
 
@@ -40,12 +52,25 @@ typedef struct {
     int bundled;                        /* tools is a read-only, ready folder: no payload, no unpacking */
     char clang[LP], python[LP], rc[LP]; /* toolchain.txt: absolute; rc empty = no resource compiler */
     char ld[LP];                        /* toolchain.txt: the linker, empty = clang links */
-    char out[LP];                       /* the game: root/game_exe ({OUT}) */
+    char out[LP];                       /* the game: root/data/game_exe, Android root/game_exe ({OUT}) */
     XrSetupUi *ui;
     SDL_Mutex *log_mx;
     SDL_IOStream *log;
     double base, span;                  /* the running step's share of the bar */
     char step[128];
+    /* the player quit during the installation (close box / Alt+F4 / QUIT, "Quit anyway?" answered Yes - the
+     * maintainer 2026-11-23, every launcher): the running tools stopped, no further step, nothing half-made kept */
+    SDL_AtomicInt cancel;
+    SDL_Mutex *proc_mx;
+#ifdef __ANDROID__
+    long pids[MAX_PROCS];               /* run_proc's fork children running now */
+#else
+    SDL_Process *procs[MAX_PROCS];      /* the build's tools running now */
+#endif
+#ifdef _WIN32
+    HANDLE job;                         /* they and what they start (clang -> lld): stopped together, and gone
+                                           with the launcher if it dies (KILL_ON_JOB_CLOSE) */
+#endif
 } L;
 
 /* ── small helpers ─────────────────────────────────────────────────────── */
@@ -199,6 +224,142 @@ static int split_tabs(char *line, char **argv, int max)
     return n;
 }
 
+/* ── quitting during the installation (the maintainer 2026-11-23; model: option-p b42fb84) ──────────────── */
+
+static int cancelled(L *l) { return SDL_GetAtomicInt(&l->cancel) != 0; }
+
+#ifndef _WIN32
+/* Linux / Android: pid and every process below it (by /proc/<n>/stat's parent field) - the parent held first
+ * (SIGSTOP) so it starts no new one, then the children, then it */
+static void kill_tree(pid_t pid, int depth)
+{
+    DIR *d;
+    struct dirent *e;
+    if (pid <= 1 || depth > 16)
+        return;
+    kill(pid, SIGSTOP);
+    if ((d = opendir("/proc"))) {
+        while ((e = readdir(d))) {
+            char p[64], buf[512], *close_paren;
+            FILE *f;
+            long child = strtol(e->d_name, NULL, 10);
+            if (child <= 1)
+                continue;
+            snprintf(p, sizeof p, "/proc/%ld/stat", child);
+            if (!(f = fopen(p, "r")))
+                continue;
+            buf[0] = 0;
+            if (!fgets(buf, sizeof buf, f))
+                buf[0] = 0;
+            fclose(f);
+            /* "pid (comm) state ppid ...": comm may hold spaces and parentheses - after the last ')' */
+            if ((close_paren = strrchr(buf, ')'))) {
+                char state;
+                long ppid;
+                if (sscanf(close_paren + 1, " %c %ld", &state, &ppid) == 2 && ppid == (long)pid)
+                    kill_tree((pid_t)child, depth + 1);
+            }
+        }
+        closedir(d);
+    }
+    kill(pid, SIGKILL);
+}
+#endif
+
+/* a started tool into the list (Windows: into the job too); 0 = the player quit meanwhile - the caller stops it */
+#ifdef __ANDROID__
+static int proc_add(L *l, long pid)
+#else
+static int proc_add(L *l, SDL_Process *proc)
+#endif
+{
+    int i, ok = 0;
+    SDL_LockMutex(l->proc_mx);
+#ifdef _WIN32
+    if (l->job) {
+        HANDLE h = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE,
+                               (DWORD)SDL_GetNumberProperty(SDL_GetProcessProperties(proc), SDL_PROP_PROCESS_PID_NUMBER, 0));
+        if (h) {
+            if (!AssignProcessToJobObject(l->job, h))
+                lg(l, "a tool not in the launcher's job (error %lu)", (unsigned long)GetLastError());
+            CloseHandle(h);
+        }
+    }
+#endif
+    for (i = 0; i < MAX_PROCS; i++)
+#ifdef __ANDROID__
+        if (!l->pids[i]) {
+            l->pids[i] = pid;
+#else
+        if (!l->procs[i]) {
+            l->procs[i] = proc;
+#endif
+            ok = 1;
+            break;
+        }
+    if (!ok)
+        lg(l, "more than %d tools at once: one not in the list", MAX_PROCS);
+    ok = !cancelled(l);
+    SDL_UnlockMutex(l->proc_mx);
+    return ok;
+}
+
+#ifdef __ANDROID__
+static void proc_remove(L *l, long pid)
+#else
+static void proc_remove(L *l, SDL_Process *proc)
+#endif
+{
+    int i;
+    SDL_LockMutex(l->proc_mx);
+    for (i = 0; i < MAX_PROCS; i++)
+#ifdef __ANDROID__
+        if (l->pids[i] == pid)
+            l->pids[i] = 0;
+#else
+        if (l->procs[i] == proc)
+            l->procs[i] = NULL;
+#endif
+    SDL_UnlockMutex(l->proc_mx);
+}
+
+/* the player quit: every running tool (and what it started) stopped; the steps see cancelled() and end */
+static void stop_build_tools(L *l)
+{
+    int i, n = 0;
+    SDL_SetAtomicInt(&l->cancel, 1);
+    SDL_LockMutex(l->proc_mx);
+#ifdef _WIN32
+    if (l->job)
+        TerminateJobObject(l->job, 1);
+#endif
+    for (i = 0; i < MAX_PROCS; i++) {
+#ifdef __ANDROID__
+        if (l->pids[i]) {
+            kill_tree((pid_t)l->pids[i], 0);
+            n++;
+        }
+#else
+        if (l->procs[i]) {
+#ifndef _WIN32
+            kill_tree((pid_t)SDL_GetNumberProperty(SDL_GetProcessProperties(l->procs[i]), SDL_PROP_PROCESS_PID_NUMBER, 0), 0);
+#endif
+            SDL_KillProcess(l->procs[i], true);
+            n++;
+        }
+#endif
+    }
+    SDL_UnlockMutex(l->proc_mx);
+    lg(l, "quit during \"%s\" (the player): %d running tool(s) stopped", l->step, n);
+}
+
+/* polled by the main thread (run_job): the window's close answered Yes -> the tools stopped */
+static void check_quit(L *l)
+{
+    if (!cancelled(l) && l->ui && xr_setup_ui_cancelled(l->ui))
+        stop_build_tools(l);
+}
+
 /* ── processes (SDL3) ──────────────────────────────────────────────────── */
 
 /* runs argv in cwd, stdout + stderr appended to log_path (NULL: dropped);
@@ -209,8 +370,11 @@ static int split_tabs(char *line, char **argv, int max)
  * API 34. The environment is inherited (the loader's LD_LIBRARY_PATH / PYTHONHOME reach clang and python). */
 static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
 {
-    int fd = -1, nul = open("/dev/null", O_RDWR | O_CLOEXEC), st = 0, code = -1;
+    int fd = -1, nul, st = 0, code = -1;
     pid_t pid;
+    if (cancelled(l))
+        return -1;
+    nul = open("/dev/null", O_RDWR | O_CLOEXEC);
     if (log_path && (fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644)) < 0)
         lg(l, "cannot open %s: %s", log_path, strerror(errno));
     pid = fork();
@@ -230,9 +394,15 @@ static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
     if (pid < 0) {
         lg(l, "cannot start %s: fork: %s", argv[0], strerror(errno));
     } else {
+        if (!proc_add(l, (long)pid))
+            kill_tree(pid, 0);              /* (the player quit while it started) */
         while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
             ;
-        if (WIFEXITED(st)) {
+        proc_remove(l, (long)pid);
+        if (cancelled(l)) {
+            st = 0;
+            code = -1;                      /* stopped by the player: never "done" */
+        } else if (WIFEXITED(st)) {
             code = WEXITSTATUS(st);
             if (code == 127 || code == 126)
                 lg(l, "%s: exit %d (%s)", argv[0], code,
@@ -251,10 +421,14 @@ static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
 #else
 static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
 {
-    SDL_PropertiesID p = SDL_CreateProperties();
-    SDL_IOStream *out = log_path ? SDL_IOFromFile(log_path, "ab") : NULL;
+    SDL_PropertiesID p;
+    SDL_IOStream *out;
     SDL_Process *proc;
     int code = -1;
+    if (cancelled(l))
+        return -1;
+    p = SDL_CreateProperties();
+    out = log_path ? SDL_IOFromFile(log_path, "ab") : NULL;
     SDL_SetPointerProperty(p, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, argv);
     if (cwd)
         SDL_SetStringProperty(p, SDL_PROP_PROCESS_CREATE_WORKING_DIRECTORY_STRING, cwd);
@@ -267,14 +441,46 @@ static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
         SDL_SetNumberProperty(p, SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER, SDL_PROCESS_STDIO_NULL);
         SDL_SetNumberProperty(p, SDL_PROP_PROCESS_CREATE_STDERR_NUMBER, SDL_PROCESS_STDIO_NULL);
     }
+    /* The exit code: SDL_WaitProcess reports 0 for EVERY process started with
+     * SDL_PROP_PROCESS_CREATE_BACKGROUND_BOOLEAN, on every system (SDL_process.c) - so every helper (curl, tar,
+     * python, clang) looked successful whatever it returned (found in Option P's launcher, 2026-11-21).
+     * Windows needs "background" (no console window per helper): the code is read through a handle of our own,
+     * opened by PID right after the start. Elsewhere the helpers run as plain children (stdio is set above). */
+#ifdef _WIN32
     SDL_SetBooleanProperty(p, SDL_PROP_PROCESS_CREATE_BACKGROUND_BOOLEAN, true);
+#endif
     proc = SDL_CreateProcessWithProperties(p);
     SDL_DestroyProperties(p);
     if (!proc) {
         lg(l, "cannot start %s: %s", argv[0], SDL_GetError());
     } else {
+#ifdef _WIN32
+        DWORD pid = (DWORD)SDL_GetNumberProperty(SDL_GetProcessProperties(proc), SDL_PROP_PROCESS_PID_NUMBER, 0);
+        HANDLE h = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid) : NULL;
+        if (!proc_add(l, proc))
+            SDL_KillProcess(proc, true);    /* (the player quit while it started) */
         SDL_WaitProcess(proc, true, &code);
+        if (h) {
+            DWORD ec = 0;
+            WaitForSingleObject(h, INFINITE);
+            if (GetExitCodeProcess(h, &ec))
+                code = (int)ec;
+            CloseHandle(h);
+        } else {
+            lg(l, "%s: no handle for its exit code (pid %lu) - taken as failed", argv[0], (unsigned long)pid);
+            code = -1;
+        }
+#else
+        if (!proc_add(l, proc)) {
+            kill_tree((pid_t)SDL_GetNumberProperty(SDL_GetProcessProperties(proc), SDL_PROP_PROCESS_PID_NUMBER, 0), 0);
+            SDL_KillProcess(proc, true);    /* (the player quit while it started) */
+        }
+        SDL_WaitProcess(proc, true, &code);
+#endif
+        proc_remove(l, proc);
         SDL_DestroyProcess(proc);
+        if (cancelled(l))
+            code = -1;                      /* stopped by the player: never "done" */
     }
     if (out)
         SDL_CloseIO(out);
@@ -321,6 +527,12 @@ static int run_job(L *l, const char *step, double base, double span, int (*fn)(L
     snprintf(l->step, sizeof l->step, "%s", step);
     l->base = base;
     l->span = span;
+    /* the player quit between two steps: no further one */
+    check_quit(l);
+    if (cancelled(l)) {
+        lg(l, "%s: not started (the player quit)", step);
+        return 1;
+    }
     lg(l, "%s", step);
     t = SDL_CreateThread(job_main, "launcher step", &j);
     if (!t)
@@ -329,11 +541,16 @@ static int run_job(L *l, const char *step, double base, double span, int (*fn)(L
         char e[64];
         double f = progress ? progress(arg) : 0.0;
         snprintf(e, sizeof e, "%u s", (unsigned)((SDL_GetTicks() - t0) / 1000));
-        ui_say(l, f, e);
+        ui_say(l, f, cancelled(l) ? "stopping" : e);    /* (the window kept alive) */
+        check_quit(l);                  /* "Quit anyway?" answered Yes: the tools stopped, the step ends by itself */
         SDL_Delay(100);
     }
     SDL_WaitThread(t, NULL);
-    lg(l, "%s: %s after %u s", step, j.rc ? "FAILED" : "done", (unsigned)((SDL_GetTicks() - t0) / 1000));
+    check_quit(l);                      /* (answered while the step ended) */
+    if (cancelled(l) && !j.rc)
+        j.rc = 1;
+    lg(l, "%s: %s after %u s", step, cancelled(l) ? "STOPPED (the player quit)" : j.rc ? "FAILED" : "done",
+       (unsigned)((SDL_GetTicks() - t0) / 1000));
     return j.rc;
 }
 
@@ -496,6 +713,14 @@ static int setup_cancelled(void *ctx)
     return l->ui && xr_setup_ui_cancelled(l->ui);
 }
 
+/* the port window's own "which disc image?" page (launcher.h), NULL = the message box below */
+static int (*s_image_page)(void *ui, const char *disc, char *iso, size_t n, const char *note);
+
+void xr_launcher_set_image_page(int (*fn)(void *ui, const char *disc, char *iso, size_t n, const char *note))
+{
+    s_image_page = fn;
+}
+
 /* 1 = the game is there (sha1 filled), 0 = quit */
 static int ensure_game(L *l, const char *image_arg, char sha1[41])
 {
@@ -519,6 +744,11 @@ static int ensure_game(L *l, const char *image_arg, char sha1[41])
         o.image_path = picked[0] ? picked : NULL;
         rc = xr_game_setup(&o, &r);
         lg(l, "game: %s - %s", xr_game_setup_code_name(rc), r.message);
+        if (rc == XR_SETUP_CANCELLED || setup_cancelled(l)) {
+            SDL_SetAtomicInt(&l->cancel, 1);    /* the player quit during the import: no question, no message */
+            lg(l, "quit during the game's import (the player)");
+            return 0;
+        }
         if (rc == XR_SETUP_READY || rc == XR_SETUP_INSTALLED) {
             snprintf(sha1, 41, "%s", r.xbe_sha1);
             if (!sha1[0]) {
@@ -536,6 +766,17 @@ static int ensure_game(L *l, const char *image_arg, char sha1[41])
         }
         if (xr_no_dialogs())
             return 0;
+        if (s_image_page) {
+            /* the port window's page (Linux: the launcher window's first page, the folder fixed) */
+            char note[300];
+            int pr;
+            snprintf(note, sizeof note, "%s not found here.", l->cfg->game);
+            pr = s_image_page(l->ui, l->cfg->disc, picked, sizeof picked, note);
+            if (pr == 1)
+                continue;               /* (picked set: install from it) */
+            if (pr == 0)
+                return 0;
+        }
         switch (no_game_dialog(l)) {
         case B_CHOOSE:
             if (!choose_image(l, picked, sizeof picked))
@@ -629,6 +870,10 @@ static int unpack_job(L *l, void *a)
         const ZipEntry *e = zip_entry(z, i);
         char rel[LP], dst[LP], *slash;
         void *data;
+        if (cancelled(l)) {
+            bad = 1;                    /* the player quit: no release.txt - the next start unpacks again */
+            break;
+        }
         if (!zip_safe_path(e->name, rel, sizeof rel)) {
             lg(l, "payload: refused entry %s", e->name);
             bad = 1;
@@ -815,6 +1060,10 @@ static int unpack_tc_job(L *l, void *a)
     for (i = 0; i < zip_count(z) && !bad; i++) {
         const ZipEntry *e = zip_entry(z, i);
         char rel[LP], dst[LP], *slash;
+        if (cancelled(l)) {
+            bad = 1;                    /* the player quit: the half folder goes below, no marker */
+            break;
+        }
         if (!zip_safe_path(e->name, rel, sizeof rel)) {
             lg(l, "compiler zip: refused entry %s", e->name);
             bad = 1;
@@ -837,8 +1086,11 @@ static int unpack_tc_job(L *l, void *a)
         SDL_AddAtomicInt(&t->unpack.done_n, 1);
     }
     zip_close(z);
-    if (bad)
+    if (bad) {
+        if (cancelled(l))
+            rm_tree(tmp);
         return 1;
+    }
     lg(l, "compiler zip: %d entries unpacked", t->unpack.total);
     join(from, sizeof from, tmp, t->folder);
     join(to, sizeof to, l->tools, t->dest);
@@ -915,7 +1167,7 @@ static int lift_job(L *l, void *a)
     snprintf(py, sizeof py, "%s", l->python);
     join(cwd, sizeof cwd, l->tools, "lifter");
     join(logp, sizeof logp, l->build, "lift.log");
-    for (line = SDL_strtok_r(text, "\r\n", &save); line; line = SDL_strtok_r(NULL, "\r\n", &save)) {
+    for (line = SDL_strtok_r(text, "\r\n", &save); line && !cancelled(l); line = SDL_strtok_r(NULL, "\r\n", &save)) {
         static char exp[MAX_ARGS][LP];
         char *raw[MAX_ARGS], *argv[MAX_ARGS + 3];
         int n = split_tabs(line, raw, MAX_ARGS), i, k = 0;
@@ -941,7 +1193,8 @@ static int lift_job(L *l, void *a)
         {
             Uint64 t0 = SDL_GetTicks();
             if (run_proc(l, argv, cwd, logp) != 0) {
-                lg(l, "lift step %s failed - see %s", raw[0], logp);
+                if (!cancelled(l))
+                    lg(l, "lift step %s failed - see %s", raw[0], logp);
                 SDL_free(text);
                 return 1;
             }
@@ -951,7 +1204,7 @@ static int lift_job(L *l, void *a)
         SDL_AddAtomicInt(&la->p.done_n, 1);
     }
     SDL_free(text);
-    return 0;
+    return cancelled(l) ? 1 : 0;
 }
 
 /* ── 6. compile + link ─────────────────────────────────────────────────── */
@@ -1042,7 +1295,7 @@ static int SDLCALL compile_worker(void *p)
     for (;;) {
         int i = SDL_AddAtomicInt(&b->next, 1), k = 0, j;
         char *argv[MAX_ARGS + 8], logp[LP];
-        if (i >= b->nsrc)
+        if (i >= b->nsrc || cancelled(w->l))
             break;
         argv[k++] = b->clang;
         for (j = 0; j < b->ncc; j++)
@@ -1055,7 +1308,8 @@ static int SDLCALL compile_worker(void *p)
         snprintf(logp, sizeof logp, "%s.log", b->objp[i]);
         SDL_RemovePath(logp);
         if (run_proc(w->l, argv, w->l->root, logp) != 0) {
-            lg(w->l, "compile failed: %s - see %s", b->src[i], logp);
+            if (!cancelled(w->l))
+                lg(w->l, "compile failed: %s - see %s", b->src[i], logp);
             SDL_AddAtomicInt(&b->failed, 1);
         }
         SDL_AddAtomicInt(&b->p.done_n, 1);
@@ -1093,7 +1347,7 @@ static int compile_job(L *l, void *a)
     for (i = 0; i < n; i++)
         if (t[i])
             SDL_WaitThread(t[i], NULL);
-    return SDL_GetAtomicInt(&b->failed) ? 1 : 0;
+    return SDL_GetAtomicInt(&b->failed) || cancelled(l) ? 1 : 0;
 }
 
 static int link_job(L *l, void *a)
@@ -1117,7 +1371,7 @@ static int link_job(L *l, void *a)
         if (run_proc(l, rv, l->root, logp) != 0)
             return 1;
     }
-    join(out, sizeof out, l->root, l->game_exe);
+    snprintf(out, sizeof out, "%s", l->out);
     argv[k++] = b->ld[0] ? b->ld : b->clang;
     for (i = 0; i < b->nlink && strcmp(b->link[i], "{OBJECTS}"); i++)
         ;
@@ -1154,7 +1408,12 @@ static int link_job(L *l, void *a)
         void *d;
         if (bs > s)
             s = bs;
+        /* next to the game (its libraries): data/ on desktops, the root on Android */
+#ifdef __ANDROID__
         join(dst, sizeof dst, l->root, s ? s + 1 : b->copy[i]);
+#else
+        join(dst, sizeof dst, l->data, s ? s + 1 : b->copy[i]);
+#endif
         if (!(d = SDL_LoadFile(b->copy[i], &n)) || !SDL_SaveFile(dst, d, n)) {
             lg(l, "cannot copy %s: %s", b->copy[i], SDL_GetError());
             SDL_free(d);
@@ -1185,7 +1444,7 @@ static int start_game(L *l)
     char *argv[] = { exe, NULL };
     SDL_PropertiesID p = SDL_CreateProperties();
     SDL_Process *proc;
-    join(exe, sizeof exe, l->root, l->game_exe);
+    snprintf(exe, sizeof exe, "%s", l->out);
     SDL_SetPointerProperty(p, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, argv);
     SDL_SetStringProperty(p, SDL_PROP_PROCESS_CREATE_WORKING_DIRECTORY_STRING, l->root);
     SDL_SetNumberProperty(p, SDL_PROP_PROCESS_CREATE_STDIN_NUMBER, SDL_PROCESS_STDIO_NULL);
@@ -1284,8 +1543,13 @@ static int read_bundled_release(L *l)
 /* Shipped data files (2026-11-16; Orta's pipeline list pipelist_orta_pal.bin belongs in
  * data\, the payload unpacks to tools\ or is the AppImage's read-only share/<slug>/tools): every plain file in
  * tools/data/ is copied to root/data/ when it is missing there or the release changed (data/shipped_release.txt).
- * data\ stays safe to delete - the next start puts the files back. Top level only, names through safe_rel. */
-typedef struct { L *l; int force, copied, failed; } ShipArg;
+ * data\ stays safe to delete - the next start puts the files back. Top level only, names through safe_rel.
+ * The same for tools/runtime/ -> next to the game exe (data/ on desktops - the release layout, only the launcher on
+ * top; Android: root/, beside libGAME.so; data/shipped_runtime.txt): the shipped APU module xbox_apu.dll /
+ * libxbox_apu.so (licence option C, maintainer 2026-11-17) - a user's own build put there in its place stays until
+ * the next release. A copy an older install put on top (root/, before 2026-11-23) is removed when the file is
+ * shipped into data/ (`stale`). */
+typedef struct { L *l; const char *sub, *to, *stale; int force, copied, failed; } ShipArg;
 
 static int safe_rel(const char *p);
 
@@ -1296,41 +1560,61 @@ static SDL_EnumerationResult SDLCALL ship_cb(void *u, const char *dir, const cha
     (void)dir;
     if (!safe_rel(name) || !strcmp(name, ".") || !strcmp(name, ".."))
         return SDL_ENUM_CONTINUE;
-    join(src, sizeof src, a->l->tools, "data");
+    join(src, sizeof src, a->l->tools, a->sub);
     join(src, sizeof src, src, name);
     if (!is_file(src))
         return SDL_ENUM_CONTINUE;
-    join(dst, sizeof dst, a->l->data, name);
+    join(dst, sizeof dst, a->to, name);
+    if (a->stale) {
+        char old[LP];
+        join(old, sizeof old, a->stale, name);
+        if (is_file(old) && SDL_RemovePath(old))
+            lg(a->l, "shipped %s: removed the old %s from the top folder (it is in data now)", a->sub, name);
+    }
     if (!a->force && is_file(dst))
         return SDL_ENUM_CONTINUE;
     if (SDL_CopyFile(src, dst))
         a->copied++;
     else {
         a->failed++;
-        lg(a->l, "shipped data: cannot copy %s: %s", name, SDL_GetError());
+        lg(a->l, "shipped %s: cannot copy %s: %s", a->sub, name, SDL_GetError());
     }
     return SDL_ENUM_CONTINUE;
 }
 
-static void ship_data(L *l)
+/* tools/<sub>/* -> <to>/, marked by data/<mark>; stale: a folder an older layout put the same files in (removed) */
+static void ship_dir(L *l, const char *sub, const char *to, const char *mark_name, const char *stale)
 {
     char dir[LP], mark[LP], want[64], *have;
     ShipArg a;
-    join(dir, sizeof dir, l->tools, "data");
+    join(dir, sizeof dir, l->tools, sub);
     if (!is_dir(dir))
         return;
-    join(mark, sizeof mark, l->data, "shipped_release.txt");
+    join(mark, sizeof mark, l->data, mark_name);
     snprintf(want, sizeof want, "%s\n", l->release);
     have = read_text(mark);
     memset(&a, 0, sizeof a);
     a.l = l;
+    a.sub = sub;
+    a.to = to;
+    a.stale = stale;
     a.force = !have || strcmp(have, want) != 0;
     SDL_free(have);
     SDL_EnumerateDirectory(dir, ship_cb, &a);
     if (a.copied || a.failed)
-        lg(l, "shipped data: %d file(s) copied to data/%s", a.copied, a.failed ? " (some failed)" : "");
+        lg(l, "shipped %s: %d file(s) copied to %s%s", sub, a.copied, to, a.failed ? " (some failed)" : "");
     if (a.force && !a.failed)
         write_text(mark, want);
+}
+
+static void ship_data(L *l)
+{
+    ship_dir(l, "data", l->data, "shipped_release.txt", NULL);
+#ifdef __ANDROID__
+    ship_dir(l, "runtime", l->root, "shipped_runtime.txt", NULL);           /* beside libGAME.so */
+#else
+    ship_dir(l, "runtime", l->data, "shipped_runtime.txt", l->root);        /* beside data/<game> (2026-11-23) */
+#endif
 }
 
 /* ── main ──────────────────────────────────────────────────────────────── */
@@ -1339,7 +1623,7 @@ int xr_launcher_main(const XrLauncherConfig *cfg, int argc, char **argv)
 {
     static L l;
     const char *image = NULL, *base;
-    int repair = 0, no_start = 0, i, ok = 0;
+    int repair = 0, no_start = 0, i, ok = 0, building = 0;
     char p[LP], sha1[41] = "", stamp_want[256], *stamp_have, logp[LP], xbe[LP];
     Uint64 payload_ofs = 0;
 
@@ -1364,15 +1648,33 @@ int xr_launcher_main(const XrLauncherConfig *cfg, int argc, char **argv)
     }
 #endif
     find_tools(&l, base);
-    join(l.out, sizeof l.out, l.root, l.game_exe);
     join(l.game, sizeof l.game, l.root, "game");
     join(l.data, sizeof l.data, l.root, "data");
+    /* Release layout (maintainer, 2026-11-21): the top folder holds only the launcher, the built game lies in
+     * data/ (host_paths: an exe in data/ has the folder above as its root). Android keeps libGAME.so in the root
+     * (the app's loader opens it there). */
+#ifdef __ANDROID__
+    join(l.out, sizeof l.out, l.root, l.game_exe);
+#else
+    join(l.out, sizeof l.out, l.data, l.game_exe);
+#endif
     join(l.build, sizeof l.build, l.data, "build");
     join(l.gen, sizeof l.gen, l.build, "gen");
     join(l.pipe, sizeof l.pipe, l.build, "pipeline");
     join(l.obj, sizeof l.obj, l.build, "obj");
     make_folders(&l);
     l.log_mx = SDL_CreateMutex();
+    l.proc_mx = SDL_CreateMutex();
+#ifdef _WIN32
+    /* the build's tools in one job: stopped together when the player quits, and gone with the launcher if it dies
+     * (or the setup window's process ends it) */
+    if ((l.job = CreateJobObjectW(NULL, NULL))) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jl;
+        memset(&jl, 0, sizeof jl);
+        jl.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(l.job, JobObjectExtendedLimitInformation, &jl, sizeof jl);
+    }
+#endif
     join(logp, sizeof logp, l.data, "launcher.log");
     l.log = SDL_IOFromFile(logp, "wb");
     lg(&l, "%s launcher in %s (tools %s, %s)", cfg->window_title, l.root, l.tools,
@@ -1397,7 +1699,18 @@ int xr_launcher_main(const XrLauncherConfig *cfg, int argc, char **argv)
     snprintf(stamp_want, sizeof stamp_want, "%s\n%s\n", l.release, sha1);
     join(p, sizeof p, l.build, "stamp.txt");
     stamp_have = read_text(p);
-    join(xbe, sizeof xbe, l.root, l.game_exe);
+    snprintf(xbe, sizeof xbe, "%s", l.out);
+    {
+        /* an install from before the data/ layout: its game next to the launcher moves into data/ (no rebuild) */
+        char old[LP];
+        join(old, sizeof old, l.root, l.game_exe);
+        if (!is_file(l.out) && is_file(old)) {
+            if (SDL_RenamePath(old, l.out))
+                lg(&l, "moved %s into data (release layout)", l.game_exe);
+            else
+                lg(&l, "could not move %s into data: %s", l.game_exe, SDL_GetError());
+        }
+    }
     if (repair) {
         lg(&l, "repair: building again");
         rm_tree(l.build);
@@ -1434,6 +1747,7 @@ int xr_launcher_main(const XrLauncherConfig *cfg, int argc, char **argv)
     if (!ensure_toolchain(&l))
         goto out;
     /* 5. lift */
+    building = 1;                       /* (from here a quit removes the half-made game) */
     rm_tree(l.build);
     SDL_CreateDirectory(l.gen);
     SDL_CreateDirectory(l.pipe);
@@ -1487,7 +1801,27 @@ int xr_launcher_main(const XrLauncherConfig *cfg, int argc, char **argv)
     ship_data(&l);
     ok = no_start || start_game(&l);
 out:
+    if (cancelled(&l)) {
+        /* the player quit during the installation: nothing half-made stays that a later start (or the player)
+         * could take as the game - the stamp is written only after a whole build (and build/ with the old one was
+         * removed when it began); the game's exe and the translated sources / objects go; the next start builds
+         * again from the beginning. An installed game is never touched before the build began. */
+        if (building) {
+            rm_tree(l.pipe);
+            rm_tree(l.gen);
+            rm_tree(l.obj);
+            if (is_file(l.out) && !SDL_RemovePath(l.out))
+                lg(&l, "cannot remove the half-built %s: %s", l.out, SDL_GetError());
+            join(p, sizeof p, l.build, "stamp.txt");
+            SDL_RemovePath(p);
+        }
+        lg(&l, "stopped by the player%s", building ? " - the half-built game removed, the next start builds again" : "");
+    }
     xr_setup_ui_close(l.ui);
+#ifdef _WIN32
+    if (l.job)
+        CloseHandle(l.job);             /* (KILL_ON_JOB_CLOSE: anything left of the build goes with it) */
+#endif
     if (l.log)
         SDL_CloseIO(l.log);
     SDL_Quit();

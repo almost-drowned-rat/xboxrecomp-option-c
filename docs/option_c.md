@@ -128,9 +128,9 @@ Findings that shaped the runtime:
 
 ## 4. Open items
 
-- **ARM64 memory ordering** (before the first ARM64 build): a compiler barrier does not order accesses across
-  threads there. Spin-waits and lock-free flags in game code (plain accesses + `RECOMP_BACKEDGE`) need
-  acquire/release semantics on ARM64.
+- **ARM64 memory ordering:** polling loops, the NV2A kickoff, interlocked operations and kernel objects are ordered
+  now (section 12); what stays open is a lock-free hand-off between two guest threads with plain loads and stores in
+  game code - no known title needs it, and a title that does gets its producer site release-fenced by a hook.
 - **AC97 refill needs the EP DSP** - only for the console's own digital (AC97) output path, not for stereo, which
   the VP mix carries, and not for the 5.1 output below, which takes the GP's six speaker feeds directly.
 - **Menu CPU load:** Panzer Dragoon Orta's 2D menus cost slightly more CPU on option-c than the other Orta
@@ -316,3 +316,45 @@ line says otherwise.
   found in `game/` used to be deleted after a verified install, one picked elsewhere was kept. Now every image stays
   where it is; the message and `game/README.txt` say the player may delete it after the install. The next start finds
   `game/default.xbe` first and never installs again because an image lies beside it (`tests/game_setup`).
+
+## 12. Changes since the v1.2.1 snapshot (Orta Recompiled v1.3.0)
+
+- **Licences in every release:** `THIRD_PARTY_NOTICES.txt` and the corresponding source of the LGPL parts
+  (`tools/release/lgpl_source.py`, taken from this public snapshot at the release's tag). The **APU emulation is a
+  replaceable shared library** (`xbox_apu.dll` / `libxbox_apu.so`, `docs/apu_module.md`): the game exe holds no LGPL
+  code from the APU; OHCI is its own module too. `src/apu/qemu_shim.h` checked line by line: no QEMU code, MIT.
+- **Launcher:** the release layout is only the launcher on top and the game in `data/`; the helpers' real exit codes
+  (SDL reports 0 for background processes); **quitting during the installation asks first** ("The installation is
+  not finished. Quit anyway?") and then stops every tool (a job object on Windows, the process tree on Linux /
+  Android) and removes the half-built game; **the launcher windows of ps2recomp-option-p** - one design for every
+  project: Windows 95 look on Windows (`src/launcher/port_setup_ui_win95.c`, replaces `port_setup_win32.c`), Windows
+  2000 look on Linux (`src/launcher/port_setup_ui_win2000_sdl.c`, font Liberation Sans under the SIL OFL 1.1). Both
+  show a first page with the disc image and the install folder and then the build's progress (step, bar,
+  percentage) in the same window, also for an update's rebuild; on Linux messages and questions are drawn inside the
+  window, and "game not found" asks on that page again (`xr_launcher_set_image_page`).
+- **SHADER COMPILE: HYBRID** (`docs/hybrid_ubershader.md`), the default on Windows and Linux: a draw whose pipeline
+  is not built yet is drawn with an uber fragment shader (graphics pipeline libraries) and, without its vertex
+  program yet, through a CPU bridge, instead of being skipped. Orta's first level on a first start: about 590 skipped
+  draws before, about 70 now. Android stays on WAIT. The pipeline list can also be built in the background
+  (`RECOMP_VK_PIPELIST_BG`, off by default).
+- **Frame pacing** in the settings file only (`frame_pacing`: `timer` / `display` x `paced` / `immediate`, `auto` =
+  display + paced where the display paces, 60 Hz included); the vblank hold sits right before the present at
+  `FLIP_INCREMENT_WRITE`.
+- **PERFORMANCE overlay** with FPS, FRAME TIME (the longest frame of the last half second) and GAME SPEED - no
+  averages: a wait between two new pictures longer than 1.5x what the picture asked for counts as stopped, never
+  above 100 %; the `[speed]` log gives every second and every 5 s the slowest one. Status overlays and the shader
+  notice share one layout (DejaVu Sans Mono Bold).
+- **UPSCALING FSR** (AMD FidelityFX FSR 1.0, MIT: EASU + RCAS, presets and sharpness), **F12 screenshots** (PNG in
+  `screenshots/`), an internal F9 debug menu for development builds (`XR_DEBUG_PANEL`, off in releases), the start
+  log names CPU, RAM, power plan, OS / Wine and the graphics driver. The RECOMP OPTIONS layout for new ports:
+  `docs/recomp_options_layout.md`.
+- **nv2a_vk fixes:** the stage's border colour for address mode BORDER, no alpha-one view for surfaces sampled with
+  BORDER, no 1-pixel line at the top / left edge (window crop, MSAA).
+- **Lifter / kernel (from upstream v0.17.0):** flag fixes (#276-#278; `tools/recomp/fpdiff.py` in the register-context
+  form), timers that tick, the bare `\Device\CdRom0`, directory opens, SCSI pass-through, end-of-file on read-only
+  handles, `FILE_NO_INTERMEDIATE_BUFFERING` no longer mapped to unbuffered I/O (4Kn drives). Instruction hooks and
+  soundtrack callbacks get the guest register context; `tools/ctx_rewrite.py` moves a port's hand-written C to it.
+- **ARM64:** acquire fences in polling loops (`tools/recomp/spin_detect.py`), NEON forms of the 46 MMX helpers as the
+  default (`tests/mmx_neon`, passed on a Snapdragon 8 Gen 2).
+- **Templates:** the Android APK packaging (`templates/android/`, from Orta Recompiled, MIT) and the `.recomp.json`
+  template (`templates/recomp.json`).

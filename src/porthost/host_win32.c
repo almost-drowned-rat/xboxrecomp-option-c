@@ -39,10 +39,11 @@ extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 #define APU_TRAP_BASE 0xFE800000u
 #define APU_TRAP_END  0xFE880000u
 
-/* USB host controllers (toolkit src/usb/ohci.c, RECOMP_USB): the title's own
+/* USB host controllers (the OHCI module, toolkit src/usb, RECOMP_USB): the title's own
  * XPP driver finds its gamepads through their trapped registers. */
-extern int xbox_OhciOwnsAddress(uint32_t xbox_va);
-extern int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
+#if !defined(XR_PORTHOST_NO_USB)
+#include "ohci.h"
+#endif
 
 static void host_log_drain(void);
 
@@ -647,9 +648,18 @@ int host_init(int argc, char **argv, HostOptions *opt)
     }
     slash = strrchr(opt->exe_dir, '\\');
     if (slash) *slash = '\0';
-    join(opt->game_dir, opt->exe_dir, "game");
-    join(opt->save_dir, opt->exe_dir, "saves");
-    join(opt->data_dir, opt->exe_dir, "data");
+    {
+        /* Release layout (maintainer, 2026-11-21): the game exe lies in <root>\data, the launcher alone on top - so
+         * an exe in a folder named "data" takes the folder above as its root (as xbox_host_root, host_paths.c). */
+        char root[HOST_PATH_MAX];
+        char *b = strrchr(opt->exe_dir, '\\');
+        snprintf(root, sizeof root, "%s", opt->exe_dir);
+        if (b && !_stricmp(b + 1, "data"))
+            root[b - opt->exe_dir] = '\0';
+        join(opt->game_dir, root, "game");
+        join(opt->save_dir, root, "saves");
+        join(opt->data_dir, root, "data");
+    }
 
     for (i = 1; i < argc; i++) {
         const char *a = argbuf[i], *v = (i + 1 < argc) ? argbuf[i + 1] : NULL;

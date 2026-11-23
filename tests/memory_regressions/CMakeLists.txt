@@ -3,6 +3,7 @@ project(memory_regressions_test C)
 # Cross-platform, like tests/kernel_bridge: the heap and the memory bridge are
 # the same code on both hosts.
 set(CMAKE_C_STANDARD 11)
+set(XBOXRECOMP_APU_SHARED OFF CACHE BOOL "" FORCE)   # the emulation's internals: the static APU
 add_subdirectory(../.. runtime)
 add_executable(memory_regressions_test test_main.c)
 target_include_directories(memory_regressions_test PRIVATE ../../src/kernel)

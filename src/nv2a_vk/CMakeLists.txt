@@ -18,6 +18,7 @@ add_library(xbox_nv2a_vk STATIC
     nv2a_vk.c
     range_alloc.c
     shader_pass.c
+    status_overlay.c
     ../nv2a_gl/gl_vsh.c
     ../nv2a_gl/gl_vsh_ff.c
     ../nv2a_gl/gl_psh.c
@@ -37,6 +38,35 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/smaa_hlsl.h
      "/* generated from third_party/smaa/SMAA.hlsl (src/nv2a_vk/CMakeLists.txt) */\n"
      "static const char s_smaa_hlsl[] = { ${_smaa_hex} 0 };\n")
 target_include_directories(xbox_nv2a_vk PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+# UPSCALING: FSR (2026-11-22): AMD FidelityFX Super Resolution 1.0, vendored unchanged in third_party/fsr1
+# (GPUOpen-Effects/FidelityFX-FSR a21ffb8, MIT; see NOTICE). Both headers go into the binary as bytes (fsr1_glsl.h,
+# made here at configure time) and are compiled with glslang at run time as the EASU / RCAS passes. No library.
+set(_fsr_a ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr1/ffx_a.h)
+set(_fsr_1 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr1/ffx_fsr1.h)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_fsr_a} ${_fsr_1})
+file(READ ${_fsr_a} _fsr_a_hex HEX)
+file(READ ${_fsr_1} _fsr_1_hex HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _fsr_a_hex "${_fsr_a_hex}")
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _fsr_1_hex "${_fsr_1_hex}")
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/fsr1_glsl.h
+     "/* generated from third_party/fsr1/ffx_a.h + ffx_fsr1.h (src/nv2a_vk/CMakeLists.txt) */\n"
+     "static const char s_ffx_a_h[] = { ${_fsr_a_hex} 0 };\n"
+     "static const char s_ffx_fsr1_h[] = { ${_fsr_1_hex} 0 };\n")
+
+# Status overlays (status_overlay.c: FPS / frame time, the shader notice; 2026-11-19): the bundled font DejaVu Sans
+# Mono Bold 2.37 (third_party/dejavu, Bitstream Vera licence + public-domain DejaVu changes; see NOTICE) goes into
+# the binary as bytes (dejavu_mono_bold.h, made here at configure time) and is rasterised with stb_truetype v1.26
+# (third_party/stb, MIT / public domain; header only). Only this font is ever read.
+set(_font_src ${CMAKE_CURRENT_SOURCE_DIR}/third_party/dejavu/DejaVuSansMono-Bold.ttf)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_font_src})
+file(READ ${_font_src} _font_hex HEX)
+file(SIZE ${_font_src} _font_len)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _font_hex "${_font_hex}")
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/dejavu_mono_bold.h
+     "/* generated from third_party/dejavu/DejaVuSansMono-Bold.ttf (src/nv2a_vk/CMakeLists.txt) */\n"
+     "static const unsigned char s_font_ttf[] = { ${_font_hex} };\n"
+     "static const unsigned int s_font_ttf_len = ${_font_len}u;\n")
 
 # Slang shaders (shader_pass.c): librashader's C header only, vendored in
 # third_party/librashader (SnowflakePowered/librashader v0.12.0, MIT; see
@@ -72,6 +102,12 @@ else()
 endif()
 message(STATUS "nv2a_vk: C++ runtime for C consumers: ${_nv2a_vk_cxx_rt}")
 target_link_libraries(xbox_nv2a_vk PUBLIC ${_nv2a_vk_cxx_rt})
+
+# F9 debug menu (nv2a_vk.c, 2026-11-22): internal only. ON for dev builds; every release build passes
+# -DXR_DEBUG_PANEL=OFF (docs/porting_guide.md release steps). Even when compiled in, an installed release (a
+# release.txt next to the game folder) never opens it.
+option(XR_DEBUG_PANEL "F9 debug menu (dev / test builds only, never in releases)" ON)
+target_compile_definitions(xbox_nv2a_vk PRIVATE XR_DEBUG_PANEL=$<BOOL:${XR_DEBUG_PANEL}>)
 
 if(NOT MSVC)
     target_compile_options(xbox_nv2a_vk PRIVATE -Wall -Wextra -Wno-unused-parameter

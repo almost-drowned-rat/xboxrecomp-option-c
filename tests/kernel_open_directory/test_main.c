@@ -1,0 +1,51 @@
+#include "kernel.h"
+#include "xbox_memory_layout.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Upstream sp00nz v0.17.0 #292 (MattSG, f2fa37e); option-c stubs 2026-11-19 (U2). */
+recomp_func_t recomp_lookup(uint32_t a);
+recomp_func_t recomp_lookup(uint32_t a) { (void)a; abort(); }
+recomp_func_t recomp_lookup_manual(uint32_t a);
+recomp_func_t recomp_lookup_manual(uint32_t a) { (void)a; abort(); }
+
+/* Opens `xbox_path` through xbox_NtCreateFile and returns the NTSTATUS. */
+static NTSTATUS open_path(const char *xbox_path, ULONG options)
+{
+    XBOX_ANSI_STRING name;
+    XBOX_OBJECT_ATTRIBUTES attrs;
+    XBOX_IO_STATUS_BLOCK ios;
+    HANDLE h = NULL;
+    NTSTATUS st;
+    name.Length = name.MaximumLength = (USHORT)strlen(xbox_path);
+    name.Buffer = (PCHAR)xbox_path;
+    attrs.RootDirectory = NULL;
+    attrs.ObjectName = &name;
+    attrs.Attributes = 0;
+    st = xbox_NtCreateFile(&h, GENERIC_READ, &attrs, &ios, NULL, 0,
+                           1, XBOX_FILE_OPEN, options);
+    if (NT_SUCCESS(st)) xbox_NtClose(h);
+    return st;
+}
+
+int main(void)
+{
+    char root[MAX_PATH], dir[MAX_PATH], sub[MAX_PATH];
+    int ok = 1;
+    GetTempPathA(MAX_PATH, root);
+    sprintf(dir, "%sxrecomp-open-dir-%lu", root, GetCurrentProcessId());
+    sprintf(sub, "%s\\SaveSlot", dir);
+    if (!CreateDirectoryA(dir, NULL) || !CreateDirectoryA(sub, NULL)) return 10;
+    xbox_path_init(dir, NULL);
+
+    /* A title may open an existing directory without FILE_DIRECTORY_FILE. */
+    if (open_path("D:\\SaveSlot", 0) != 0) { puts("FAIL open directory without FILE_DIRECTORY_FILE"); ok = 0; }
+    /* FILE_NON_DIRECTORY_FILE must still refuse a directory. */
+    if (open_path("D:\\SaveSlot", XBOX_FILE_NON_DIRECTORY_FILE) == 0) { puts("FAIL non-directory open of a directory succeeded"); ok = 0; }
+
+    RemoveDirectoryA(sub); RemoveDirectoryA(dir);
+    if (!ok) return 1;
+    puts("PASS: existing directory opens without FILE_DIRECTORY_FILE");
+    return 0;
+}

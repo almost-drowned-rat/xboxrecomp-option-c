@@ -4932,6 +4932,25 @@ static void bridge_NtDeviceIoControlFile(X86Ctx *ctx)
             return;
         }
 
+        /* Any other command sent as IOCTL_SCSI_PASS_THROUGH_DIRECT (READ DVD STRUCTURE, INQUIRY, ...) is answered
+         * the same way: GOOD, and the DataBuffer holds defined bytes (zero: there is no disc to describe) instead of
+         * whatever the title's heap held. Upstream sp00nz v0.17.0 #294 (MattSG, 71f22da), 2026-11-19 (U2); here the
+         * guest buffer is checked before it is written. */
+        if (ioctl == 0x4D014u && in_va && in_len >= 44) {
+            uint32_t data_va  = BRIDGE_MEM32(in_va + 20);
+            uint32_t data_len = BRIDGE_MEM32(in_va + 12);
+            uint32_t i;
+
+            fprintf(stderr, "  [FILE] DVD SCSI command 0x%02X, %u bytes -> zeroed\n", BRIDGE_MEM8(in_va + 28), data_len);
+            if (data_va && data_len && bridge_buf_ok(data_va, data_len, "NtDeviceIoControlFile"))
+                for (i = 0; i < data_len; i++)
+                    BRIDGE_MEM8(data_va + i) = 0;
+            BRIDGE_MEM8(in_va + 2) = 0;              /* ScsiStatus = GOOD */
+            bridge_write_iostatus(ios_va, 0, in_len);
+            g_eax = 0;
+            return;
+        }
+
         fprintf(stderr, "  [FILE] DVD device IOCTL 0x%X (in=%u out=%u) "
                         "-> STATUS_SUCCESS\n", ioctl, in_len, out_len);
         if (out_va && out_len) {
@@ -8708,9 +8727,15 @@ static void bridge_NtCreateTimer(X86Ctx *ctx)
     HANDLE h;
 
     (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
 
-    h = CreateWaitableTimerW(NULL, TRUE, NULL);
+    if (STACK_ARG(0) && !bridge_buf_ok(STACK_ARG(0), 4, "NtCreateTimer")) {
+        g_eax = 0xC0000005u;                /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+    /* TimerType 0 = NotificationTimer (stays signalled), 1 = SynchronizationTimer (released waiter resets it):
+     * XAPI's CreateWaitableTimer(bManualReset = FALSE) asks for the second. Upstream sp00nz v0.17.0 #265
+     * (Raajik, 0878a8a), taken into the ctx form 2026-11-19 (U2). */
+    h = CreateWaitableTimerW(NULL, STACK_ARG(2) == 0, NULL);
     if (!h) {
         fprintf(stderr, "  [KERNEL] NtCreateTimer: CreateWaitableTimerW failed (error %u)\n",
                 GetLastError());
@@ -8870,17 +8895,39 @@ static void bridge_NtSetIoCompletion(X86Ctx *ctx)
 }
 
 /* --- NtSetTimerEx (ordinal 229, 8 args = 32 bytes) --- */
+/* NTSTATUS NtSetTimerEx(HANDLE TimerHandle, PLARGE_INTEGER DueTime, PTIMER_APC_ROUTINE TimerApcRoutine,
+ *                       KPROCESSOR_MODE ApcMode, PVOID TimerContext, BOOLEAN WakeTimer, LONG Period,
+ *                       PBOOLEAN PreviousState);
+ * XAPI's SetWaitableTimer. It succeeded without arming anything, so a title clocked by a waitable timer never
+ * ticked (SSX On Tour's 60 Hz frame clock: its "Saving..." screen waited forever). Upstream sp00nz v0.17.0 #265
+ * (Raajik, 0878a8a), taken into the ctx form 2026-11-19 (U2). A timer APC is not delivered (logged once). */
 static void bridge_NtSetTimerEx(X86Ctx *ctx)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    (void)STACK_ARG(7);
-    g_eax = 0;
+    HANDLE   h       = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t due_va  = STACK_ARG(1);
+    uint32_t apc     = STACK_ARG(2);
+    LONG     period  = (LONG)STACK_ARG(6);
+    uint32_t prev_va = STACK_ARG(7);
+    LARGE_INTEGER due;
+
+    if (!h) {
+        g_eax = 0xC0000008u;                /* STATUS_INVALID_HANDLE */
+        return;
+    }
+    if (!bridge_buf_ok(due_va, 8, "NtSetTimerEx")
+            || (prev_va && !bridge_buf_ok(prev_va, 1, "NtSetTimerEx"))) {
+        g_eax = 0xC0000005u;                /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+    due.QuadPart = (LONGLONG)((uint64_t)BRIDGE_MEM32(due_va) | ((uint64_t)BRIDGE_MEM32(due_va + 4) << 32));
+    if (apc) {
+        static int warned;
+        if (!warned++)
+            fprintf(stderr, "  [KERNEL] NtSetTimerEx: timer APC 0x%08X not delivered\n", apc);
+    }
+    if (prev_va)                            /* the prior state is not tracked: "was not signalled" */
+        BRIDGE_MEM8(prev_va) = 0;
+    g_eax = SetWaitableTimer(h, &due, period, NULL, NULL, FALSE) ? 0 : 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
 }
 
 /* --- NtSignalAndWaitForSingleObjectEx (ordinal 230, 5 args = 20 bytes) --- */

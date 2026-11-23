@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(apu_fe_trap_test C)
 set(CMAKE_C_STANDARD 11)
+set(XBOXRECOMP_APU_SHARED OFF CACHE BOOL "" FORCE)   # the emulation's internals: the static APU
 add_subdirectory(../.. runtime)
 add_executable(apu_fe_trap_test test_main.c)
 target_include_directories(apu_fe_trap_test PRIVATE ../../src ../../src/apu)

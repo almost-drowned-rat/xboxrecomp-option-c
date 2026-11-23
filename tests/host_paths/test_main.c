@@ -67,6 +67,14 @@ int main(void)
          "/tmp/.mount_X/", "/tmp/.mount_X/orta", 0);
     rule("no appdir", "/tmp/.mount_X/orta", "/home/p/Orta.AppImage", NULL, "/tmp/.mount_X/", "/tmp/.mount_X/orta", 0);
     rule("empty exe", "", NULL, NULL, "", "", 0);
+    /* release layout 2026-11-21: the game exe in data/ - the root is the folder above */
+    rule("data windows", "D:\\Games\\Orta\\data\\ORTA.exe", NULL, NULL, "D:\\Games\\Orta\\",
+         "D:\\Games\\Orta\\data\\ORTA.exe", 0);
+    rule("data posix", "/home/p/orta/data/orta", NULL, NULL, "/home/p/orta/", "/home/p/orta/data/orta", 0);
+    rule("data case", "D:\\Games\\Orta\\Data\\ORTA.exe", NULL, NULL, "D:\\Games\\Orta\\",
+         "D:\\Games\\Orta\\Data\\ORTA.exe", 0);
+    rule("not data", "/home/p/orta/mydata/orta", NULL, NULL, "/home/p/orta/mydata/", "/home/p/orta/mydata/orta", 0);
+    rule("data at top", "/data/orta", NULL, NULL, "/", "/data/orta", 0);
 
     r = xbox_host_root();
     s = xbox_host_self();

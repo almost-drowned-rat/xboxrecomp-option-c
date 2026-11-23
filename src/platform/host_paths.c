@@ -73,6 +73,17 @@ int xbox_host_paths_resolve(const char *exe, const char *appimage, const char *a
     }
     dir_of(root, root_n, exe);
     copy(self, self_n, exe);
+    {
+        /* Release layout (maintainer, 2026-11-21, every port and system): the top folder holds only
+         * <game>_launcher, the game executable lies in data/. So an exe in a folder named "data" (any case) has
+         * the folder above as its root - game/, saves/, media/ and data/ itself stay where they were. */
+        size_t k = strlen(root), i;
+        int data = k >= 6 && is_sep(root[k - 1]) && is_sep(root[k - 6]);
+        for (i = 0; data && i < 4; i++)
+            data = (root[k - 5 + i] | 0x20) == "data"[i];
+        if (data)
+            root[k - 5] = 0;
+    }
     return 0;
 }
 

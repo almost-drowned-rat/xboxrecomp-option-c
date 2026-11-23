@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: MIT
+// option-c Android APK template (templates/android; from Panzer Dragoon Orta Recomp's packaging/android by O and
+// taken into the toolkit as MIT with the maintainer's word, 2026-11-19). One public APK per port: the game
+// is compiled ON THE DEVICE once from the player's own disc; no game code is ever part of the APK. A port's build
+// script points Gradle at this tree and passes its names and paths as -P properties (README.md).
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+    plugins {
+        id 'com.android.application' version '9.5.1'
+    }
+}
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = 'xboxrecomp-android'
+include ':app'

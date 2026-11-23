@@ -463,6 +463,13 @@ NTSTATUS __stdcall xbox_NtCreateFile(
      * says created / opened / overwritten. */
     int existed = GetFileAttributesW(win_path) != INVALID_FILE_ATTRIBUTES;
 
+    /* An existing directory opens without FILE_DIRECTORY_FILE too, as NT does, but Win32 only allows that with
+     * backup semantics (the directory branch): it failed with access denied. FILE_NON_DIRECTORY_FILE still refuses.
+     * Upstream sp00nz v0.17.0 #292 (MattSG, f2fa37e), 2026-11-19 (U2). */
+    if (existed && !(CreateOptions & (XBOX_FILE_DIRECTORY_FILE | XBOX_FILE_NON_DIRECTORY_FILE))
+        && (GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY))
+        CreateOptions |= XBOX_FILE_DIRECTORY_FILE;
+
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (existed && CreateDisposition == XBOX_FILE_CREATE) {
             g_xbox_last_file_error = ERROR_ALREADY_EXISTS;
@@ -484,8 +491,11 @@ NTSTATUS __stdcall xbox_NtCreateFile(
          * root this way ("\Device\Harddisk0\Partition5\", now a folder rather than the partition image). */
         if (existed && (GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY) && !(CreateOptions & 0x40))
             flags_and_attrs |= FILE_FLAG_BACKUP_SEMANTICS;
-        if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
-            flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
+        /* XBOX_FILE_NO_INTERMEDIATE_BUFFERING (0x8, titles open data files with 0x4C) is NOT passed on as
+         * FILE_FLAG_NO_BUFFERING: Win32 then wants offset, length and buffer aligned to the HOST volume's sector
+         * size, and the title only aligns to the Xbox's 512 bytes. On a 4096-byte-sector drive every 512 / 3584-byte
+         * read failed - THPS 2X issue #22 (no shaders / sounds, crash after the intro). The host cache is harmless
+         * (tests/kernel_file_nobuf). */
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
         DWORD access = xbox_access_to_win32(DesiredAccess);
@@ -718,6 +728,30 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
     }
 }
 
+/* The access a handle was granted (0 if it cannot be read), for failure reports: ERROR_ACCESS_DENIED on a handle
+ * says little without it. Upstream sp00nz v0.17.0 #245 (BearddOddity, d8611d8), 2026-11-19 (U2). */
+static ULONG handle_granted_access(HANDLE h)
+{
+    typedef LONG (WINAPI *query_object_fn)(HANDLE, int, PVOID, ULONG, PULONG);
+    static query_object_fn query;
+    ULONG info[14];                 /* PUBLIC_OBJECT_BASIC_INFORMATION */
+    if (!query)
+        query = (query_object_fn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject");
+    if (!query || query(h, 0 /* ObjectBasicInformation */, info, sizeof info, NULL) < 0)
+        return 0;
+    return info[1];                 /* GrantedAccess */
+}
+
+/* Setting a file's end or its allocation needs write access, on the Xbox as on NT: the I/O manager answers
+ * STATUS_ACCESS_DENIED for a handle opened without FILE_WRITE_DATA before the file system sees the call. XAPI's
+ * SetEndOfFile on a save a title opened only to read reached the host call, failed with err=5 and warned each time.
+ * Unknown access (the query failed) counts as writable, so the host call still decides. (#245) */
+static int handle_may_write(HANDLE h)
+{
+    ULONG granted = handle_granted_access(h);
+    return !granted || (granted & (FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL)) != 0;
+}
+
 NTSTATUS __stdcall xbox_NtSetInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
@@ -741,14 +775,20 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             LARGE_INTEGER cur, zero = {0};
+            if (!handle_may_write(FileHandle)) {
+                XBOX_TRACE(XBOX_LOG_FILE, "SetEndOfFile on a read-only handle: access denied");
+                IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+                return STATUS_ACCESS_DENIED;
+            }
             SetFilePointerEx(FileHandle, zero, &cur, FILE_CURRENT);
             SetFilePointerEx(FileHandle, info->EndOfFile, NULL, FILE_BEGIN);
             if (!SetEndOfFile(FileHandle)) {
+                DWORD err = GetLastError();
                 xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                    "SetEndOfFile failed: size=%lld err=%u",
-                    (long long)info->EndOfFile.QuadPart, GetLastError());
+                    "SetEndOfFile failed: size=%lld err=%u access=0x%08X",
+                    (long long)info->EndOfFile.QuadPart, err, (unsigned)handle_granted_access(FileHandle));
                 SetFilePointerEx(FileHandle, cur, NULL, FILE_BEGIN);
-                return STATUS_UNSUCCESSFUL;
+                return err == ERROR_ACCESS_DENIED ? STATUS_ACCESS_DENIED : STATUS_UNSUCCESSFUL;
             }
             if (cur.QuadPart <= info->EndOfFile.QuadPart)
                 SetFilePointerEx(FileHandle, cur, NULL, FILE_BEGIN);
@@ -768,6 +808,10 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_END_OF_FILE_INFORMATION info =
                 (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             FILE_ALLOCATION_INFO fai;
+            if (!handle_may_write(FileHandle)) {               /* needs write access, as SetEndOfFile (#245) */
+                IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+                return STATUS_ACCESS_DENIED;
+            }
             fai.AllocationSize = info->EndOfFile;
             if (!SetFileInformationByHandle(FileHandle, FileAllocationInfo,
                                             &fai, sizeof(fai))) {
@@ -1451,6 +1495,14 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     int fd;
     int existed = access(host_path, F_OK) == 0;
+    {
+        /* An existing directory opens without FILE_DIRECTORY_FILE too, as NT does (the Win32 branch above,
+         * upstream #292): here a write open of it failed with EISDIR. */
+        struct stat ds;
+        if (existed && !(CreateOptions & (XBOX_FILE_DIRECTORY_FILE | XBOX_FILE_NON_DIRECTORY_FILE))
+            && stat(host_path, &ds) == 0 && S_ISDIR(ds.st_mode))
+            CreateOptions |= XBOX_FILE_DIRECTORY_FILE;
+    }
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF) {
             if (mkdir(host_path, 0755) != 0 && errno == EEXIST
@@ -1704,6 +1756,10 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         }
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+            if ((fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY) {   /* needs write access (#245, the Win32 one) */
+                IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+                return STATUS_ACCESS_DENIED;
+            }
             if (ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
                 return STATUS_UNSUCCESSFUL;
             IoStatusBlock->Status = STATUS_SUCCESS;
@@ -1718,6 +1774,10 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             off_t want = (off_t)info->EndOfFile.QuadPart;
             struct stat st;
+            if ((fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY) {   /* needs write access (#245) */
+                IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+                return STATUS_ACCESS_DENIED;
+            }
             if (want < 0 || fstat(fd, &st) != 0)
                 return STATUS_INVALID_PARAMETER;
             if (want < st.st_size) {

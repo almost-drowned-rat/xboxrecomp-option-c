@@ -12,7 +12,7 @@ header, the toolkit's NOTICE, `git log --follow` per file. Not legal advice - th
 | src/apu/apu_core.c, apu_vp.c, apu_dsp.c | xemu (hw/xbox/mcpx), extracted; (c) 2012 espes, 2018-2019 Jannik Vogel, 2019-2025 Matt Borgerson | **LGPL-2.1-or-later** |
 | src/apu/apu_regs.h, apu_state.h, apu_debug.h, fpconv.h, xbox_adpcm.h, apu.h | xemu, same authors | **LGPL-2.1-or-later** |
 | src/apu/apu_shim.h | this project's own (hosts the xemu code) | LGPL-2.1-or-later by choice (NOTICE) |
-| src/apu/qemu_shim.h | this project's own (QEMU type stand-ins, written for the NV2A extraction, now only the APU's) | MIT (toolkit) - **to confirm**: the header names no licence and no copied QEMU code; a line-by-line check against QEMU's headers is open |
+| src/apu/qemu_shim.h | upstream toolkit (sp00nz, 7a71ed2 2026-03-10; QEMU type stand-ins, written for the NV2A extraction, now only the APU's) | **MIT (toolkit) - checked 2026-11-17, see below** |
 | src/apu/apu_dsp56k.c/.h, apu_gp.c/.h | Takedawn's xboxrecomp fork, written from Motorola's DSP56300 manual + the title's image ("No emulator's code") | MIT ((c) 2026 sp00nz) |
 | src/apu/apu_resample.h | Takedawn's fork e34e52e | MIT |
 | src/apu/apu_lowpass.h | own (Chamberlin's filter, replaced xemu's GPLv2 svf.h) | MIT |
@@ -24,6 +24,42 @@ header, the toolkit's NOTICE, `git log --follow` per file. Not legal advice - th
 So: **the LGPL part is the MCPX APU core** (core, voice processor, DSP glue, register/state headers); the DSP56k
 interpreter, the GP model, AC97 and the whole OHCI / USB pad side are MIT. No GPL-only file is in the tree (xemu's
 GPLv2 svf.h and DSP headers were removed earlier, NOTICE "Derived algorithms").
+
+### qemu_shim.h: line check against QEMU (2026-11-17)
+
+Compared with xemu's QEMU headers (xemu's `include/qemu/`: queue.h, bitmap.h, bitops.h,
+thread / timer / memory / pci declarations). Result: **no QEMU code copied, no GPL / LGPL text**:
+- The file keeps QEMU's *names* (QemuMutex, qemu_mutex_lock, QTAILQ_*, set_bit, error_report, g_malloc0, ...) so
+  that xemu's APU code compiles - an interface, implemented anew: threading on Win32 CRITICAL_SECTION /
+  CONDITION_VARIABLE, timers on QueryPerformanceCounter, memory / PCI / VGA / VMState as empty stubs.
+- QTAILQ_*: the classic BSD layout (`tqe_next` / `tqe_prev`), not QEMU's union / `tqe_circ` version; QEMU's
+  queue.h is itself BSD-3 (from NetBSD) - either way no copyleft.
+- set_bit / clear_bit / test_bit / bitmap_zero: one-line standard idioms, written differently from QEMU's
+  LGPL bitops.h / bitmap.h (no BIT_MASK / BIT_WORD, no small_nbits path).
+- ctz32, muldiv64, ROUND_UP, container_of, KiB / MiB, ldl_le_p: trivial one-liners on compiler builtins.
+- Author: the upstream toolkit (sp00nz, 2026-03-10 / 05-27 / 10-02), under the toolkit's MIT licence.
+
+So it stays MIT; nothing to replace. An explicit MIT header line would only state what holds already - left
+for the maintainer (no licence text changed without his word).
+
+## Maintainer's decision 2026-11-17: option C
+
+- From now on **every release carries the LGPL sources** of the APU core (incl. this project's changes) and a
+  **THIRD_PARTY_NOTICES** file (every MIT / BSD / LGPL notice) - built into the generic release scripts
+  (tools/release/port_release.ps1, port_release_linux.sh).
+- For the existing **Orta v1.1.2**, the same sources + notices are prepared as a release attachment, uploaded
+  only on the maintainer's word.
+- qemu_shim.h checked before the next release: MIT (above).
+- With the encapsulation the APU core becomes a **replaceable shared library on every platform** (Windows,
+  Linux, Android). **Done (2026-11-17, docs/apu_module.md):** the APU module `xbox_apu.dll` /
+  `libxbox_apu.so` holds the whole emulation (the LGPL xemu core and the MIT DSP / GP / AC97 / trap files); the
+  exe loads it through `apu_module.h` (one export, ABI-checked), the release ships it in `runtime/` and the
+  launcher puts it next to the game exe. A user replaces it there (or sets `RECOMP_APU_MODULE`) with one built
+  from `licenses/source/` - LGPL-2.1 section 6(b) ("a suitable shared library mechanism") on Windows, Linux and
+  Android, without relinking the game. The exe no longer contains LGPL code from the APU (the static build,
+  `XBOXRECOMP_APU_SHARED=OFF`, is kept for the unit tests). `src/nv2a_gl/gl_vsh_ff.c` (xemu, LGPL) stays in the
+  renderer: it is linked statically as before and covered by the source bundle and the relinkable objects.
+  OHCI stays a static module (MIT).
 
 ## How a release uses them
 
@@ -54,6 +90,4 @@ GPLv2 svf.h and DSP headers were removed earlier, NOTICE "Derived algorithms").
 | **B** | A + ship the LGPL APU sources inside every release (`licenses\source\apu\`, ~250 KB) | small (release scripts) | duty 2 met by the release itself, independent of the other repository (section 6a) |
 | **C** | B + the encapsulation he ordered: the APU (and OHCI) as their own module, on Windows / Linux as a shared library (`xbox_apu.dll` / `.so`, model conker-live-recompiled `xemu_apu.dll`), with a THIRD_PARTY_NOTICES file | the encapsulation task | the LGPL code is a separable, replaceable part (section 6b) on PC; Android keeps it static or ships the `.so` in the APK |
 
-Recommendation: **B now** (before the next Orta release; no change of any licence), **C with the
-encapsulation**. Open for him: A, B or C; and whether qemu_shim.h should get an explicit MIT header after the
-line check.
+The recommendation was B now, C with the encapsulation; the maintainer chose **C** (2026-11-17, above).

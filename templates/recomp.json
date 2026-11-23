@@ -1,0 +1,15 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "<the game's title as it shipped>",
+  "wikidata": "Q<digits - check that the item is this game, not the series or a sequel>",
+  "system": "Xbox",
+  "type": "recomp",
+  "original": [
+    { "region": "<USA | Europe | Japan>", "serial": "<product code on the disc, e.g. MS-012>" }
+  ],
+  "project": "<Game> Recompiled",
+  "status": "released",
+  "targets": ["Windows"],
+  "toolchain": "xboxrecomp-option-c",
+  "approach": "Static recompilation of the player's own disc on the first start, Vulkan renderer"
+}

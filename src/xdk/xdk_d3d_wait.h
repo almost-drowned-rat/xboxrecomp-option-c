@@ -21,8 +21,9 @@
  * submitted (put) value; target: BlockOnTime's first stack argument. The exit test is the XDK's own (unsigned):
  * done when (put - target) >= (put - *sem). target == put is left alone (D3D kicks the pushbuffer off itself
  * first). Sleeps 0.25 ms per check (host_sleep_ns, no spin), 250 ms at most. Does nothing without RECOMP_PB_EXEC.
- * Next step (maintainer 2026-11-15, step 4): the four values from the port's game.toml and the wrap emitted by the
- * lifter, so a port needs no hand-written override at all. */
+ * Since step 6c (2026-11-17) the four values can come from the port's variant file instead ([d3d_block_on_time],
+ * tools/gameconfig.py) and the lifter emits this wrap (gen/recomp_hle.c), so a port needs no hand-written override;
+ * one in recomp_manual.c still wins. */
 #ifndef XDK_D3D_WAIT_H
 #define XDK_D3D_WAIT_H
 

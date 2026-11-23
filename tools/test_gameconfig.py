@@ -149,3 +149,37 @@ def test_seeds_to_toml_keeps_every_seed_and_the_observed_reading_of_tools_disasm
     with pytest.raises(ValueError, match="unknown key"):
         seeds_to_toml.convert([{"start": "0x1", "end": "0x2"}])
     json.dumps(seeds)                                # input untouched
+
+
+BOT = "[d3d_block_on_time]\nfunction = 0x002AFF90\ndevice = 0x002BB788\nsem_off = 0x30\nput_off = 0x2C\n"
+
+
+def test_d3d_block_on_time_per_variant(tmp_path):
+    game, us, pal = _setup(tmp_path, us_extra=BOT)
+    c = gameconfig.load(game, us)
+    assert c.block_on_time == {"function": 0x2AFF90, "device": 0x2BB788, "sem_off": 0x30, "put_off": 0x2C}
+    assert "BlockOnTime 0x002AFF90" in gameconfig.describe(c)
+    assert gameconfig.load(game, pal).block_on_time is None
+
+
+@pytest.mark.parametrize("bad, match", [
+    (BOT.replace("put_off = 0x2C\n", ""), "missing"),
+    (BOT.replace("sem_off = 0x30", 'sem_off = "0x30"'), "expected int"),
+    (BOT.replace("device = 0x002BB788", "device = 0"), "32-bit address"),
+    (BOT + "extra = 1\n", "unknown key"),
+])
+def test_d3d_block_on_time_errors(tmp_path, bad, match):
+    game, us, _ = _setup(tmp_path, us_extra=bad)
+    with pytest.raises(ValueError, match=match):
+        gameconfig.load(game, us)
+
+
+def test_hle_wrapper_file(tmp_path):
+    from tools.recomp.__main__ import write_hle_wrappers, HLE_FILE
+    write_hle_wrappers(str(tmp_path), {"function": 0x2AFF90, "device": 0x2BB788, "sem_off": 0x30, "put_off": 0x2C})
+    text = (tmp_path / HLE_FILE).read_text(encoding="utf-8")
+    assert "void sub_002AFF90(RECOMP_PARAMS)" in text
+    assert "xdk_d3d_block_on_time(0x002BB788u, 0x30u, 0x2Cu, MEM32(esp + 4));" in text
+    assert "sub_002AFF90_gen(ctx, base);" in text
+    write_hle_wrappers(str(tmp_path), None)          # no entry: the file stays, without a wrapper
+    assert "sub_002AFF90" not in (tmp_path / HLE_FILE).read_text(encoding="utf-8")

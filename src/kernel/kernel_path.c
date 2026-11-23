@@ -74,6 +74,10 @@ typedef struct {
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                     PATH_GAME,  SUB_NONE        },
+    /* The bare device, for a title that opens the volume itself (it failed with "path not found"; Partition2-5
+     * already map without a separator). After the rule above, so paths under it still match that one. Upstream
+     * sp00nz v0.17.0 #291 (MattSG, bad9bb5), 2026-11-19 (U2). */
+    { "\\Device\\CdRom0",                       PATH_GAME,  SUB_NONE        },
     /* E:\UDATA and E:\TDATA: the saved games and the title's persistent
      * data, which XAPI's save-game and title-data calls open by device path
      * (\Device\Harddisk0\Partition1\UDATA\<title id>\...). Under the

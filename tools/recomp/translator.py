@@ -242,6 +242,12 @@ INSN_HOOKS = {}
 # sub_X_gen for the original) with a rebuild, without a re-lift.
 WEAK_FUNCTIONS = False
 
+# --spin-backoff / [recomp] spin_backoff (step 6c): the back edge of a polling loop (spin_detect.py) becomes
+# RECOMP_SPIN() - the barrier plus the runtime's backoff - instead of RECOMP_BACKEDGE(). SPIN_SITES counts the
+# polling loops found (with or without the backoff: each gets RECOMP_POLL_ACQUIRE after its reads, step 6d).
+SPIN_BACKOFF = False
+SPIN_SITES = 0
+
 
 def weaken(name, code):
     """--weak-functions: the body becomes name_gen, name a weak alias of it."""
@@ -1800,6 +1806,10 @@ class FunctionTranslator:
     _CARRY_CC = frozenset({
         "b", "nae", "c", "ae", "nb", "nc", "be", "na", "a", "nbe",
     })
+    # shl's OF is the result's sign XOR the carry out, so these read _cf too.
+    _OF_CC = frozenset({
+        "o", "no", "l", "nge", "ge", "nl", "le", "ng", "g", "nle",
+    })
 
     @staticmethod
     def _function_needs_cf(instructions):
@@ -1829,6 +1839,8 @@ class FunctionTranslator:
                          or last_setter in ("inc", "dec")
                          or last_setter in BT_MODIFY
                          or last_setter == "rep-compare")):
+                return True
+            if cc in FunctionTranslator._OF_CC and last_setter in ("shl", "sal"):
                 return True
             if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m
@@ -2557,12 +2569,30 @@ class FunctionTranslator:
                         self._hook_targets.add(v)
         return set(self._hook_plan) | self._hook_targets
 
-    def _hook_lines(self, hook, instructions):
-        """C statements for one hook at the start of its block."""
+    def _hook_lines(self, hook, instructions, has_ebp=False):
+        """C statements for one hook at the start of its block.
+
+        A hook gets the guest's register context (2026-11-18, for
+        THPS 2X 2.0 with the maintainer's OK: 18 of its 20 hooks read or write
+        registers): `void name(RECOMP_PARAMS)` / `int name(RECOMP_PARAMS)`,
+        called with RECOMP_ARGS. eax, ecx, edx, ebx, esi, edi and esp are ctx
+        fields (recomp_types.h g_*); ebp is a C local of the function (FPO
+        scratch, see the declarations), so when the function
+        has it, it is handed over through g_ebp and taken back afterwards -
+        a hook that writes ebp is seen by the code after it. g_ebp itself is
+        put back as it was: it is the nearest published frame for frameless
+        callees and must not change meaning because a hook ran. Not handed
+        over: the function's local _flags (a hook decides through its return
+        value and on_true / on_false, not through the guest's flags)."""
         name = hook["call"]
         tag = f"/* hook 0x{hook['at']:08X}{' after' if hook['after'] else ''} */"
+        if has_ebp:
+            pre = "uint32_t hook_g_ebp_ = g_ebp; g_ebp = ebp; "
+            post = " ebp = g_ebp; g_ebp = hook_g_ebp_;"
+        else:
+            pre = post = ""
         if hook["on_true"] is None and hook["on_false"] is None:
-            return [f"    {{ extern void {name}(void); {name}(); }} {tag}"]
+            return [f"    {{ extern void {name}(RECOMP_PARAMS); {pre}{name}(RECOMP_ARGS);{post} }} {tag}"]
 
         def leave(v):
             if v == "ret":
@@ -2573,7 +2603,9 @@ class FunctionTranslator:
                 n = int(next(iter(rets)) or "0", 0)
                 return f"esp += {4 + n}; return;"
             return f"goto loc_{v:08X};"
-        s = f"    {{ extern int {name}(void); int hook_ = {name}();"
+        # ebp is taken back before the hook's result branches (a "ret" leaves,
+        # a goto continues in the same function: both see the hook's ebp)
+        s = f"    {{ extern int {name}(RECOMP_PARAMS); {pre}int hook_ = {name}(RECOMP_ARGS);{post}"
         if hook["on_true"] is not None:
             s += f" if (hook_) {{ {leave(hook['on_true'])} }}"
         if hook["on_false"] is not None:
@@ -2855,10 +2887,9 @@ class FunctionTranslator:
         # sahf and the fcomi family leave their EFLAGS in _fa, and sahf keeps
         # the incoming OF in _fb (sp00n bb2b5c7).
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "xadd", "inc", "dec", "sahf", "fcomi",
-                                 "fcomip", "fcompi", "fucomi", "fucomip",
-                                 "fucompi")
-               or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
+                                 "xadd", "lock cmpxchg", "inc", "dec", "imul", "mul", "sahf",
+                                 "fcomi", "fcomip", "fcompi", "fucomi", "fucomip", "fucompi")
+               or insn.mnemonic.removeprefix("lock ") in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
@@ -3043,7 +3074,7 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
             for hook in self._hook_plan.get(bb.start, ()):
-                lines.extend(self._hook_lines(hook, instructions))
+                lines.extend(self._hook_lines(hook, instructions, "ebp" in used_regs))
 
             # Inherit agreed state, including compatible CMP/TEST snapshots
             # whose source operands differ between predecessor paths. The
@@ -3163,6 +3194,11 @@ class FunctionTranslator:
                 return m.group(0)
             if "goto loc_" in line and "RECOMP_BACKEDGE" not in line:
                 lines[idx] = re.sub(r'goto loc_([0-9A-Fa-f]+);', _back, line)
+        # Polling loops (spin_detect.py): always the acquire after their reads (step 6d, ARM64 memory order),
+        # with --spin-backoff also RECOMP_SPIN() on the back edge (step 6c).
+        global SPIN_SITES
+        from . import spin_detect
+        SPIN_SITES += spin_detect.mark_spins(lines, backoff=SPIN_BACKOFF)
 
         # Ensure labels at end of function have a statement after them.
         # In C, a label must be followed by a statement; a comment alone is not

@@ -145,7 +145,9 @@ def test_negative_control_without_the_barrier_the_loop_spins_forever():
     db = {base: {"start": hex(base), "end": base + len(image), "_addr": base, "size": len(image),
                  "section": ".text"}}
     body = FunctionTranslator(image, db).translate_function(base, db[base])
-    no_barrier = "#undef RECOMP_BACKEDGE\n#define RECOMP_BACKEDGE() ((void)0)\n"
+    # both barriers off: since step 6d a polling loop also has RECOMP_POLL_ACQUIRE after its read
+    no_barrier = ("#undef RECOMP_BACKEDGE\n#define RECOMP_BACKEDGE() ((void)0)\n"
+                  "#undef RECOMP_POLL_ACQUIRE\n#define RECOMP_POLL_ACQUIRE() ((void)0)\n")
     src = HARNESS.replace("BODY", no_barrier + body.replace("sub_00010000", "spin"))
     with tempfile.TemporaryDirectory() as tmp:
         c = Path(tmp) / "spin.c"

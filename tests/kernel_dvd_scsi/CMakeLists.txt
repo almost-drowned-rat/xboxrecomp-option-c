@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.20)
+project(kernel_dvd_scsi_test C)
+# DVD SCSI pass-through answers every command (upstream sp00nz v0.17.0 #294; option-c form 2026-11-19).
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../.. runtime)
+add_executable(kernel_dvd_scsi_test test_main.c)
+target_include_directories(kernel_dvd_scsi_test PRIVATE ../../src/kernel)
+target_link_libraries(kernel_dvd_scsi_test PRIVATE xboxrecomp)
+enable_testing()
+set(XBE ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
+add_test(NAME kernel_dvd_scsi_test COMMAND kernel_dvd_scsi_test ${XBE})

@@ -21,6 +21,7 @@ game.toml:
     split = 1000                           #   --split
     exclude_manual = "../src/game/recomp/recomp_manual.c"   # --exclude-manual
     weak_functions = false                 #   --weak-functions
+    spin_backoff = false                   #   --spin-backoff: polling loops back off (tools/recomp/spin_detect.py)
     [variant.us]                           # one table per variant; the id names the file
     label = "USA"
     sha256 = "..."                         # of default.xbe
@@ -37,6 +38,11 @@ variants/<id>.toml (everything optional):
     observed = true                        # a run reached it (seed_from_log)
     [[hook]]                               # instruction hook, format of tools/recomp/hooks_config.py
     [[switch]]                             # reserved: no switch-table override in the lifter yet -> error if used
+    [d3d_block_on_time]                    # XDK D3D's fence wait without the spin (src/xdk/xdk_d3d_wait.h): the
+    function = 0x002AFF90                  #   title's BlockOnTime - the lifter emits it as sub_X_gen plus a
+    device = 0x002BB788                    #   wrapper sub_X that waits first (gen/recomp_hle.c), unless the
+    sem_off = 0x30                         #   port's recomp_manual.c defines sub_X itself (that wins)
+    put_off = 0x2C                         #   g_pDevice; the device fields: GPU semaphore pointer, put value
 
 The generator never rewrites these files; the partition layout stays its own generated file that the variant
 only references.
@@ -57,10 +63,12 @@ except ImportError:          # Python < 3.11
 _COMMON_KEYS = {"schema_version", "game", "disasm", "recomp", "variant"}
 _GAME_KEYS = {"title"}
 _DISASM_KEYS = {"extra_sections": list, "text_only": bool}
-_RECOMP_KEYS = {"split": int, "exclude_manual": str, "weak_functions": bool}
+_RECOMP_KEYS = {"split": int, "exclude_manual": str, "weak_functions": bool, "spin_backoff": bool}
 _VARIANT_REF_KEYS = {"label", "sha256", "file"}
-_VARIANT_KEYS = {"schema_version", "partitions", "disasm", "recomp", "function", "hook", "switch"}
+_VARIANT_KEYS = {"schema_version", "partitions", "disasm", "recomp", "function", "hook", "switch",
+                 "d3d_block_on_time"}
 _FUNCTION_KEYS = {"at", "note", "observed"}
+_BLOCK_ON_TIME_KEYS = {"function": int, "device": int, "sem_off": int, "put_off": int}
 
 
 @dataclass
@@ -75,6 +83,7 @@ class GameConfig:
     partitions: Optional[str] = None                    # absolute
     seeds: List[Tuple[int, bool]] = field(default_factory=list)   # (address, observed)
     hooks: Dict = field(default_factory=dict)            # hooks_config.parse_list() result
+    block_on_time: Optional[Dict] = None                 # [d3d_block_on_time]: function, device, sem_off, put_off
 
 
 def _need_tomllib():
@@ -184,13 +193,27 @@ def load(path, xbe_path):
     if partitions is not None and not isinstance(partitions, str):
         raise ValueError(f"{vpath}: partitions must be a path string")
 
+    block_on_time = None
+    if "d3d_block_on_time" in vdoc:
+        block_on_time = _typed(f"{vpath} [d3d_block_on_time]", vdoc["d3d_block_on_time"], _BLOCK_ON_TIME_KEYS)
+        missing = sorted(set(_BLOCK_ON_TIME_KEYS) - set(block_on_time))
+        if missing:
+            raise ValueError(f"{vpath} [d3d_block_on_time]: missing {missing}")
+        for k in ("function", "device"):
+            if not 0 < block_on_time[k] <= 0xFFFFFFFF:
+                raise ValueError(f"{vpath} [d3d_block_on_time].{k}: a 32-bit address, got {block_on_time[k]!r}")
+        for k in ("sem_off", "put_off"):
+            if not 0 <= block_on_time[k] < 0x10000:
+                raise ValueError(f"{vpath} [d3d_block_on_time].{k}: a device field offset, got {block_on_time[k]!r}")
+
     return GameConfig(path=os.path.abspath(path), variant=vid, label=ref["label"], sha256=digest,
                       title=game.get("title"), disasm=disasm, recomp=recomp,
                       partitions=_rel(vpath, partitions) if partitions else None,
-                      seeds=seeds, hooks=hooks)
+                      seeds=seeds, hooks=hooks, block_on_time=block_on_time)
 
 
 def describe(cfg):
     return (f"game config {os.path.basename(cfg.path)}: variant {cfg.variant} ({cfg.label}), "
             f"{len(cfg.seeds)} seeds, {sum(map(len, cfg.hooks.values()))} hooks"
-            + (f", partitions {os.path.basename(cfg.partitions)}" if cfg.partitions else ""))
+            + (f", partitions {os.path.basename(cfg.partitions)}" if cfg.partitions else "")
+            + (f", D3D BlockOnTime 0x{cfg.block_on_time['function']:08X}" if cfg.block_on_time else ""))

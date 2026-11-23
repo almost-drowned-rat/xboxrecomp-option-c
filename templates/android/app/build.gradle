@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: MIT
+plugins {
+    id 'com.android.application'
+}
+
+// Everything port-specific comes from the port's build script as -P properties, never from a committed
+// local.properties (README.md lists them):
+//   the port   appId (applicationId), appName (launcher label), portTitle (menus, dialogs), savesPrefix (save
+//              backup zip name), touchName (the virtual pad's name), touchAim (true: the port's game library
+//              exports PORT_TOUCH_AIM, the BACK menu offers the aiming layout), versionCode, versionName,
+//              keyAlias (release key alias), portDir (port_android.h, port_icon.h, setup_ui_sdl.c),
+//              portRes (the port's res/ folder: mipmap icons)
+//   paths      sdl3Src (SDL3 source: its android-project Java + the native library), outDir (build root outside
+//              the repo), ndkPath, pythonPrefix, toolkit (the option-c worktree), adrenotoolsSrc, prebuiltLibs,
+//              assetsDir, releaseStore + releasePassFile (release signing)
+// The Java package (namespace xboxrecomp.port) is the same for every port, so the JNI names in jni/ never change;
+// the applicationId is the port's own.
+def need = { String n -> def v = project.findProperty(n); if (v == null) throw new GradleException("pass -P${n}=... (README.md)"); v }
+def sdl3Src = need('sdl3Src')
+def outDir = need('outDir')
+layout.buildDirectory = file("${outDir}/app")
+
+android {
+    namespace = 'xboxrecomp.port'
+    compileSdk = 36
+    ndkPath = project.findProperty('ndkPath')
+    ndkVersion = '30.0.16248370'          // NDK r30 (AGP checks it against ndkPath)
+    buildFeatures { resValues = true }    // the port's strings below (AGP 9 has them off by default)
+    defaultConfig {
+        applicationId = need('appId')
+        minSdk = 29                       // Android 10: Vulkan 1.1 loader floor; the game itself needs Vulkan 1.3
+        targetSdk = 36
+        versionCode = (need('versionCode') as String).toInteger()
+        versionName = need('versionName')
+        resValue 'string', 'app_name', need('appName')
+        resValue 'string', 'port_title', need('portTitle')
+        resValue 'string', 'saves_prefix', need('savesPrefix')
+        resValue 'string', 'touch_name', need('touchName')
+        resValue 'bool', 'touch_aim', (project.findProperty('touchAim') ?: 'false')
+        ndk { abiFilters 'arm64-v8a' }
+        externalNativeBuild {
+            cmake {
+                arguments "-DSDL3_SRC=${sdl3Src}", "-DPYTHON_PREFIX=${project.findProperty('pythonPrefix') ?: ''}",
+                          "-DXR_TOOLKIT=${project.findProperty('toolkit') ?: ''}",
+                          "-DPORT_DIR=${need('portDir')}",
+                          "-DADRENOTOOLS_SRC=${project.findProperty('adrenotoolsSrc') ?: ''}",
+                          '-DANDROID_STL=c++_static', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON'
+            }
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path = file('jni/CMakeLists.txt')
+            buildStagingDirectory = file("${outDir}/cxx")
+        }
+    }
+    sourceSets {
+        main {
+            // SDL's own Java glue (SDLActivity & co.) straight from the SDL3 source, not copied into the toolkit
+            java.srcDirs += ["${sdl3Src}/android-project/app/src/main/java"]
+            // the port's icons (mipmap-*/ic_launcher*, drawable-nodpi/ic_launcher_fg)
+            res.srcDirs += [need('portRes')]
+            // prebuilt runtime libs (libxr_glslang.so ...) staged by the port's build script outside the repo
+            if (project.findProperty('prebuiltLibs')) jniLibs.srcDirs += [project.findProperty('prebuiltLibs')]
+            // python/ (stdlib + site-packages: lifter, capstone, the port's config) staged by the build script,
+            // extracted by PortActivity into internal storage at the first start of a new APK version
+            if (project.findProperty('assetsDir')) assets.srcDirs += [project.findProperty('assetsDir')]
+        }
+    }
+    // The release key never lives in a repo: the build script passes its path + password file
+    // (-PreleaseStore, -PreleasePassFile, -PkeyAlias).
+    def relStore = project.findProperty('releaseStore')
+    def relPass = project.findProperty('releasePassFile')
+    signingConfigs {
+        if (relStore && relPass) {
+            release {
+                storeFile = file(relStore)
+                storePassword = file(relPass).text.trim()
+                keyAlias = need('keyAlias')
+                keyPassword = file(relPass).text.trim()
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled = false
+            if (relStore && relPass) signingConfig = signingConfigs.release
+        }
+    }
+    packaging {
+        // extracted to nativeLibraryDir as real files: the on-device compiler (shipped as lib*.so) must be exec'able
+        jniLibs { useLegacyPackaging = true }
+    }
+    lint { abortOnError = false }
+    androidResources {
+        // keep every staged file (Python's stdlib has names aapt would skip, e.g. starting with '_')
+        ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~'
+    }
+}

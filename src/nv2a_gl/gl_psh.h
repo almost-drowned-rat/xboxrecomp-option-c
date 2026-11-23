@@ -32,4 +32,10 @@ void nv2a_fog_params(const uint32_t *regs, uint32_t xform, float out[4]);
 /* Fragment shader source for `k`. Returns bytes written, -1 on overflow. */
 int nv2a_gl_psh(const Nv2aPshKey *k, char *buf, size_t cap);
 
+/* SHADER COMPILE: HYBRID (docs/hybrid_ubershader.md): one Vulkan fragment shader that interprets any key it covers
+ * from the uniform block's u_pk (the key's 38 words, appended to the block nv2a_gl_psh declares). Returns bytes
+ * written, -1 on overflow. _covers: 0 for keys it cannot draw (CUBE_MAP or shadow-map stages). */
+int nv2a_uber_psh(char *buf, size_t cap);
+int nv2a_uber_psh_covers(const Nv2aPshKey *k);
+
 #endif

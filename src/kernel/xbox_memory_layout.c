@@ -392,6 +392,13 @@ static RECOMP_TLS uint8_t s_ac97_before[AC97_MODEL_HI - AC97_MODEL_LO];
 static RECOMP_TLS uint32_t s_ac97_off;          /* the faulting write's offset in the NABM page */
 void (*g_ac97_after_write)(volatile uint8_t *nabm, const uint8_t *before_100, uint32_t off) = NULL;
 
+/* The AC97 model's hook, set through a call: the APU module may be a shared library and cannot assign the exe's
+ * variable (src/apu/apu_module.h). */
+void xbox_ac97_set_after_write(void (*fn)(volatile uint8_t *nabm, const uint8_t *before_100, uint32_t off))
+{
+    g_ac97_after_write = fn;
+}
+
 /* The MCPX aperture's host address (0xFE800000), NULL before the layout is up: the APU's GP model reads and writes
  * the GP's X memory there (apu_dsp.c, gp_xwin: +0x30000, plain RAM). */
 void *xbox_McpxWindow(void)
@@ -906,16 +913,18 @@ static void flip_queue_retire(uint32_t dev, uint32_t n)
 
 /* Two sources (FRAME PACING, maintainer 2026-11-05):
  *   timer    the guest vblank every 1/hz s of the host clock (as before)
- *   display  on a display at 120 Hz or more whose rate is a whole multiple of
- *            the guest rate: every n-th vblank of the display itself
+ *   display  on a display at 60 / 120 / 180 / 240 Hz (60 since 2026-11-22) whose
+ *            rate is a whole multiple of the guest rate: every n-th vblank of
+ *            the display itself
  *            (platform/host_vblank.h, a thread below), so a game frame stays
  *            on screen exactly n refreshes; a timer drifted against the
  *            refresh and showed frames for n-1 and n+1 refreshes in turn
  * The 60 Hz display count (xbox_DisplayVblankCount, game time) follows the
  * display the same way while it paces (every m-th refresh, m = refresh / 60),
  * so game time and frames cannot drift apart. Every change of source or rate
- * re-bases the counts, which stay monotonic. RECOMP_FRAME_PACING=timer keeps
- * the timer (the port's FRAME PACING line sets it; default display). */
+ * re-bases the counts, which stay monotonic. RECOMP_FRAME_PACING=timer[+...]
+ * keeps the timer (the settings file's frame_pacing; default auto, see
+ * fp_parse below). */
 static int64_t  s_vb_period_ns = -1;   /* 0 = off */
 static uint64_t s_vb_t0_ns;
 static uint64_t s_vb_base;              /* vblanks counted before the rebase */
@@ -1189,8 +1198,10 @@ static int dp_measure(int64_t *period_ns, uint64_t *last_ns)
         mult = (hz + 30) / 60;
         fprintf(stderr, "  frame pacing: display measured %.3f Hz (try %d: %d of %d intervals within 0.5 ms of the median)\n",
                 med > 0 ? 1e9 / (double)med : 0.0, attempt, ok, N);
-        if (hz < 110 || mult < 2 || mult > 4) {
-            fprintf(stderr, "  frame pacing: display below 120 Hz or above 240 Hz -> 60 Hz timer\n");
+        /* 60 Hz counts too since 2026-11-22 (auto rule: 60 / 120 / 180 / 240): a 60 Hz timer drifts against a
+         * 59.9x Hz panel and showed one frame twice every few seconds to minutes */
+        if (hz < 55 || mult < 1 || mult > 4) {
+            fprintf(stderr, "  frame pacing: display below 60 Hz or above 240 Hz -> 60 Hz timer\n");
             return 0;
         }
         if (fabs(1e9 / (double)med - 60.0 * mult) > 0.01 * 60.0 * mult) {
@@ -1276,15 +1287,88 @@ static DWORD WINAPI dp_thread(LPVOID unused)
     return 0;
 }
 
+/* FRAME PACING mode (maintainer 2026-11-22, the same four in option-c and
+ * option-p, chosen by hand in the settings file only - no menu row; the port
+ * maps its `frame_pacing` key to RECOMP_FRAME_PACING). Two axes:
+ *   source    timer = the guest vblank from a 60 Hz timer; display = every
+ *             n-th vblank of the display itself (60 / 120 / 180 / 240 Hz,
+ *             steady), back to the timer when no n fits
+ *   pictures  paced = a frame is presented at its vblank (the hold first, then
+ *             the present: frames evenly spaced); immediate = presented as
+ *             soon as it is finished, the hold after it (the game's timing is
+ *             the same, the picture may come up to a refresh earlier)
+ * Values: timer+paced, timer+immediate, display+paced, display+immediate,
+ * auto (= unset): the display where its vblank can be had and fits, else the
+ * timer; pictures paced (the default every port had; chosen from an Orta G3
+ * over all four at 60 and 120 Hz, porting_guide "Frame pacing"). The old values timer /
+ * display mean that source, paced. Parsed once; logged once ("[pacing] ..."). */
+static int s_fp_parsed, s_fp_timer, s_fp_immediate, s_fp_auto;
+
+static void fp_parse(void)
+{
+    const char *e;
+    char src[16] = "", pic[16] = "";
+    if (s_fp_parsed)
+        return;
+    s_fp_parsed = 1;
+    e = getenv("RECOMP_FRAME_PACING");
+    if (e && *e) {
+        const char *plus = strchr(e, '+');
+        size_t n = plus ? (size_t)(plus - e) : strlen(e);
+        if (n < sizeof src) {
+            memcpy(src, e, n);
+            src[n] = 0;
+        }
+        if (plus && strlen(plus + 1) < sizeof pic)
+            strcpy(pic, plus + 1);
+    }
+    if (!strcmp(src, "timer"))
+        s_fp_timer = 1;
+    else if (strcmp(src, "display"))
+        s_fp_auto = 1;                            /* unset, "auto" or unknown */
+    s_fp_immediate = !strcmp(pic, "immediate");
+    if (e && *e && s_fp_auto && strcmp(e, "auto"))
+        fprintf(stderr, "[pacing] RECOMP_FRAME_PACING=%s not known -> auto\n", e);
+    fprintf(stderr, "[pacing] mode %s%s: source %s, pictures %s\n",
+            s_fp_auto ? "auto" : s_fp_timer ? "timer" : "display",
+            s_fp_auto ? "" : s_fp_immediate ? "+immediate" : "+paced",
+            s_fp_timer ? "60 Hz timer" : "the display when it runs at 60 / 120 / 180 / 240 Hz, else the timer",
+            s_fp_immediate ? "immediate" : "paced");
+}
+
+int xbox_FramePacingImmediate(void)
+{
+    fp_parse();
+    return s_fp_immediate;
+}
+
+/* GAME SPEED (PERFORMANCE overlay, maintainer 2026-11-22): the vblanks the
+ * game's finished frames asked for (each flip its swap interval, 1 for 0)
+ * against the guest vblanks that went by. A title at its full rate - 60 with
+ * interval 1, 30 with interval 2 - is at 100 %; one that falls behind shows
+ * less. One writer (the pushbuffer executor, per flip); an aligned 64-bit
+ * load is whole on the 64-bit hosts, so readers need no lock. */
+static volatile uint64_t s_speed_iv_sum;
+
+void xbox_GuestFlipNote(uint32_t swap_interval)
+{
+    s_speed_iv_sum += swap_interval ? swap_interval : 1;
+}
+
+uint64_t xbox_GuestFlipVblanksAsked(void)
+{
+    return s_speed_iv_sum;
+}
+
 /* The renderer's window, at its creation and on every display change: (re)bind
- * the display pacing to the display it is on. RECOMP_FRAME_PACING=timer: off. */
+ * the display pacing to the display it is on. Source timer: off. */
 void xbox_GuestDisplayPacing(void *native_window)
 {
     static int off = -1;
     if (off < 0) {
-        const char *e = getenv("RECOMP_FRAME_PACING");
         const char *st = getenv("RECOMP_PACING_STATS");
-        off = e && !strcmp(e, "timer");
+        fp_parse();
+        off = s_fp_timer;
         if (off)
             fprintf(stderr, "  frame pacing: 60 Hz timer (RECOMP_FRAME_PACING=timer)\n");
         if (off && st && *st == '1')
@@ -1890,6 +1974,16 @@ void recomp_spin_wake(void)
         SetEvent(s_hw_event);
 }
 #endif
+
+/* The instruction-hook form (hooks get the register context since 2026-11-18, translator.py _hook_lines): a
+ * port's hooks.toml names `call = "recomp_spin_wake_hook"` at the kickoff flush test. The plain recomp_spin_wake()
+ * stays for the runtime's own callers. */
+void recomp_spin_wake_hook(RECOMP_PARAMS)
+{
+    (void)ctx;
+    (void)base;
+    recomp_spin_wake();
+}
 
 static void sleep_ns(uint64_t ns);
 

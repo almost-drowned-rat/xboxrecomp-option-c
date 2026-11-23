@@ -246,9 +246,22 @@ void xdk_music_bind(uint32_t vtable, XdkOpenGameTrack open_game)
     s_open_game = open_game;
 }
 
-static long dec_read(void *c, int16_t *out, long n) { return media_decoder_read((MediaDecoder *)c, out, n); }
-static int  dec_rewind(void *c) { return media_decoder_rewind((MediaDecoder *)c); }
-static void dec_close(void *c) { media_decoder_close((MediaDecoder *)c); }
+/* The album decoders: host code, the guest's ctx is not used. */
+static long dec_read(RECOMP_PARAMS, void *c, int16_t *out, long n)
+{
+    (void)ctx; (void)base;
+    return media_decoder_read((MediaDecoder *)c, out, n);
+}
+static int dec_rewind(RECOMP_PARAMS, void *c)
+{
+    (void)ctx; (void)base;
+    return media_decoder_rewind((MediaDecoder *)c);
+}
+static void dec_close(RECOMP_PARAMS, void *c)
+{
+    (void)ctx; (void)base;
+    media_decoder_close((MediaDecoder *)c);
+}
 
 static void song_name(MediaSong s, char *out, size_t n)
 {
@@ -258,15 +271,15 @@ static void song_name(MediaSong s, char *out, size_t n)
         snprintf(out, n, "\"%s\" / \"%s\"", s_lib.albums[s.album].name, s_lib.albums[s.album].tracks[s.track].name);
 }
 
-static int open_song(Music *m, MediaSong s)
+static int open_song(RECOMP_PARAMS, Music *m, MediaSong s)
 {
     char nm[600];
     if (m->open && m->src.close)
-        m->src.close(m->src.ctx);
+        m->src.close(RECOMP_ARGS, m->src.ctx);
     m->open = 0;
     m->cur = s;
     if (s.album < 0) {
-        if (s_open_game && s_open_game(s.track, &m->src))
+        if (s_open_game && s_open_game(RECOMP_ARGS, s.track, &m->src))
             m->open = 1;
     } else if (s.album < s_lib.nalbums && s.track < s_lib.albums[s.album].ntracks) {
         MediaDecoder *d = media_decoder_open(s_lib.albums[s.album].tracks[s.track].path);
@@ -284,12 +297,12 @@ static int open_song(Music *m, MediaSong s)
 }
 
 /* The playlist's next song that opens (at most one pass); 0 if none does. */
-static int advance(Music *m)
+static int advance(RECOMP_PARAMS, Music *m)
 {
     int k;
     for (k = 0; k < m->pl.n; k++) {
         const MediaSong *s = media_playlist_next(&m->pl);
-        if (s && open_song(m, *s))
+        if (s && open_song(RECOMP_ARGS, m, *s))
             return 1;
     }
     return 0;
@@ -317,7 +330,7 @@ static void put_format(uint32_t w)
     w16(w + 0x10, 0);
 }
 
-uint32_t xdk_music_create(MediaSong first, MediaPlaylist *pl, uint32_t pwfx)
+uint32_t xdk_music_create(RECOMP_PARAMS, MediaSong first, MediaPlaylist *pl, uint32_t pwfx)
 {
     Music *m = NULL;
     int i;
@@ -338,7 +351,7 @@ uint32_t xdk_music_create(MediaSong first, MediaPlaylist *pl, uint32_t pwfx)
         memset(pl, 0, sizeof *pl);
         media_playlist_seek(&m->pl, first);
     }
-    if (!open_song(m, first) && !(m->has_pl && advance(m))) {
+    if (!open_song(RECOMP_ARGS, m, first) && !(m->has_pl && advance(RECOMP_ARGS, m))) {
         if (!m->has_pl) {
             m->silent = 1;                  /* a single song that does not open: silence, like an empty track */
         } else {
@@ -350,7 +363,7 @@ uint32_t xdk_music_create(MediaSong first, MediaPlaylist *pl, uint32_t pwfx)
     m->obj = xbox_HeapAlloc(OBJ_SIZE, 16);
     if (!m->obj) {
         if (m->open && m->src.close)
-            m->src.close(m->src.ctx);
+            m->src.close(RECOMP_ARGS, m->src.ctx);
         if (m->has_pl)
             media_playlist_free(&m->pl);
         memset(m, 0, sizeof *m);
@@ -380,23 +393,23 @@ int xdk_music_current(MediaSong *song, int *has_playlist)
     return 1;
 }
 
-int xdk_music_skip(void)
+int xdk_music_skip(RECOMP_PARAMS)
 {
     Music *m = s_newest >= 0 ? &s_mus[s_newest] : NULL;
     if (!m || !m->obj || !m->has_pl)
         return 0;
-    if (!advance(m))
+    if (!advance(RECOMP_ARGS, m))
         m->open = 0;                    /* nothing opens: silence until the title stops it */
     return 1;
 }
 
-int xdk_music_jump(MediaSong song)
+int xdk_music_jump(RECOMP_PARAMS, MediaSong song)
 {
     Music *m = s_newest >= 0 ? &s_mus[s_newest] : NULL;
     if (!m || !m->obj || !m->has_pl)
         return 0;
     media_playlist_seek(&m->pl, song);
-    if (!open_song(m, song) && !advance(m))
+    if (!open_song(RECOMP_ARGS, m, song) && !advance(RECOMP_ARGS, m))
         m->open = 0;
     return 1;
 }
@@ -415,7 +428,7 @@ void xdk_music_Release(RECOMP_PARAMS)
     if (--m->ref > 0)
         RETURN((uint32_t)m->ref, 1);
     if (m->open && m->src.close)
-        m->src.close(m->src.ctx);
+        m->src.close(RECOMP_ARGS, m->src.ctx);
     if (m->has_pl)
         media_playlist_free(&m->pl);
     w32(m->obj + 4, 0);
@@ -456,13 +469,13 @@ void xdk_music_Process(RECOMP_PARAMS)
     while (done < want) {
         long got = -1;
         if (m->open)
-            got = m->src.read(m->src.ctx, (int16_t *)gp(buf + (uint32_t)done * 4u), want - done);
+            got = m->src.read(RECOMP_ARGS, m->src.ctx, (int16_t *)gp(buf + (uint32_t)done * 4u), want - done);
         if (got > 0) {
             done += got;
             continue;
         }
         if (m->has_pl) {
-            if (advance(m))
+            if (advance(RECOMP_ARGS, m))
                 continue;
         } else if (got < 0 || m->silent) {
             if (!m->silent) {
@@ -500,7 +513,7 @@ void xdk_music_Flush(RECOMP_PARAMS)
 {
     Music *m = music_of(ARG(0));
     if (m && m->open && m->src.rewind)
-        m->src.rewind(m->src.ctx);
+        m->src.rewind(RECOMP_ARGS, m->src.ctx);
     RETURN(S_OK_, 1);
 }
 
@@ -510,7 +523,7 @@ void xdk_music_Seek(RECOMP_PARAMS)
     int32_t off = (int32_t)ARG(1);
     uint32_t origin = ARG(2), pabs = ARG(3);
     if (m && m->open && off == 0 && origin == 0 && m->src.rewind)   /* FILE_BEGIN, 0: rewind */
-        m->src.rewind(m->src.ctx);
+        m->src.rewind(RECOMP_ARGS, m->src.ctx);
     if (pabs)
         w32(pabs, 0);
     RETURN(S_OK_, 4);

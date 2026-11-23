@@ -19,7 +19,8 @@ def test_a_read_shift_by_cl_saves_the_previous_flags_and_selects():
     text, _ = _block("85c9 d3e0 0f94c2")          # test ecx, ecx / shl eax, cl / sete dl
     assert "_shf = " in text and "_shk = ((LO8(ecx)) & 31u)" in text
     assert "(_shk ? (_fa == 0) : (_shf & 0x40u))" in text
-    assert text.index("_shf = ") < text.index("eax = eax << ")
+    # the shift itself reads "(uint32_t)(eax) << (count & 31u)" since U2 (upstream #277: masked, unsigned)
+    assert text.index("_shf = ") < text.index("eax = (uint32_t)(eax) << ")
 
 
 def test_a_shift_by_an_immediate_is_unchanged():
@@ -49,3 +50,18 @@ def test_the_saved_word_names_cf_only_where_the_function_declares_it():
         lifted, _ = lift_basic_block(lifter, BasicBlock(start=0x1000, instructions=insns))
         save = next(l for l in lifted if l.startswith("_shf = "))
         assert ("_cf" in save) == needs_cf, save
+
+
+def test_a_shl_before_a_shift_by_cl_names_cf_only_where_declared():
+    # U2 (upstream #276): shl's OF = the result's sign XOR CF, so the saved word of a shl setter reads _cf through
+    # OF as well as through CF. Without _cf both bits are left out - Orta's relift (2026-11-19) had two functions
+    # (shl, then a shift by cl, then a reader) that named the undeclared _cf.
+    d = Disassembler()
+    insns = [d._decode_instruction(i) for i in d._cs.disasm(bytes.fromhex("d1e0 d3e3 0f94c2"), 0x1000)]
+    for needs_cf in (False, True):                  # shl eax, 1 / shl ebx, cl / sete dl
+        lifter = Lifter()
+        lifter.needs_cf = needs_cf
+        lifted, _ = lift_basic_block(lifter, BasicBlock(start=0x1000, instructions=insns))
+        save = next(l for l in lifted if l.startswith("_shf = "))
+        assert ("_cf" in save) == needs_cf, save
+        assert ("0x800u" in save) == needs_cf, save   # OF only where it can be derived

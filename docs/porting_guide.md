@@ -158,7 +158,19 @@ port is built to link any subset of its versions into one exe:
 
 - [ ] `XBOXRECOMP_VULKAN=ON`, `XBOXRECOMP_D3D11=OFF`, `RECOMP_PB_EXEC=1`, `nv2a_vk_install()`.
 - [ ] D3D fence: wrap the title's fence wait (`BlockOnTime` / `sub_<fence>`), register `*(dev+<sem>)` with
-      `nv2a_pb_set_semaphore_target`; mirror off. Without it D3D hangs after a few frames.
+      `nv2a_pb_set_semaphore_target`; mirror off. Without it D3D hangs after a few frames. Since step 6c no
+      hand-written wrap is needed: the four values go into the variant file
+      (`[d3d_block_on_time]` function / device / sem_off / put_off, tools/gameconfig.py) and the lifter emits the
+      wrapper (gen/recomp_hle.c, `xdk_d3d_block_on_time`, src/xdk/xdk_d3d_wait.h); a recomp_manual.c override of
+      the same function wins.
+- [ ] Other polling loops (a guest thread re-reading memory that another thread or the GPU sets): `[recomp]
+      spin_backoff = true` (lifter `--spin-backoff`) - tools/recomp/spin_detect.py finds loops that re-read the
+      same place with no store and no call, and their back edge backs off (`RECOMP_SPIN`, src/kernel/kernel_spin.c:
+      pause, yield, then 0.1 ms sleeps); the log line of the lift counts them. `RECOMP_SPIN_BACKOFF=0` at run time
+      turns the backoff into the pause hint only. Measure before / after (G3 CPU cores). **Opt-in, only when a
+      profile shows a guest thread burning a core in such a loop**: on Orta (BlockOnTime already sleeping) the 48
+      loops end at once and the backoff gave nothing (measured 2026-11-18). Independent of it, every such
+      loop gets `RECOMP_POLL_ACQUIRE` after its reads (ARM64 memory order, step 6d).
 - [ ] Logos/movies visible: `RECOMP_GL_DUMP=<prefix>,<n>` frame dumps, `tools\dump_png.ps1` → 4:3 PNGs; look at them.
 - [ ] Wrong pixels in a decoder → state replay (`xbox_StateSnapshot` + `tools.conformance.replay`, Unicorn oracle)
       to bisect the call tree to one function; `--xbe-func` conformance for SIMD helpers.
@@ -215,9 +227,26 @@ port is built to link any subset of its versions into one exe:
 > **Fixed exceptions (maintainer 2026-11-17, every port):** besides the NV2A pushbuffer executor (the renderer),
 > two device emulations stay by rule: **sound emulation (MCPX APU incl. the DSP56k, AC97)** and **OHCI (USB /
 > pads)**. Reason: both work, the cost is low, a rebuild brings no noticeable benefit. They are encapsulated as
-> their own modules (licence: docs/licence_apu_ac97_ohci.md); an HLE replacement of the APU is
+> their own modules (docs/apu_module.md: the APU as the shared library xbox_apu.dll / libxbox_apu.so, copied
+> next to the exe by CMake and by the launcher - nothing to do in a port; Android: the APK carries
+> libxbox_apu.so; licence: docs/licence_apu_ac97_ohci.md); an HLE replacement of the APU is
 > deferred. So for Option C ports the item below reads: the LLE APU and USB stay ON; turning them off is only for
 > a title that runs fully on the HLE DirectSound / XInput of src/xdk (THPS 2X's own line).
+>
+> **DECISION - APU / OHCI modules (maintainer, fixed for every present and future port; 2026-11-17, written down
+> 2026-11-21):**
+> 1. Sound emulation (MCPX APU incl. the DSP) **stays emulation**. The APU stages A-E (an own HLE replacement)
+>    are **struck** (2026-11-17). It lives encapsulated as the module `xbox_apu.dll` /
+>    `libxbox_apu.so`. OHCI (USB) also stays emulation, encapsulated the same way.
+> 2. Measured 2026-11-17 (G3, module vs static): frame times, hitches and RAM unchanged, CPU within noise -> **the
+>    module stays** (no static linking).
+> 3. A port that **uses** the APU emulation ships the module **next to the game exe** (release layout: in `data\`),
+>    **plus the LGPL sources of the APU incl. our changes and THIRD_PARTY_NOTICES in every release**; its release
+>    notes carry the licence note on the APU module (no AI note there - his decision).
+> 4. A port that runs on DirectSound HLE (`RECOMP_DSOUND_HLE=1`, e.g. THPS 2X) and does **not** need the APU
+>    emulation ships **neither the module nor its LGPL sources**. Condition: verified that the game starts without
+>    `xbox_apu.dll` and its sound is complete (the line `[APU] no ... - no sound emulation` is expected then, no
+>    other error). First example: THPS 2X 2.0.
 
 - [ ] Lift with `--weak-functions` (every function overridable from `recomp_manual.c` with a rebuild) and
       `--hooks config/hooks.toml` (per-game instruction hooks). Use them for diagnostics too: a census of a library's
@@ -227,7 +256,15 @@ port is built to link any subset of its versions into one exe:
 - [ ] Guest vblank (kernel, `RECOMP_GUEST_HZ`): mirror the title's "frames completed" counter so the title's own
       swap throttle paces it; override its spin-delay helper so GPU waits sleep (`xbox_GuestFlipWait`,
       `xbox_GuestYield`).
-- [ ] D3D's kickoff flush spin: hook `recomp_spin_wake()` before the test instruction of each flush loop.
+- [ ] D3D's kickoff flush spin: hook `recomp_spin_wake_hook` (the hook form of `recomp_spin_wake()`) before the
+      test instruction of each flush loop.
+- [ ] **Instruction hooks get the register context** (2026-11-18, for THPS 2X 2.0): a hooks.toml `call` is
+      `void name(RECOMP_PARAMS)` (or `int name(RECOMP_PARAMS)` with on_true / on_false) and is called with
+      `RECOMP_ARGS`; it reads and writes the guest's registers through ctx (`g_eax` ... `g_edi`, `g_esp`; the
+      function's local `ebp` through `g_ebp`, taken back after the hook). No `xbox_diag_ctx()` detour. A toolkit
+      without this (before option-c <hook-ABI commit>) called `name()` with no arguments: move a port's hooks
+      to the new signature together with the toolkit pin (toolkit `tools/ctx_rewrite.py`, from THPS 2X; Orta: pal.toml
+      `recomp_spin_wake` -> `recomp_spin_wake_hook`).
 - [ ] **No blocking file / log I/O in kernel-call, DPC, ISR or gate-holding paths** (maintainer's standing rule,
       2026-10-27; every port): output goes through a dedicated logger thread, a lint enforces it. Built on
       a later toolkit branch (not in this snapshot): `cmake/HotPathLogging.cmake` force-includes
@@ -254,7 +291,18 @@ port is built to link any subset of its versions into one exe:
 - [ ] Frame cap, vblank at 60 Hz, present mode (`RECOMP_PRESENT=fifo|mailbox|immediate`; default MAILBOX when the device has it, FIFO the
       fallback, logged as `present mode: <mode> (<reason>)`; a port's frame limiter asks `nv2a_vk_present_fifo()`),
       frame-cap waits through `platform/host_wait.h` (`host_sleep_ns`, `host_wait_until_ns` for exact deadlines),
-      frames in flight (`RECOMP_VK_FRAMES=1|2`, default 2). Input-to-present latency: `input_ms` column of
+      frames in flight (`RECOMP_VK_FRAMES=1|2`, default 2). Shader compile hitches: async compile
+      `RECOMP_VK_ASYNC=wait|skip|off` (default `wait`: a draw whose program / pipeline is not built yet waits for
+      the compile worker up to `RECOMP_VK_ASYNC_WAIT_US` per frame, default 2500, then is skipped for that frame;
+      `skip` skips at once; `off` compiles on the executor; the digits 2 / 1 / 0 still work), logged as
+      `async compile: mode <name>` and per flip in `[vk] async (...)`; measured (frames
+      > 25 ms -63..-71 % without a pipeline list). As a player option (RECOMP OPTIONS line, e.g. THPS "SHADER
+      COMPILE: COMPLETE / SMOOTH / FAST" = off / wait / skip): `nv2a_vk_set_async_mode(NV2A_VK_ASYNC_OFF|_SKIP|_WAIT)`
+      from any thread, takes effect at the next draw, no restart (builds already queued finish in every mode;
+      the env value is the start value; logged `[vk] async: mode <old> -> <new> (runtime, frame <n>)`);
+      `nv2a_vk_get_async_mode()` for the menu's current value; test hook `RECOMP_VK_ASYNC_SWITCH=<frame>:<mode>,...`
+      switches at those flips without a menu. Ship the keys-only pipeline list as well: it removes the
+      compiles before the first frame. Input-to-present latency: `input_ms` column of
       the frame-time CSV (last pad read by the title → end of its present; XInput HLE). Menu response to a
       scripted press: the `draws` column (draws per frame) steps when a screen changes without a file open;
       with `RECOMP_EVENT_TS=1`, `[EVT] <ms> PAD <entry>` and `[EVT] <ms> FRAMETIME t0` put the press on the
@@ -337,6 +385,16 @@ D3D's busy-waits that call those handlers – the guest lock burnout3-sw has (`x
         the edges by its own sprite groups (Orta) or uses the toolkit's HUD squash (`nv2a_vk_set_hud_squash`,
         `_edges`; THPS 2X).
       - A game without native 16:9 support keeps menus, loading screens and movies at **4:3, pillarboxed** (never stretched); only gameplay is rendered in the chosen aspect ratio (wider projection/FOV, not stretching).
+      - **No black bars in GAMEPLAY at any offered aspect ratio** (maintainer, 2026-11-18, Orta GitHub #8; every port;
+        gameplay only). Measure the gameplay frames at 4:3, 16:9, 16:10 and 21:9 (black rows / columns in the title's
+        frame and in the window). Bars the title draws itself (Orta: its 3D in 640x448 at every aspect, 16 black lines
+        top and bottom as CRT overscan; runs 20261107_*_shots_a43/a169/a1610/a219) are removed in the aspect-ratio
+        work - never stretched. **The rule and the measurement are the same for every port; the fix is the
+        port's own**, because where the bars come from depends on how the title builds its picture (its viewport,
+        projection, overscan). Orta v1.2.2 (8ebfab2, src/recomp_manual.c) uses **Vert+**: full height, the
+        vertical FOV widened to match. Another title may need something else (or have no bars at all - THPS 2X
+        builds its wide picture by its own projection plus the toolkit's HUD squash: measure it). The toolkit does
+        not detect or correct bars at run time. Menus, loading screens and movies keep the 4:3 pillarbox rule above.
       - The in-game HUD during gameplay always follows the chosen aspect ratio (maintainer, 2026-10-18; every port):
   anchored to the screen edges of the wider view, never stretched.
       - A game with native 16:9 support (e.g. the Xbox dashboard's widescreen setting) uses its native mode for everything instead.
@@ -412,6 +470,12 @@ State: toolkit branch `launcher` (head 65019c1: `src/launcher/`, `src/install/ga
      (`XR_LAUNCHER_JOBS` caps it, for shared machines), link (`build.txt`), remove the intermediates (pipeline, gen,
      obj);
    - a stamp (release version, XBE SHA-1, toolchain): later starts go straight into the game;
+   - **release layout (maintainer, 2026-11-21; every port, Windows / Linux / Android, also later ones):** the top
+     folder holds only `<game>_launcher`; the built game `<game>` goes into `data\` (link output, the files the link
+     step copies beside it, the start). An exe in a folder named `data` takes the folder above as its root
+     (`xbox_host_root`, `host_win32.c` / `host_linux.c`), so `game\`, `saves\`, `media\` and `data\` stay where they
+     were; an older install's game next to the launcher is moved into `data\` at the next start (no rebuild).
+     Android keeps its library in the app's root;
    - arguments: `--repair` (rebuild; `saves\` and `media\` are never touched), `--image <path>`, `--no-start`.
 3. **Progress window** = the installer UI (`game_setup_ui.c`): 640x240, the step text word-wrapped (37 characters,
    up to 4 lines, the 8x8 debug font at scale 2). Every step logs to `data\launcher.log`.
@@ -435,6 +499,16 @@ State: toolkit branch `launcher` (head 65019c1: `src/launcher/`, `src/install/ga
    present. **Published only after the maintainer's OK on a check report.** The working repos stay private.
 7. **Player notes (README):** internet at the first start (~190 MB compiler), ~2 GB disk, a few minutes once. The
    exe is unsigned: SmartScreen "More info -> Run anyway"; Smart App Control (Windows 11) blocks unsigned apps.
+8. **`.recomp.json` in the public repo's root** (maintainer, 2026-11-19; every option-c port from its first public
+   release, THPS 2X with 2.0, Orta with its next release; recomp.board, spec https://recomp.fyi/spec, schema
+   https://recomp.fyi/schema/v1.json, CC BY 4.0; the same fields as Option P's template): copy
+   `templates/recomp.json` to `.recomp.json` in the snapshot and fill it. **Every release checks it:** `status`
+   (`released` while maintained), `targets` = **only platforms with a published build** (Linux / Android / Steam Deck
+   join on the day their build is released, never before - a stale file is worse than none), `original` = every disc
+   the launcher accepts (region + serial; `sha1` only if the launcher checks exactly that image), `wikidata` checked
+   against the game (not the series). No `launchers`, no game files or links to them; extra fields (`links`, `notes`)
+   only on his word. Validate against the schema before the snapshot (e.g. `python -m jsonschema`, or an editor that
+   reads `$schema`).
 
 THPS 2X on the dev machine (2 compile threads): download 14 s, lift 117 s, compile 55 s, `tools\` 773 MB, exe
 24.6 MB.
@@ -454,9 +528,7 @@ a new port takes these instead of copying them from Orta or THPS:
 | Release exe + zip (Windows), AppImage (Linux) | `tools/release/port_release.ps1`, `port_release_zip.ps1`, `port_release_linux.sh` | `tools/release.psd1` / a `.conf` with its names (headers of the scripts) |
 | Regression + timing + first-start E2E | `tools/g3` (`g3_regress.ps1`, `g3_series.ps1`, `g3_firststart.ps1`) | `tools/g3/<port>.psd1` (parts, scripts, minimum frames / draws) |
 | Rumble | the OHCI model forwards the title's output report (260af9e) | nothing |
-
-Still in the port: the Android packaging (Gradle app, loader, Vulkan shim) - its move into
-`templates/android/` is planned.
+| Android APK (Gradle app, loader, on-device lift / compile / link, Vulkan shim with Turnip, touch controls, BACK menu) | `templates/android/` (from Orta's packaging, MIT since 2026-11-19; README.md there) | `port_android.h`, `port_icon.h`, `setup_ui_sdl.c`, the icons, and the `-P` properties (app id, names, version) from its build script |
 
 ## M6 – settings in the game's own menu
 
@@ -480,9 +552,47 @@ Still in the port: the Android packaging (Gradle app, loader, Vulkan shim) - its
         default BORDERLESS, applies at once), RENDER RESOLUTION, ASPECT RATIO (4:3 / 16:9), MENUS AT 16:9
         (PILLARBOXED / STRETCHED, shown only with 16:9; movies always stay 4:3), ANISOTROPIC FILTER,
         **ANTIALIASING ▸** (a sub-menu with every choice: OFF / FXAA / SMAA / MSAA 2X / MSAA 4X, default FXAA;
-        applies at once), **FRAME RATE ▸** (FRAME RATE, FRAME PACING: DISPLAY / 60 HZ TIMER - see "Frame pacing"
-        below, VSYNC, FPS COUNTER: OFF / FPS / FPS AND FRAME TIME / FRAME
-        TIME), **SHADERS ▸** (the optional slang shaders, if the port has the module), **BOOT ANIMATION ▸ as the
+        applies at once), **PERFORMANCE ▸** (maintainer 2026-11-22, the same in option-p; was FRAME RATE ▸: FRAME
+        RATE where the port has it, then four ON/OFF switches **V-SYNC, FPS, FRAME TIME, GAME SPEED** - the last
+        three stored as `performance_overlay` = fps / frametime / speed joined by `+`, `all`, `off`, unset = the
+        old `fps_counter` mapped; `nv2a_vk_set_perf_overlay(NV2A_VK_PERF_*)`, `nv2a_vk_perf_overlay_parse`; NO
+        FRAME PACING row any more - settings file only, see "Frame pacing" below; Android ports hide DISPLAY
+        MODE), **SHADER COMPILE: OFF / SKIP / WAIT / HYBRID** (maintainer, 2026-11-18: a FIXED part of every option-c
+        port's RECOMP OPTIONS; `nv2a_vk_set_async_mode` / `_get`, applies at once; OFF = compile on the spot
+        (hitches), SKIP = draw it once built (objects missing for a moment), WAIT = wait up to 2.5 ms per frame,
+        then skip, HYBRID = a prebuilt ubershader draws until the specialised shader is built; default HYBRID on
+        Windows / Linux, WAIT on Android, where HYBRID stays selectable - the toolkit's own default since
+        2026-11-23 (maintainer's decision; unset `RECOMP_VK_ASYNC` = HYBRID, Android WAIT); a port that stores the
+        line writes nothing while the player has not chosen, so the default applies), right under it **SHADER NOTICE: ON / OFF** (maintainer, 2026-11-18; its default - ON - still
+        to be confirmed by him; with the async setter: `nv2a_vk_set_shader_notice(int on)`): a small "BUILDING
+        SHADERS" in a corner like the
+        FPS counter while draws wait for, skip or bridge over a shader still being built, with a short hold so it does
+        not flicker; drawn after the picture, so screenshots never contain it,
+        **Status overlays: one layout for all** (maintainer, 2026-11-18: "it is only about status messages: FPS,
+        shaders etc."): every status line option-c itself puts on the screen - the FPS / frame-time counter
+        (`nv2a_vk_set_fps_hud`) and the shader notice, and any later one - uses the layout of Option P's notices
+        (ps2recomp_option_p 20748c6, host\src\window.cpp DrawOverlay; rewritten for option-c, no code taken:
+        Option P is GPL-3.0, option-c MIT): a dark panel 0x101420, line height max(14, window height / 48), text
+        0xEBEBEB (a title line 0x78BEFF, a chosen line 0xFFD23C), margins line/2 left and line/4 top, a bold
+        monospace font (option-c: a bundled free font with stb_truetype, the same on Windows, Linux and Android).
+        **Toolkit features every port gets without code of its own (maintainer's wishlist 2026-11-20, built
+        2026-11-22):** (a) **start log lines** - `version:`, `host:` (Windows 11 / 10 with edition, version and build;
+        Wine with its Proton tool name and the Unix system under it), `cpu:` (name, cores / threads), `ram:` (total /
+        free), `power plan:` (Windows), `[VK] <GPU>, Vulkan x.y.z, driver <name> <version>` and `[graphics] ...`
+        (the graphics settings in effect, again whenever one changes); native Linux / Android lines come later;
+        (b) **F12** = screenshot of the game picture (after SMAA / MSAA / bloom / gamma, no overlays, at the
+        render resolution - before the window's FXAA / FSR pass and its scaling) as PNG in `<install root>/screenshots/` (`RECOMP_SCREENSHOT_DIR` overrides), written
+        on a thread of its own; (c) **F9** = the internal DEBUG MENU (status-overlay look, keyboard: arrows, F9 /
+        Esc) switching the renderer options at once, not saved - **dev builds only**: CMake `XR_DEBUG_PANEL`
+        (default ON; every release build passes `-DXR_DEBUG_PANEL=OFF`) and never active in an installed release
+        (release.txt present); (d) **UPSCALING: BILINEAR / FSR** with FSR PRESET and FSR SHARPNESS -
+        `nv2a_vk_set_upscaling(fsr, preset, sharpness)`, AMD FSR 1.0 (EASU + RCAS); the preset sets the internal
+        resolution (window height / 1.5 / 1.7 / 2.0, never below the title's own), so RENDER RESOLUTION is greyed
+        while FSR is on; FXAA runs before the upscale; (e) the **launcher's target folder** - the setup window's
+        "Install to:" line with a folder picker (since 2026-11-23 option-p's launcher windows, the maintainer's design
+        standard for every project: src/launcher/port_setup_ui_win95.c on Windows, port_setup_ui_win2000_sdl.c on Linux).
+        Not affected: the port's own menu texts drawn in the game's font (e.g. Orta's RESTART NEEDED),
+        **SHADERS ▸** (the optional slang shaders, if the port has the module), **BOOT ANIMATION ▸ as the
         last line** (SHADERS before it - maintainer, 2026-10-27; a status line - BOOT.MPG FOUND / "NEEDS BOOT MPG IN
         THE MEDIA FOLDER" / "CONVERT BOOT VIDEO TO BOOT.MPG  SEE README" when only a boot.mp4 / mkv is there - then
         ON / OFF, greyed without media/boot.mpg; see "Boot animation" below). Every other line is a value line
@@ -603,11 +713,30 @@ Still in the port: the Android packaging (Gradle app, loader, Vulkan shim) - its
         `D3DKMTWaitForVerticalBlankEvent`, no DXGI; other hosts fall back to the timer until `VK_KHR_present_wait`
         is wired), the pacing thread in `kernel/xbox_memory_layout.c` (measures 60 intervals; engages only on a
         steady 120 / 180 / 240 Hz display, multiple of 60 within 1 %, every interval within 1 ms - variable refresh
-        and 60 / 144 / 165 Hz stay on the timer; the 60 Hz game-time count follows the display too, so game time
+        and 144 / 165 Hz stay on the timer, 60 Hz too until 2026-11-22; the 60 Hz game-time count follows the display too, so game time
         and frames never drift; counts re-based on every change, monotonic), `xbox_GuestDisplayPacing(hwnd)` from
-        the renderer at window creation and display / mode changes. The port's line: **FRAME PACING: DISPLAY
-        (default) / 60 HZ TIMER** in FRAME RATE, after a restart (`RECOMP_FRAME_PACING=timer`). Check with
-        `RECOMP_PACING_STATS=1` (refreshes per presented frame, every 10 s) on a 120 Hz display, timer vs display.
+        the renderer at window creation and display / mode changes. **Since 2026-11-22 (maintainer, the same in
+        option-p): no menu row** - the settings file's `frame_pacing` only, which the port hands over as
+        `RECOMP_FRAME_PACING` at start: `timer+paced`, `timer+immediate`, `display+paced`, `display+immediate`,
+        `auto` (= unset, the default). Source: TIMER = the 60 Hz timer, DISPLAY = every n-th display vblank
+        (60 Hz now counts too: 60 / 120 / 180 / 240, steady, within 1 %; else the timer). Pictures: PACED = the
+        vblank hold, then the present (as before); IMMEDIATE = present as soon as the frame is finished, the hold
+        after it (the game's timing unchanged; lower latency, uneven spacing). auto = the display where it fits,
+        paced - chosen from Orta alone (2026-11-22; timed series at 60 and 120 Hz, full speed and a Steam Deck
+        approximation, two rounds each): paced p99 17.1-17.2 ms with 4-8 frames > 25 ms in
+        gameplay at 60 and 120 Hz, immediate 18.6-19.8 ms with 17-30; display+paced equal to or slightly better
+        than timer+paced (120 Hz gameplay > 25 ms: 4 / 6 vs 6 / 8), and it keeps every frame on the refresh grid
+        (no drift double frames) - so display+paced, timer only where the display cannot pace. Old values `timer` / `display` = that source, paced. Logged once: `[pacing] mode ...`. **GAME
+        SPEED** (`RECOMP_SPEED_LOG=1` or while shown: each second `[speed] second: X %, N pictures, longest gap
+        Y ms`, each 5 s only `[speed] 5 s: slowest second X %` - **no averages** in the overlay or the logs,
+        maintainer 2026-11-22, every port): the lower of (a) the vblanks the game's finished frames asked for
+        (each flip its swap interval) against the guest vblanks gone by and (b) the share of the window the game
+        was not STOPPED - a wait between two new pictures longer than 1.5x what the picture asked for counts as
+        stopped for its time past that, and what is caught up afterwards never makes up for it; never above
+        100 % (a 200 ms freeze in a half second shows ~60 %). 100 % = the title at its own full rate (60 or 30);
+        a title that drops frames under its own clock on purpose reads low. FPS = pictures in the last half
+        second, FRAME TIME = the longest frame of it (not 1000 / FPS). Check with `RECOMP_PACING_STATS=1` (refreshes per presented frame, every 10 s) on a 60
+        and a 120 Hz display, timer vs display.
         References: Orta (option-c), THPS 2X (vulkan-backend).
         **PAL60 rule** (maintainer, 2026-10-24; every port): a PAL title that supports PAL60 never runs at 50 Hz in
         the recomp – no 50 Hz option, no 50 Hz override, its PAL variant always answers PAL60 (a 30-fps title:
@@ -651,9 +780,11 @@ Still in the port: the Android packaging (Gradle app, loader, Vulkan shim) - its
 | `tools\lift.ps1`, `tools\build.ps1`, `tools\lock.ps1` (game repo) | lift, build (shared lock, ≤2 jobs) |
 | `tools\scan_table_seeds.py` (game repo) | data-section pointers to unlifted functions → seeds |
 | `tools/gap_check.py` (toolkit) | every unresolved stub explained (gap / inside / outside), seeds for gaps |
+| `tools/ctx_rewrite.py --toolkit <option-c> --hooks <toml> [--write] src/*.c` (toolkit) | moves a port's hand-written C from global registers to option-c's register context (RECOMP_PARAMS / RECOMP_ARGS through every function that needs it); dry run first, on a clean tree; the REVIEW list (address-taken functions, host entries, macros, fn-pointer typedefs, own `ctx`/`base`) needs a person |
 | `RECOMP_DISASM_SKIP`, `RECOMP_DISASM_EXTRA` | bisect / opt into disassembler passes (`alias_closure`, `nop_boundary`) |
 | `RECOMP_ICALL_FEEDBACK` (CMake `XBOXRECOMP_ICALL_FEEDBACK=ON`, development builds only - never a release, maintainer 2026-11-16) | unresolved indirect-call targets → seeds |
 | `RECOMP_TIMER_WAKE=1` (opt-in, off) | KeSetTimer / KeInsertQueueDpc wake the timer thread at once; changes the pad-report timing, so old replays no longer match - check later with new recordings |
+| `RECOMP_PRESENT_AT=stall` (old point, off) | the window gets the frame at NV097_FLIP_STALL instead of FLIP_INCREMENT_WRITE (default since THPS 2X #19: the stall comes before D3D's AA filter copy into the new front buffer, so presenting there showed the previous frame - +1 frame latency, a screen drawn once never appeared); swap counter + stall wait stay at the stall either way |
 | `RECOMP_STUB_LOG=1` | a reached unresolved stub (a silent no-op) logs its address and caller |
 | `RECOMP_WATCHDOG_SECS`, `RECOMP_PEEK` | where a hang is, guest globals |
 | `RECOMP_GL_DUMP`, `RECOMP_FRAME_TRACE`, pad-script `shot=` | pictures and draw traces |

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT
+     option-c Android APK template (from Panzer Dragoon Orta Recomp). Based on SDL3's android-project template (zlib
+     licence, THIRD_PARTY_NOTICES.txt). The label and the port's strings come from app/build.gradle (-P properties),
+     the icon (@mipmap/ic_launcher) from the port's res folder (-PportRes). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:installLocation="auto">
+
+    <!-- Vulkan 1.3 (the renderer needs it) -->
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x403000" android:required="true" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
+    <!-- rumble -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- icon: the port's own (its res folder); BACK: OnBackInvokedCallback (PortActivity) -->
+    <!-- appCategory game: Android 16 ignores an app's orientation on large screens (sw >= 600 dp, the Tab S8 came up
+         portrait) - games are exempt, so the forced landscape holds there too -->
+    <application android:label="@string/app_name"
+        android:appCategory="game"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:theme="@style/AppTheme"
+        android:enableOnBackInvokedCallback="true"
+        android:hardwareAccelerated="true"
+        android:extractNativeLibs="true">
+
+        <activity android:name=".PortActivity"
+            android:label="@string/app_name"
+            android:alwaysRetainTaskState="true"
+            android:launchMode="singleInstance"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="layoutDirection|locale|grammaticalGender|fontScale|fontWeightAdjustment|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:preferMinimalPostProcessing="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+        </activity>
+        <!-- the restart (RestartActivity.java): its own process, started while the game is in the foreground -->
+        <activity android:name=".RestartActivity"
+            android:process=":restart"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+    </application>
+</manifest>

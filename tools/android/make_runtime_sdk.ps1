@@ -76,7 +76,8 @@ $PrB = Join-Path $Work "probe"
 if (Test-Path (Join-Path $PrB "CMakeCache.txt")) { Remove-Item (Join-Path $PrB "CMakeCache.txt") }
 Step "probe" (@("-S", (Join-Path $Toolkit "tools\android\sdk_probe"), "-B", $PrB) + $Common + @("-DXR_TOOLKIT=$(Cm $Toolkit)",
     "-DXR_SDL3_SO=$(Cm (Join-Path $SdlPrefix 'lib\libSDL3.so'))", "-DXR_SDL3_INCLUDE=$(Cm (Join-Path $SdlPrefix 'include'))",
-    "-DXR_GLSLANG_SO=$(Cm $XgSo)", "-DXR_GLSLANG_INCLUDE=$(Cm (Join-Path $GlPrefix 'include'))")) @("--build", $PrB, "-j", "$Jobs")
+    "-DXR_GLSLANG_SO=$(Cm $XgSo)", "-DXR_GLSLANG_INCLUDE=$(Cm (Join-Path $GlPrefix 'include'))",
+    "-DXR_DEBUG_PANEL=OFF")) @("--build", $PrB, "-j", "$Jobs")   # F9 debug menu: never in a release runtime
 
 # 5. the compile and link commands of the stub, from build.ninja
 $ninja = Get-Content (Join-Path $PrB "build.ninja")

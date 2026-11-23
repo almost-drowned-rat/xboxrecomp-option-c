@@ -98,8 +98,9 @@ static void print_guest_context(void *rip)
 #define HOST_PC_NAME "RIP"
 #endif
 extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr, uint32_t xbox_va, int is_write);
-extern int xbox_OhciOwnsAddress(uint32_t xbox_va);
-extern int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
+#if !defined(XR_PORTHOST_NO_USB)
+#include "ohci.h"                    /* the OHCI module (toolkit src/usb) */
+#endif
 #define APU_TRAP_BASE 0xFE800000u
 #define APU_TRAP_END  0xFE880000u
 

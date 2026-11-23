@@ -32,6 +32,8 @@
 #   DATA="assets/pipelist_orta_pal.bin"    # optional, relative to src/: shipped into data/ by the launcher
 #   DEPS=~/orta_deps                       # appimagetool/ + appimage_runtime/ + sdl3*/
 #   ICON=assets/icon_256.png               # relative to src/
+#   PUBLIC_TOOLKIT=~/xboxrecomp-option-c   # a public release: licenses/source from this clone of the public toolkit,
+#   PUBLIC_TAG=v1.2.0                      # at this tag (default: the version); without it only a --dev build passes
 set -eu
 CONF="${1:?port config}"
 VERSION="${2:?version}"
@@ -145,6 +147,16 @@ for d in $DATA; do
 done
 [ -f "$B/port_icon.h" ] && cp "$B/port_icon.h" "$R/sdk/build/"
 echo "headers: $NH; port sources: ${#SRCLINES[@]}"
+# the APU module (licence option C: the emulation as a replaceable shared library; launcher.c ship_data:
+# tools/runtime/* -> next to the game exe). A build with XBOXRECOMP_APU_SHARED=OFF has none.
+APUMOD=$B/xboxrecomp/src/apu/libxbox_apu.so
+[ -f "$APUMOD" ] || APUMOD=$(find "$B" -name libxbox_apu.so -type f | head -1)
+if [ -n "$APUMOD" ] && [ -f "$APUMOD" ]; then
+  mkdir -p "$R/runtime"; cp "$APUMOD" "$R/runtime/libxbox_apu.so"
+  echo "APU module: libxbox_apu.so ($(du -k "$APUMOD" | cut -f1) KB)"
+elif grep -q '^XBOXRECOMP_APU_SHARED:BOOL=ON' "$B/CMakeCache.txt" 2>/dev/null; then
+  echo "ERROR: the APU module libxbox_apu.so is not in the build $B"; exit 1
+fi
 
 # -- libraries (the link line, in order) --------------------------------------------------------------------------
 mkdir -p "$R/sdk/lib"
@@ -224,6 +236,8 @@ lic LICENSE-xemu-parts-LGPL-2.1.txt          "$TK/LICENSES/LGPL-2.1.txt"
 lic LICENSE-pl_mpeg-MIT.txt                  "$TK/src/bootvideo/third_party/pl_mpeg/LICENSE"
 lic LICENSE-miniz-MIT.txt                    "$TK/src/shaderpack/third_party/miniz/LICENSE"
 lic LICENSE-SMAA-MIT.txt                     "$TK/src/nv2a_vk/third_party/smaa/LICENSE.txt"
+lic LICENSE-DejaVu-fonts.txt                 "$TK/src/nv2a_vk/third_party/dejavu/LICENSE"
+lic LICENSE-LiberationFonts-OFL.txt          "$TK/src/launcher/third_party/liberation/LICENSE"
 lic LICENSE-SDL3-zlib.txt                    "$HOME/deps/SDL3/LICENSE.txt"
 lic COPYRIGHT-glslang.txt                    "$SYS/share/doc/glslang-dev/copyright"
 lic COPYRIGHT-SPIRV-Tools.txt                "$SYS/share/doc/spirv-tools/copyright"
@@ -237,16 +251,40 @@ done
 [ -f "$R/licenses/llvm/LLVM.txt" ] || warn "no LLVM licence text in llvm/LICENSES"
 ls "$R"/licenses/llvm/libc6*.txt >/dev/null 2>&1 || warn "no glibc licence text in llvm/LICENSES"
 [ -f "$R/licenses/python/Python.txt" ] || warn "no Python licence text in python/LICENSES"
+lic THIRD_PARTY_NOTICES.txt                  "$TK/THIRD_PARTY_NOTICES.txt"
+# licence option C (maintainer 2026-11-17): the corresponding source of the LGPL parts (the xemu APU core with this
+# project's changes, the headers it needs) in every release - licenses/source/, with SOURCE.txt
+# The files come from the PUBLIC toolkit snapshot at the release's tag (config PUBLIC_TOOLKIT = its clone,
+# PUBLIC_TAG default = the version): the private tree's comments are not scrubbed and its commits are not public.
+# Without PUBLIC_TOOLKIT (a test release) the private tree is used and SOURCE.txt says so - never publish that.
+if [ -n "${PUBLIC_TOOLKIT:-}" ]; then
+  PTAG=${PUBLIC_TAG:-$VERSION}
+  PSHA=$(git -C "$PUBLIC_TOOLKIT" rev-parse "$PTAG^{commit}") || { echo "ERROR: $PUBLIC_TOOLKIT has no tag $PTAG"; exit 1; }
+  PTREE=$STAGE/public_toolkit; rm -rf "$PTREE"; mkdir -p "$PTREE"
+  git -C "$PUBLIC_TOOLKIT" archive --format=tar "$PSHA" | tar -x -C "$PTREE"
+  "$R/python/bin/python3" -I "$TK/tools/release/lgpl_source.py" "$PTREE" "$R/licenses/source" --version "$VERSION" \
+    --commit "xboxrecomp-option-c, tag $PTAG, commit $PSHA" --notices "$TK/THIRD_PARTY_NOTICES.txt" \
+    || { echo "ERROR: lgpl_source.py failed - the LGPL source bundle is incomplete"; exit 1; }
+else
+  warn "no PUBLIC_TOOLKIT in the config: licenses/source comes from the PRIVATE tree - a test release only"
+  "$R/python/bin/python3" -I "$TK/tools/release/lgpl_source.py" "$TK" "$R/licenses/source" \
+    --version "$VERSION (PRIVATE TREE - not for publishing)" \
+    || { echo "ERROR: lgpl_source.py failed - the LGPL source bundle is incomplete"; exit 1; }
+fi
 cat > "$R/licenses/README.txt" <<EOF
 $TITLE $VERSION (Linux AppImage) - licences of everything in this release.
 
 $TITLE (the port's own code): GPL-3.0-or-later. Built on the xboxrecomp toolkit, branch option-c
 (MIT; its third-party parts in NOTICE-toolkit.txt: the xemu parts LGPL-2.1-or-later, pl_mpeg / miniz / SMAA /
-dr_libs / stb_vorbis / burnout3-sw MIT or public domain). Linked in: SDL3 (zlib), glslang and SPIRV-Tools (BSD / MIT /
+dr_libs / stb_vorbis / stb_truetype / burnout3-sw MIT or public domain, the DejaVu Sans Mono Bold font of the status
+overlays under the Bitstream Vera / Arev licence, the launcher window's Liberation Sans under the SIL OFL 1.1). Linked in: SDL3 (zlib), glslang and SPIRV-Tools (BSD / MIT /
 Apache-2.0). Shipped for the translator and the first start: LLVM 23.1.1 clang + lld (Apache-2.0 with LLVM exception)
 with a glibc 2.35 sysroot (LGPL-2.1-or-later), Python 3.12 (PSF licence) with capstone 5.0.9 (BSD).
 The AppImage runtime (https://github.com/AppImage/type2-runtime, MIT) starts this file.
 The compiler's and Python's own licence folders: llvm/ and python/ (each with a NOTICE.txt naming every file's origin).
+THIRD_PARTY_NOTICES.txt: every third-party part with its copyright and licence.
+source/: the complete source of the LGPL-2.1-or-later parts (the xemu MCPX APU core with this project's changes) as
+built into this release; source/SOURCE.txt says how to rebuild that library and relink the game with it.
 
 Source of this release: the public $PUBLIC_REPO repository, tag $VERSION.
 EOF

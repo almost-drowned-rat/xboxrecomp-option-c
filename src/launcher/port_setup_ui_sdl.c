@@ -1,7 +1,7 @@
 /* port_setup_ui_sdl.c - the toolkit's progress UI (game_setup_ui.h: xr_setup_ui_*) for the Linux and Android port
  * launchers (launcher_port.h; origin: Panzer Dragoon Orta's launcher/setup_ui_sdl.c, Orta Recompiled, moved into
  * the toolkit unchanged on 2026-11-16),
- * in the look of the Windows setup window (port_setup_win32.c; the progress bar in the middle of the screen, for
+ * in the look of the old Windows setup window (port_setup_win32.c, replaced 2026-11-23 by port_setup_ui_win95.c; the progress bar in the middle of the screen, for
  * the Linux AppImage too): a Windows 95 style dialog - grey #C0C0C0 face, 3D bevels, a navy title bar with white bold text, a
  * blocky navy progress bar in a sunken groove. Drawn with the SDL renderer (SDL_RenderDebugText, no font library;
  * MS Sans Serif is not shipped). Only the style; no Microsoft graphics. The close box cancels (as on Windows).
@@ -217,6 +217,38 @@ static int in_close(XrSetupUi *ui, float px, float py)
     return ui->s > 0 && x >= DLG_W - 24 && x <= DLG_W - 2 && y >= 2 && y <= 22;
 }
 
+/* Quit / the close box / Alt+F4 during the installation: asked first (the maintainer 2026-11-23, every launcher) -
+ * No goes on, Yes stops it cleanly (launcher.c stop_build_tools). RECOMP_NO_DIALOGS=1 (the tests): Yes. */
+static void want_quit(XrSetupUi *ui)
+{
+    static const SDL_MessageBoxButtonData buttons[] = {
+        { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "No" },
+        { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Yes" },
+    };
+    SDL_MessageBoxData box;
+    int hit = 0;
+    ui->close_down = 0;
+    if (ui->closed)
+        return;
+    if (xr_no_dialogs()) {
+        ui->closed = 1;
+        return;
+    }
+    SDL_zero(box);
+    box.flags = SDL_MESSAGEBOX_INFORMATION;
+    box.window = ui->win;
+    box.title = ui->title;
+    box.message = "The installation is not finished. Quit anyway?";
+    box.numbuttons = 2;
+    box.buttons = buttons;
+    if (!SDL_ShowMessageBox(&box, &hit))
+        hit = 1;                        /* no box possible: the player's close stands */
+    if (hit == 1)
+        ui->closed = 1;
+    if (ui->ren)
+        draw(ui);                       /* (the box may have covered the dialog) */
+}
+
 void xr_setup_ui_progress(void *p, double fraction, const char *text)
 {
     XrSetupUi *ui = (XrSetupUi *)p;
@@ -226,7 +258,7 @@ void xr_setup_ui_progress(void *p, double fraction, const char *text)
         return;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
-            ui->closed = 1;
+            want_quit(ui);
         } else if (e.type == SDL_EVENT_FINGER_DOWN || e.type == SDL_EVENT_FINGER_UP) {
             int ow = 0, oh = 0;
             SDL_GetRenderOutputSize(ui->ren, &ow, &oh);
@@ -234,7 +266,7 @@ void xr_setup_ui_progress(void *p, double fraction, const char *text)
                 if (e.type == SDL_EVENT_FINGER_DOWN)
                     ui->close_down = 1;
                 else if (ui->close_down)
-                    ui->closed = 1;
+                    want_quit(ui);
             } else if (e.type == SDL_EVENT_FINGER_UP) {
                 ui->close_down = 0;
             }
@@ -246,7 +278,7 @@ void xr_setup_ui_progress(void *p, double fraction, const char *text)
                 if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN)
                     ui->close_down = 1;
                 else if (ui->close_down)
-                    ui->closed = 1;
+                    want_quit(ui);
             } else if (e.type == SDL_EVENT_MOUSE_BUTTON_UP) {
                 ui->close_down = 0;
             }
@@ -275,8 +307,8 @@ int xr_no_dialogs(void)
 
 void xr_setup_ui_message(XrSetupUi *ui, int error, const char *text)
 {
-    if (xr_no_dialogs())
-        return;
+    if (xr_no_dialogs() || (ui && ui->closed))
+        return;                         /* (the player quit during the installation: no "... failed" after it) */
     SDL_ShowSimpleMessageBox(error ? SDL_MESSAGEBOX_ERROR : SDL_MESSAGEBOX_WARNING,
                              ui ? ui->title : "First start", text, ui ? ui->win : NULL);
 }

@@ -24,7 +24,9 @@
 #     Build      = "<private>\build\orta_recomp"     # optional: the build folder (default <Private>\build\<repo name>)
 #     Repo       = "D:\src\my_port"   # optional: when the config does not sit in <repo>\tools\
 #     Licences   = @{ "LICENSE-librashader.txt" = "<path>" }  # optional: further licence texts
-#   }
+#     PublicToolkit = "<clone of xboxrecomp-option-c>"   # a public release: licenses\source from this clone ...
+#     PublicTag  = "v1.2.0"                               # ... at this tag (default: the version); without it the
+#   }                                                     #     bundle is the private tree's, for test releases only
 # Repo = the folder above the config's tools\ folder; Private = <repo>\..\private; Shared = <toolkit>\..\private.
 # Needs a finished build of the port (its tools\build.ps1): it reads that build's build.ninja (compile flags, include
 # folders, link line) and ninja's header list of the port's sources, so the player's machine builds exactly what
@@ -202,6 +204,19 @@ try {
             Copy-Item -LiteralPath $C.Extra[$k] $dst
         }
     }
+    # -- the APU module (licence option C: the emulation as a replaceable shared library; launcher.c ship_data:
+    #    tools/runtime/* -> next to the game exe). A build with XBOXRECOMP_APU_SHARED=OFF has none.
+    $apuMod = Join-Path $Build "xboxrecomp\src\apu\xbox_apu.dll"
+    if (-not (Test-Path -LiteralPath $apuMod)) {
+        $apuMod = Get-ChildItem $Build -Recurse -Filter xbox_apu.dll -File | Select-Object -First 1 -ExpandProperty FullName
+    }
+    if ($apuMod) {
+        New-Item -ItemType Directory "$P\runtime" -Force | Out-Null
+        Copy-Item -LiteralPath $apuMod "$P\runtime\xbox_apu.dll"
+        Write-Host "APU module: xbox_apu.dll ($([math]::Round((Get-Item -LiteralPath $apuMod).Length / 1KB)) KB)"
+    } elseif (Select-String -Path (Join-Path $Build "CMakeCache.txt") -Pattern '^XBOXRECOMP_APU_SHARED:BOOL=ON' -Quiet) {
+        throw "the APU module xbox_apu.dll is not in the build $Build"
+    }
 
     # -- libraries (the link line, in order) --------------------------------------------------------------------
     New-Item -ItemType Directory "$P\sdk\lib" | Out-Null
@@ -269,6 +284,7 @@ try {
         "LICENSE-pl_mpeg-MIT.txt"                  = "$Toolkit\src\bootvideo\third_party\pl_mpeg\LICENSE"
         "LICENSE-miniz-MIT.txt"                    = "$Toolkit\src\shaderpack\third_party\miniz\LICENSE"
         "LICENSE-SMAA-MIT.txt"                     = "$Toolkit\src\nv2a_vk\third_party\smaa\LICENSE.txt"
+        "LICENSE-DejaVu-fonts.txt"                 = "$Toolkit\src\nv2a_vk\third_party\dejavu\LICENSE"
         "LICENSE-SDL3-zlib.txt"                    = (Join-Path $Shared "deps\src\SDL3\LICENSE.txt")
         "LICENSE-glslang.txt"                      = (Join-Path $Shared "deps\src\glslang\LICENSE.txt")
         "LICENSE-Vulkan-SDK.txt"                   = (Get-ChildItem "C:\VulkanSDK\*\Licenses\LICENSE.txt" | Select-Object -Last 1).FullName
@@ -277,20 +293,50 @@ try {
         "LICENSE-llvm-mingw-Apache-2.0-LLVM.txt"   = (Join-Path (Split-Path (Split-Path (Get-Command clang.exe).Source)) "LICENSE.TXT")
         "COPYING-MinGW-w64-runtime.txt"            = "$Mingw\COPYING.MinGW-w64-runtime.txt"
         "COPYING-winpthreads.txt"                  = "$Mingw\COPYING.winpthreads.txt"
+        "THIRD_PARTY_NOTICES.txt"                  = "$Toolkit\THIRD_PARTY_NOTICES.txt"
     }
     if ($C.Licences) { foreach ($k in $C.Licences.Keys) { $lic[$k] = $C.Licences[$k] } }   # e.g. librashader
     foreach ($k in $lic.Keys) {
         if (-not $lic[$k] -or -not (Test-Path -LiteralPath $lic[$k])) { throw "licence text missing for ${k}: $($lic[$k])" }
         Copy-Item -LiteralPath $lic[$k] "$P\licenses\$k"
     }
+    # licence option C (maintainer 2026-11-17): the corresponding source of the LGPL parts (the xemu APU core with
+    # this project's changes, the headers it needs) in every release - licenses\source\, with SOURCE.txt
+    # The files come from the PUBLIC toolkit snapshot at the release's tag (config PublicToolkit = its clone,
+    # PublicTag default = the version): the private tree's comments are not scrubbed and its commits are not public.
+    # Without PublicToolkit (a test release) the private tree is used and SOURCE.txt says so - never publish that.
+    $lgplArgs = @((Join-Path $Toolkit "tools\release\lgpl_source.py"))
+    if ($C.PublicToolkit) {
+        $ptag = if ($C.PublicTag) { $C.PublicTag } else { $Version }
+        $psha = (git -C $C.PublicToolkit rev-parse "$ptag^{commit}").Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $psha) { throw "public toolkit $($C.PublicToolkit) has no tag $ptag" }
+        $ptree = Join-Path $Stage "public_toolkit"
+        if (Test-Path $ptree) { Remove-Item $ptree -Recurse -Force }
+        New-Item -ItemType Directory $ptree | Out-Null
+        git -C $C.PublicToolkit archive --format=tar $psha -o "$ptree.tar"
+        tar -xf "$ptree.tar" -C $ptree
+        Remove-Item "$ptree.tar"
+        $lgplArgs += @($ptree, "$P\licenses\source", "--version", $Version,
+                       "--commit", "xboxrecomp-option-c, tag $ptag, commit $psha",
+                       "--notices", "$Toolkit\THIRD_PARTY_NOTICES.txt")
+    } else {
+        Write-Warning "no PublicToolkit in the config: licenses\source comes from the PRIVATE tree - a test release only"
+        $lgplArgs += @($Toolkit, "$P\licenses\source", "--version", "$Version (PRIVATE TREE - not for publishing)")
+    }
+    & "$P\python\python.exe" -I @lgplArgs
+    if ($LASTEXITCODE -ne 0) { throw "lgpl_source.py failed - the LGPL source bundle is incomplete" }
     $T = $C.Title
     [IO.File]::WriteAllText("$P\licenses\README.txt", ("$T $Version - licences of everything in this release.`r`n`r`n" +
         "$T (the port's own code): GPL-3.0-or-later. Built on the xboxrecomp toolkit, branch option-c`r`n" +
         "(MIT; its third-party parts in NOTICE-toolkit.txt: the xemu parts LGPL-2.1-or-later, pl_mpeg / miniz / SMAA /`r`n" +
-        "dr_libs / stb_vorbis / burnout3-sw MIT or public domain). Linked in: SDL3 (zlib), glslang (BSD / MIT / Apache-2.0),`r`n" +
+        "dr_libs / stb_vorbis / stb_truetype / burnout3-sw MIT or public domain, the DejaVu Sans Mono Bold font of the`r`n" +
+        "status overlays under the Bitstream Vera / Arev licence). Linked in: SDL3 (zlib), glslang (BSD / MIT / Apache-2.0),`r`n" +
         "the Vulkan loader's import library (Apache-2.0), the llvm-mingw runtime (libc++ etc.: Apache-2.0 with LLVM exception;`r`n" +
         "MinGW-w64 runtime, winpthreads). Shipped for the translator: Python 3.12.10 embeddable (PSF licence) with capstone`r`n" +
         "5.0.9 (BSD). Fetched or carried for the first start: llvm-mingw 20260908 (https://github.com/mstorsjo/llvm-mingw).`r`n`r`n" +
+        "THIRD_PARTY_NOTICES.txt: every third-party part with its copyright and licence.`r`n" +
+        "source\: the complete source of the LGPL-2.1-or-later parts (the xemu MCPX APU core with this project's changes)`r`n" +
+        "as built into this release; source\SOURCE.txt says how to rebuild that library and relink the game with it.`r`n`r`n" +
         "Source of this release: the public $($C.PublicRepo) repository, tag $Version.`r`n"), $utf8)
     $build = @("# compile + link (from $Name's build.ninja): cc = the common arguments, src / gen = the units, rc, link") +
              @("cc`t" + ($cc -join "`t")) + $srcLines + @("gen`t*.c", "rc`t{TOOLS}/src/assets/$rcLeaf`t/I`t{TOOLS}/src/assets",

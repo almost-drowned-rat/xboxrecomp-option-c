@@ -199,7 +199,8 @@ int mcpx_aci_block_play(volatile uint8_t *blk, unsigned frames, mcpx_aci_mem_fn 
 extern volatile uint8_t *xbox_ac97_nabm(void);
 extern void xbox_ac97_host_begin(void);
 extern void xbox_ac97_host_end(void);
-extern void (*g_ac97_after_write)(volatile uint8_t *nabm, const uint8_t *before_100, uint32_t off);
+/* through a call, not the exe's variable: the APU may be a shared library (apu_module.h) */
+extern void xbox_ac97_set_after_write(void (*fn)(volatile uint8_t *nabm, const uint8_t *before_100, uint32_t off));
 extern void xbox_set_irq_line(uint32_t vector, int level);
 extern uint8_t *mcpx_apu_phys(uint64_t addr);
 
@@ -232,7 +233,7 @@ void mcpx_aci_attach(void)
     const char *e = getenv("RECOMP_AC97_MODEL");
     if (s_attached || (e && *e == '0') || !xbox_ac97_nabm())
         return;
-    g_ac97_after_write = after_write;
+    xbox_ac97_set_after_write(after_write);
     s_attached = 1;
     fprintf(stderr, "[AC97] channel model attached: analog +0x110, digital +0x170, interrupt vector %u"
             " (RECOMP_AC97_MODEL=0 turns it off)\n", ACI_VECTOR);

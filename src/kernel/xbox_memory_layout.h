@@ -203,10 +203,19 @@ int64_t xbox_GuestNsToNextVblank(void);
 /* The display's vblank count, a fixed 60 Hz (titles that count vblanks for time). */
 uint64_t xbox_DisplayVblankCount(void);
 /* FRAME PACING Display: the renderer hands over its native window (creation,
- * display change); on a display at 120 / 180 / 240 Hz the guest vblank and the
- * 60 Hz count then follow the display's own vblank. RECOMP_FRAME_PACING=timer
- * keeps the 60 Hz timer. */
+ * display change); on a display at 60 / 120 / 180 / 240 Hz the guest vblank and
+ * the 60 Hz count then follow the display's own vblank. RECOMP_FRAME_PACING
+ * (settings file only, no menu row): timer+paced, timer+immediate,
+ * display+paced, display+immediate, auto (unset; old timer / display = that
+ * source, paced). */
 void xbox_GuestDisplayPacing(void *native_window);
+/* 1 = pictures "immediate" (present as soon as finished, the vblank hold
+ * after it), 0 = "paced" (hold, then present; default). */
+int xbox_FramePacingImmediate(void);
+/* GAME SPEED: the executor per flip with the swap's interval; the overlay
+ * compares the sum with the guest vblanks gone by (xbox_GuestVblankCount). */
+void xbox_GuestFlipNote(uint32_t swap_interval);
+uint64_t xbox_GuestFlipVblanksAsked(void);
 /* RECOMP_PACING_STATS=1: the renderer after each present; a histogram of the
  * display refreshes per presented frame every 10 s (also with the timer). */
 void xbox_GuestPresentNote(void);

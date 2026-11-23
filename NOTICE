@@ -46,6 +46,11 @@ LGPL-2.1-or-later — extracted from xemu
   src/apu/apu_shim.h is this project's own file but is released under the
   same licence, because it exists only to host the extracted APU code.
 
+  Since 2026-11-17 the APU files are built into a shared library of their
+  own, the APU module (xbox_apu.dll / libxbox_apu.so; docs/apu_module.md),
+  which a user can replace with one built from modified sources; releases
+  carry those sources in licenses/source/.
+
   Licensed under the GNU Lesser General Public License, version 2.1 or (at
   your option) any later version. The full text is in LICENSES/LGPL-2.1.txt;
   the canonical copy is
@@ -142,6 +147,29 @@ Public domain / MIT-0 / MIT — vendored unchanged (branch vulkan-backend)
   LICENSE.txt next to the files). Built into the renderer as GLSL at
   configure time (CMake turns SMAA.hlsl into a header).
 
+  AMD FidelityFX Super Resolution 1.0 (src/nv2a_vk/third_party/fsr1/:
+  ffx_a.h, ffx_fsr1.h, LICENSE.txt), GPUOpen-Effects/FidelityFX-FSR, commit
+  a21ffb8; (c) 2021 Advanced Micro Devices, Inc.; MIT (the LICENSE.txt next
+  to the files). Vendored unchanged; built into the renderer as GLSL at
+  configure time (CMake turns both headers into bytes) for UPSCALING: FSR.
+
+  stb_truetype (src/nv2a_vk/third_party/stb/stb_truetype.h), nothings/stb,
+  v1.26, sha256 ecd30b05e0dd4fea3a13c26810dd9e1992dc379049482c393d5a19e6b5090aab;
+  (c) Sean Barrett / RAD Game Tools; MIT or public domain, at your choice
+  (the licence at the end of the header). Vendored unchanged; rasterises the
+  bundled font for option-c's status overlays (src/nv2a_vk/status_overlay.c,
+  written for this toolkit). It reads only the bundled font.
+
+  DejaVu Sans Mono Bold (src/nv2a_vk/third_party/dejavu/:
+  DejaVuSansMono-Bold.ttf, LICENSE), dejavu-fonts 2.37
+  (dejavu-fonts-ttf-2.37.zip, sha256 of the font
+  bce60f1b4421acd9ea51ba6623d7024ecbe6817a953e3654df62a5e6bdf8f769); the
+  Bitstream Vera fonts (c) 2003 Bitstream, Inc., glyphs from the Arev fonts
+  (c) Tavmjong Bah, DejaVu changes in the public domain; the Bitstream Vera /
+  Arev licence (the LICENSE next to the font). Unmodified and under its own
+  name; built into the renderer as bytes at configure time (CMake turns the
+  font into a header).
+
   miniz (src/shaderpack/third_party/miniz/: miniz_tinfl.c, miniz_tinfl.h,
   miniz.h, miniz_common.h, miniz_tdef.h, miniz_zip.h, LICENSE),
   richgel999/miniz, tag 3.1.2, commit 77d0dce; (c) 2013-2014 RAD Game Tools
@@ -218,6 +246,38 @@ Reference material (no code taken)
   behaviour: register offsets, kernel export ordinals, structure layouts.
   Those are functional facts rather than expression, and no code was copied
   for them.
+
+
+Taken from this project's own ports (branch option-c, MIT by the maintainer)
+---------------------------------------------------------------------------
+
+  templates/android/  (2026-11-19)
+    The Android APK packaging of Panzer Dragoon Orta Recomp (written for it
+    by its agents O and L, 2026-11-11..19), made port-neutral and put under
+    MIT with the maintainer's word; Orta itself is GPL-3.0. Its Gradle /
+    manifest skeleton follows SDL3's android-project template (zlib);
+    RestartActivity follows the scheme of ProcessPhoenix (Apache-2.0),
+    written anew; TouchOverlay's UX model is the maintainer's SpaghettiKart
+    handheld fork, no code taken. libadrenotools (BSD-2-Clause) is linked
+    from its own source tree (templates/android/LICENSE-libadrenotools-BSD-2.txt).
+
+  tools/ctx_rewrite.py  (2026-11-19)
+    From THPS 2X 2.0 (567f33c), MIT with the maintainer's word.
+
+  src/launcher/port_setup_ui_win2000_sdl.c  (2026-11-23)
+    The Linux launcher window of ps2recomp-option-p (launcher/
+    game_setup_ui_win95_sdl.c, b42fb84), taken over
+    on the maintainer's word with the Xbox ports' texts; it stays
+    GPL-3.0-or-later, like the other port launcher files from Panzer Dragoon
+    Orta Recomp (launcher_port.c, port_setup_ui_sdl.c). The Windows window
+    src/launcher/port_setup_ui_win95.c (2026-11-23) is the same: a copy of
+    option-p's launcher/game_setup_ui_win95.c (b42fb84), GPL-3.0-or-later.
+    Its font: Liberation Sans Regular + Bold (src/launcher/third_party/
+    liberation/: LiberationSans-Regular.ttf, LiberationSans-Bold.ttf,
+    LICENSE), digitized data (c) 2010 Google Corporation, (c) 2012 Red Hat,
+    Inc., SIL Open Font License 1.1 (the LICENSE next to the fonts);
+    unmodified, under their own name, built into the Linux launcher as bytes
+    at configure time.
 
 
 Contributors to xboxrecomp itself are credited in CONTRIBUTORS.md.

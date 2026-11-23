@@ -1,0 +1,114 @@
+THIRD_PARTY_NOTICES - xboxrecomp toolkit (Option C)
+===================================================
+
+Every release built with tools/release/port_release.ps1 or port_release_linux.sh carries this file. It lists the
+third-party code compiled into a port built with this toolkit, with each part's copyright and licence. The
+toolkit's own NOTICE (NOTICE-toolkit.txt in a release) says which file comes from where; the licence texts are
+in licenses/ in a release (LICENSES/ in the toolkit).
+
+
+1. LGPL-2.1-or-later: the MCPX APU core, extracted from xemu
+-------------------------------------------------------------
+
+  https://github.com/xemu-project/xemu
+
+  src/apu/apu_core.c, apu_vp.c, apu_dsp.c, apu_regs.h, apu_state.h, apu_debug.h, xbox_adpcm.h, fpconv.h, apu.h,
+  apu_shim.h (this project's own, same licence), src/nv2a_gl/gl_vsh_ff.c
+
+    Copyright (c) 2012, 2015 espes
+    Copyright (c) 2015, 2018-2019 Jannik Vogel
+    Copyright (c) 2018-2025 Matt Borgerson
+
+  GNU Lesser General Public License, version 2.1 or (at your option) any later version: the full text is
+  licenses/LICENSE-xemu-parts-LGPL-2.1.txt.
+
+  The APU files are built into the APU module, a shared library of its own next to the game (xbox_apu.dll /
+  libxbox_apu.so), which can be replaced with one built from modified sources (licenses/source/SOURCE.txt).
+  The complete corresponding source of these files as built into this release, including this project's
+  changes, is in licenses/source/ (with SOURCE.txt: the toolkit commit, and how to rebuild the library and
+  relink the game with a modified one).
+
+
+2. MIT
+------
+
+  Each part below is under the MIT licence (text in section 5) with the copyright line(s) given.
+
+  xboxrecomp toolkit (incl. the OHCI controller and USB pad, src/usb; AC97, src/apu/apu_aci.c; the DSP56300
+  interpreter and GP model, src/apu/apu_dsp56k.c, apu_gp.c; src/apu/apu_resample.h, apu_lowpass.h,
+  apu_xaudio2.c, apu_mmio_hook.c, qemu_shim.h; the Vulkan renderer from antoxa2584x/burnout3-sw)
+    Copyright (c) 2026 sp00nz (and the contributors in CONTRIBUTORS.md)
+
+  XboxXBE-Recomp (TGP482): tools/symbols/xbe2pe.py adapted; src/xdk/xdk_xinput.c, xdk_dsound.c after it
+    Copyright (c) 2026 TGP482
+
+  SMAA (iryoku/smaa 71c806a): src/nv2a_vk/third_party/smaa
+    Copyright (C) 2013 Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando Navarro, Diego Gutierrez
+
+  AMD FidelityFX Super Resolution 1.0 (GPUOpen-Effects/FidelityFX-FSR a21ffb8): src/nv2a_vk/third_party/fsr1 (MIT)
+    Copyright (c) 2021 Advanced Micro Devices, Inc.
+
+  stb_truetype v1.26 (nothings/stb): src/nv2a_vk/third_party/stb (MIT or public domain, at your choice)
+    Copyright (c) 2017 Sean Barrett
+
+  DejaVu Sans Mono Bold 2.37 (dejavu-fonts): src/nv2a_vk/third_party/dejavu (Bitstream Vera / Arev licence, the
+  LICENSE next to the font; DejaVu changes in the public domain)
+    Copyright (c) 2003 by Bitstream, Inc.; Arev glyphs Copyright (c) 2006 by Tavmjong Bah
+
+  Liberation Sans Regular + Bold (liberation-fonts): src/launcher/third_party/liberation (SIL Open Font License 1.1,
+  the LICENSE next to the fonts) - the Linux launcher window's font
+    Digitized data copyright (c) 2010 Google Corporation; Copyright (c) 2012 Red Hat, Inc.
+
+  miniz 3.1.2 (richgel999/miniz): src/shaderpack/third_party/miniz
+    Copyright 2013-2014 RAD Game Tools and Valve Software
+    Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
+
+  pl_mpeg (phoboslab/pl_mpeg c871f2b): src/bootvideo/third_party/pl_mpeg
+    Copyright (c) Dominic Szablewski
+
+  stb_vorbis (nothings/stb 003501f; MIT or public domain, at your choice): src/media/third_party
+    Copyright (c) 2017 Sean Barrett
+
+  librashader C header (librashader-v0.12.0): src/nv2a_vk/third_party/librashader/librashader.h
+    Copyright 2022 chyyran
+    (only the header; a port that ships librashader's DLL ships its own licence and source location)
+
+
+3. Public domain / MIT No Attribution
+-------------------------------------
+
+  dr_mp3, dr_flac, dr_wav (mackron/dr_libs d422edf): src/media/third_party
+    Copyright 2023 David Reid - public domain (Unlicense) or MIT No Attribution, at your choice
+
+
+4. Other licences, full texts in licenses/
+-------------------------------------------
+
+  SDL3 (zlib licence)                     Copyright (C) 1997-2026 Sam Lantinga     LICENSE-SDL3-zlib.txt
+  glslang (several permissive licences)   copyright holders as named in the text   LICENSE-glslang.txt
+  Vulkan SDK parts                        copyright holders as named in the text   LICENSE-Vulkan-SDK.txt
+  Shipped for the player's machine's lift and link only, not compiled into the game:
+  capstone (BSD-3), Python (PSF), LLVM / llvm-mingw (Apache-2.0 with LLVM exception; MinGW-w64 runtime parts),
+  glibc sysroot (Linux, LGPL-2.1-or-later) - their texts are in licenses/.
+  Android APK only (templates/android): the Gradle / manifest skeleton follows SDL3's android-project template
+  (zlib, as SDL3 above); libadrenotools (bylaws/libadrenotools 8fae8ce, BSD-2-Clause, Copyright (c) 2021, Billy
+  Laws) is linked into libvulkan_port.so - its text is templates/android/LICENSE-libadrenotools-BSD-2.txt, which
+  the port's APK carries; a Turnip driver (Mesa, MIT) is never shipped: the player picks one.
+
+
+5. The MIT licence text (for every part in section 2)
+-----------------------------------------------------
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and
+to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.

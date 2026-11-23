@@ -99,8 +99,29 @@ void xr_setup_ui_progress(void *p, double fraction, const char *text)
     if (!ui || !ui_show(ui))
         return;
     while (SDL_PollEvent(&e))
-        if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED)
-            ui->closed = 1;
+        if ((e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) && !ui->closed) {
+            /* during the installation: asked first (the maintainer 2026-11-23, every launcher) - No goes on, Yes
+             * stops it (launcher.c stop_build_tools); RECOMP_NO_DIALOGS=1 (the tests): Yes */
+            static const SDL_MessageBoxButtonData buttons[] = {
+                { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "No" },
+                { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Yes" },
+            };
+            SDL_MessageBoxData box;
+            int hit = 1;
+            if (!xr_no_dialogs()) {
+                SDL_zero(box);
+                box.flags = SDL_MESSAGEBOX_INFORMATION;
+                box.window = ui->win;
+                box.title = ui->title;
+                box.message = "The installation is not finished. Quit anyway?";
+                box.numbuttons = 2;
+                box.buttons = buttons;
+                if (!SDL_ShowMessageBox(&box, &hit))
+                    hit = 1;
+            }
+            if (hit == 1)
+                ui->closed = 1;
+        }
     now = SDL_GetTicks();
     if (fraction < 1.0 && now - ui->last_draw < 50)
         return;                         /* 20 redraws a second are plenty */
@@ -137,8 +158,8 @@ int xr_no_dialogs(void)
 
 void xr_setup_ui_message(XrSetupUi *ui, int error, const char *text)
 {
-    if (xr_no_dialogs())
-        return;
+    if (xr_no_dialogs() || (ui && ui->closed))
+        return;                         /* (the player quit during the installation: no "... failed" after it) */
     SDL_ShowSimpleMessageBox(error ? SDL_MESSAGEBOX_ERROR : SDL_MESSAGEBOX_WARNING,
                              ui ? ui->title : "First start", text, ui ? ui->win : NULL);
 }

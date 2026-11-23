@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(adpcm_decode_test C)
 set(CMAKE_C_STANDARD 11)
+set(XBOXRECOMP_APU_SHARED OFF CACHE BOOL "" FORCE)   # the emulation's internals: the static APU
 add_subdirectory(../.. runtime)
 add_executable(adpcm_decode_test test_main.c)
 target_include_directories(adpcm_decode_test PRIVATE ../../src ../../src/apu)

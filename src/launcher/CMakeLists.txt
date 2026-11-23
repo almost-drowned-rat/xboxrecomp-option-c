@@ -29,15 +29,41 @@ endif()
 set(_xr_porthost_dir ${CMAKE_CURRENT_SOURCE_DIR}/../porthost)   # not CMAKE_SOURCE_DIR: that is the port's root
 add_library(xbox_launcher_port INTERFACE)
 if(WIN32)
+    # Windows (the maintainer 2026-11-23: every project in Option P's designs): option-p's launcher window
+    # (port_setup_ui_win95.c - Windows 95's look, plain GDI, the first page and the build's progress in one window)
     target_sources(xbox_launcher_port INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/launcher_port.c
-                   ${CMAKE_CURRENT_SOURCE_DIR}/port_setup_win32.c ${_xr_porthost_dir}/xr_vk_check.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/port_setup_ui_win95.c ${_xr_porthost_dir}/xr_vk_check.c
                    ${_xr_porthost_dir}/host_port.c)
     target_link_libraries(xbox_launcher_port INTERFACE comdlg32 shell32 ole32 gdi32 user32)
-else()
+elseif(ANDROID)
     target_sources(xbox_launcher_port INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/launcher_port.c
                    ${CMAKE_CURRENT_SOURCE_DIR}/port_setup_ui_sdl.c ${_xr_porthost_dir}/xr_vk_check.c
                    ${_xr_porthost_dir}/host_port.c)
     target_link_libraries(xbox_launcher_port INTERFACE ${CMAKE_DL_LIBS})
+else()
+    # Linux (the maintainer 2026-11-23): option-p's launcher window (port_setup_ui_win2000_sdl.c - Windows 2000's look,
+    # the first page with the disc image and the install folder) with its font Liberation Sans Regular + Bold
+    # (third_party/liberation, SIL OFL 1.1; see NOTICE) built in as bytes (made here at configure time) and rasterised
+    # by stb_truetype (src/nv2a_vk/third_party/stb, MIT / public domain; header only).
+    set(_xr_launcher_gen ${CMAKE_CURRENT_BINARY_DIR}/launcher_gen)
+    file(MAKE_DIRECTORY ${_xr_launcher_gen})
+    foreach(_face Regular Bold)
+        string(TOLOWER ${_face} _face_lower)
+        set(_font_file ${CMAKE_CURRENT_SOURCE_DIR}/third_party/liberation/LiberationSans-${_face}.ttf)
+        set(_font_inc ${_xr_launcher_gen}/liberation_sans_${_face_lower}.inc)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_font_file})
+        if(NOT EXISTS ${_font_inc} OR ${_font_file} IS_NEWER_THAN ${_font_inc})
+            file(READ ${_font_file} _font_hex HEX)
+            string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _font_bytes "${_font_hex}")
+            file(WRITE ${_font_inc} "/* generated from src/launcher/third_party/liberation/LiberationSans-${_face}.ttf */\n${_font_bytes}\n")
+        endif()
+    endforeach()
+    target_sources(xbox_launcher_port INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/launcher_port.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/port_setup_ui_win2000_sdl.c ${_xr_porthost_dir}/xr_vk_check.c
+                   ${_xr_porthost_dir}/host_port.c)
+    target_include_directories(xbox_launcher_port INTERFACE ${_xr_launcher_gen}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/../nv2a_vk/third_party/stb)
+    target_link_libraries(xbox_launcher_port INTERFACE m ${CMAKE_DL_LIBS})
 endif()
 target_include_directories(xbox_launcher_port INTERFACE ${CMAKE_CURRENT_SOURCE_DIR} ${_xr_porthost_dir})
 target_link_libraries(xbox_launcher_port INTERFACE xbox_launcher)

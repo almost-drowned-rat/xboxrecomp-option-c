@@ -41,7 +41,9 @@ static APUMixerVoice g_mixer_voices[APU_MIXER_MAX_VOICES];
 static volatile int g_mixer_active_count = 0;
 static CRITICAL_SECTION g_mixer_cs;
 static bool g_mixer_initialized = false;
-struct McpxApuDebug g_dbg;
+#if !defined(XR_APU_MODULE)
+struct McpxApuDebug g_dbg;                  /* the APU module: the exe's (apu_state.h, apu_module.c) */
+#endif
 struct McpxApuDebug g_dbg_cache;
 int g_dbg_voice_monitor = -1;
 uint64_t g_dbg_muted_voices[4] = { 0 };

@@ -30,7 +30,10 @@ extern "C" {
 void host_version_text(const char *game_dir, char *buf, size_t n);
 /* "Windows 10.0.26300 x64" / "Wine 9.0 (...) on Linux 6.x; Steam Deck, Gamescope" */
 void host_describe(char *buf, size_t n);
-/* both, as the lines "version: ..." and "host: ..." on stdout */
+/* "AMD Ryzen 5 5600H with Radeon Graphics, 6 cores / 12 threads", "15.4 GB (9.2 GB free)", "Balanced"
+ * (2026-11-22, the maintainer's log wishlist; Windows and Wine - native Linux / Android: empty here) */
+void host_describe_machine(char *cpu, size_t ncpu, char *ram, size_t nram, char *power, size_t npower);
+/* the lines "version: ...", "host: ..." and, where known, "cpu: ...", "ram: ...", "power plan: ..." on stdout */
 void host_log_version_and_host(const char *game_dir);
 
 #ifdef __cplusplus

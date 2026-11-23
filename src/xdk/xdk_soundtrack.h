@@ -62,16 +62,22 @@ int  xdk_soundtrack_song_of_handle(uint32_t handle, MediaSong *song);
 /* ── Music media object ─────────────────────────────────────────────── */
 
 /* PCM at 44100 Hz, 2 channels, s16 interleaved. read: frames written, 0 at
- * the end, -1 on an error. */
+ * the end, -1 on an error. Every callback gets the calling guest thread's
+ * register context first (2026-11-18, for THPS 2X 2.0): a port's
+ * game-track source runs the title's own lifted decoder (guest_call into its
+ * WMA objects), which needs ctx. They are called on the guest thread that
+ * called the music object's method (or xdk_music_create / _skip / _jump);
+ * `c` is the source's own state (XdkMusicSource.ctx). The toolkit's album
+ * decoders ignore ctx. */
 typedef struct {
     void *ctx;
-    long (*read)(void *ctx, int16_t *out, long frames);
-    int  (*rewind)(void *ctx);
-    void (*close)(void *ctx);
+    long (*read)(RECOMP_PARAMS, void *c, int16_t *out, long frames);
+    int  (*rewind)(RECOMP_PARAMS, void *c);
+    void (*close)(RECOMP_PARAMS, void *c);
 } XdkMusicSource;
 
 /* The port's game tracks (index as in media_playlist.h): 1 and a source. */
-typedef int (*XdkOpenGameTrack)(int track, XdkMusicSource *src);
+typedef int (*XdkOpenGameTrack)(RECOMP_PARAMS, int track, XdkMusicSource *src);
 
 /* vtable: the title's WMA file media object vtable (11 methods: AddRef,
  * Release, GetInfo, GetStatus, Process, Discontinuity, Flush, Seek,
@@ -81,8 +87,10 @@ void xdk_music_bind(uint32_t vtable, XdkOpenGameTrack open_game);
 /* A host media object that starts with `first`. pl: the playlist to follow
  * at the end of a song (taken over; NULL = this song only). pwfx: the
  * caller's WAVEFORMATEX, filled with the PCM format (0 = none). Returns the
- * guest object, 0 when no song of the list can be opened. */
-uint32_t xdk_music_create(MediaSong first, MediaPlaylist *pl, uint32_t pwfx);
+ * guest object, 0 when no song of the list can be opened. create / skip /
+ * jump may open a game track (the port's callback): call them on a guest
+ * thread with its ctx (from a hook or a stub), never from a host thread. */
+uint32_t xdk_music_create(RECOMP_PARAMS, MediaSong first, MediaPlaylist *pl, uint32_t pwfx);
 int  xdk_music_owns(uint32_t obj);
 /* The newest live music object: 1 and the song it plays (a title's "now
  * playing" display); has_playlist: whether it follows a playlist. */
@@ -90,11 +98,11 @@ int  xdk_music_current(MediaSong *song, int *has_playlist);
 /* The newest live music object with a playlist moves on to its next song at
  * once (a "next song" entry). 1 when done; 0 when there is none -- the port
  * then asks the title for its next track itself. */
-int  xdk_music_skip(void);
+int  xdk_music_skip(RECOMP_PARAMS);
 /* The newest live music object with a playlist plays `song` at once and
  * follows its playlist from there (a "select track" entry; a shuffled list
  * goes on in its own order). 1 when done; 0 when there is none. */
-int  xdk_music_jump(MediaSong song);
+int  xdk_music_jump(RECOMP_PARAMS, MediaSong song);
 
 void xdk_music_AddRef(RECOMP_PARAMS);            /* (this)                    4 */
 void xdk_music_Release(RECOMP_PARAMS);           /* (this)                    4 */

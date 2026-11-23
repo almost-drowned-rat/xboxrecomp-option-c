@@ -13,6 +13,7 @@ set(KERNEL_SOURCES
     kernel_thread.c
     kernel_sync.c
     kernel_hal.c
+    kernel_spin.c
     kernel_xbox.c
     xbox_settings.c
     xbox_variant.c

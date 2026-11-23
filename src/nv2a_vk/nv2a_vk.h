@@ -64,7 +64,31 @@ int nv2a_vk_render_scale_fits(double factor, int wide);
  * half second in ms, both, or none (default). Any thread; the next frame.
  * RECOMP_FPS_HUD set in the environment overrides it (1 = both, fps, ms, 0). */
 enum { NV2A_VK_HUD_OFF, NV2A_VK_HUD_FPS, NV2A_VK_HUD_BOTH, NV2A_VK_HUD_MS };
-void nv2a_vk_set_fps_hud(int mode);
+void nv2a_vk_set_fps_hud(int mode);   /* the old form; maps onto the PERFORMANCE overlay below */
+
+/* PERFORMANCE overlay (maintainer 2026-11-22, same in option-p): three
+ * independent parts, the port's ON/OFF switches FPS / FRAME TIME / GAME SPEED
+ * (menu page PERFORMANCE, with V-SYNC). FPS = pictures shown a second;
+ * FRAME TIME = the longest frame of the last half second; GAME SPEED = the
+ * game's own speed in % (the vblanks its finished frames asked for - each
+ * flip its swap interval - against the guest vblanks that went by; a title
+ * that drops frames on purpose under its own clock reads low). Settings key
+ * performance_overlay = fps / frametime / speed joined by '+', all, off
+ * (nv2a_vk_perf_overlay_parse; unset: map the old fps_counter). Any thread; the
+ * next frame. RECOMP_PERF_OVERLAY (same words) overrides; RECOMP_SPEED_LOG=1
+ * logs "[speed] 5 s: average X %, slowest second Y %" (also while SPEED shows). */
+enum { NV2A_VK_PERF_FPS = 1, NV2A_VK_PERF_FRAMETIME = 2, NV2A_VK_PERF_SPEED = 4, NV2A_VK_PERF_ALL = 7 };
+
+/* UPSCALING (RECOMP OPTIONS > POST PROCESSING, maintainer 2026-11-20/21): fsr 0 = BILINEAR (as before), 1 = FSR
+ * (AMD FidelityFX Super Resolution 1.0); preset 0 QUALITY / 1 BALANCED / 2 PERFORMANCE sets the internal resolution
+ * (window height / 1.5 / 1.7 / 2.0, never below the title's own) - the RENDER RESOLUTION line has no effect while
+ * FSR is on; sharpness 0 LOW / 1 MEDIUM / 2 HIGH / 3 MAX. Any thread; the next frame. RECOMP_VK_FSR=off|quality|
+ * balanced|performance and RECOMP_VK_FSR_SHARP=low|medium|high|max override it. */
+enum { NV2A_VK_FSR_QUALITY, NV2A_VK_FSR_BALANCED, NV2A_VK_FSR_PERFORMANCE };
+enum { NV2A_VK_FSR_SHARP_LOW, NV2A_VK_FSR_SHARP_MEDIUM, NV2A_VK_FSR_SHARP_HIGH, NV2A_VK_FSR_SHARP_MAX };
+void nv2a_vk_set_upscaling(int fsr, int preset, int sharpness);
+void nv2a_vk_set_perf_overlay(int mask);
+int  nv2a_vk_perf_overlay_parse(const char *s);
 
 /* "Menus stretched" (aspect-ratio rule, porting_guide.md M6): with 16:9 on,
  * frames the port marked 4:3 (xbox_SetPresentWide(0): menus, movies) are
@@ -78,6 +102,13 @@ void nv2a_vk_set_stretch_43(int on);
  * stay untouched). 256 entries per channel, 0..255. An identity ramp (the default) costs nothing: no pass. Any
  * thread; the next flip. RECOMP_VK_GAMMA=0 turns it off. */
 void nv2a_vk_set_gamma_ramp(const uint8_t r[256], const uint8_t g[256], const uint8_t b[256]);
+/* The same with a source text for the log: every CHANGED ramp logs one "[VK] gamma: identity | ramp r a/b/c g .. b ..
+ * at 64/128/192 (source <text>)" line (plus one "source start" line at the first flip); a port's menu passes e.g.
+ * "menu brightness +2". nv2a_vk_set_gamma_ramp = source "port". From menus / settings, not per frame.
+ * RECOMP_SHOT_GAMMA=1: named shots (g_xbox_screenshot_hook) are taken from the frame after SMAA, bloom and the ramp,
+ * as the player sees it (also headless, for the shot), instead of the title's surface before them. */
+void nv2a_vk_set_gamma_ramp_from(const uint8_t r[256], const uint8_t g[256], const uint8_t b[256],
+                                 const char *source);
 
 /* WINDOW CROP (maintainer rule, 2026-11-01; porting guide aspect-ratio rule): in windowed mode the black margins a
  * title leaves inside its frame (TV safe area / overscan) are cut off - the presented surface is read back every
@@ -141,6 +172,29 @@ void nv2a_vk_set_shader_preset(const char *path);
  * Call before the window is made; RECOMP_VK_PIPELIST=<file> does the same. NULL = none. (nv2a_vk.c "shipped
  * pipeline list"; maintainer 2026-11-15, step 6.) */
 void nv2a_vk_set_pipeline_list(const char *path);
+/* The pipeline list in the BACKGROUND (maintainer 2026-11-19, an option against Android's black first start): read at
+ * start, built a few entries per frame on the async compile worker (installed as async builds; the first frame comes
+ * at once). Call before the renderer starts; RECOMP_VK_PIPELIST_BG=0/1 when not called. Default off. _progress: 1
+ * while entries are still going to the worker; done / total = pipelines handed over / in the list (a progress line). */
+void nv2a_vk_set_pipeline_list_background(int on);
+int nv2a_vk_pipeline_list_progress(uint32_t *done, uint32_t *total);
+/* Async shader compile at run time, for a port's options menu (2026-11-18, maintainer's order via A: an option in
+ * RECOMP OPTIONS). NV2A_VK_ASYNC_OFF = compile on the executor (every object drawn from its first frame, hitches),
+ * _SKIP = build on the worker and skip the draw until it is done, _WAIT = build on the worker and wait up to
+ * RECOMP_VK_ASYNC_WAIT_US per frame first (the default). RECOMP_VK_ASYNC stays the start value. Any thread; takes
+ * effect at the renderer's next draw (builds already queued finish and are installed in every mode). Logged as
+ * "[vk] async: mode <old> -> <new> (runtime)". _get = the mode in effect (or requested and not applied yet).
+ * _HYBRID (RECOMP_VK_ASYNC=hybrid, in development - docs/hybrid_ubershader.md): while the shader builds, the draw is
+ * drawn with the prebuilt uber fragment shader when the device has VK_EXT_graphics_pipeline_library (fast linking)
+ * and a vertex shader for the draw exists; otherwise as _WAIT. */
+enum { NV2A_VK_ASYNC_OFF = 0, NV2A_VK_ASYNC_SKIP = 1, NV2A_VK_ASYNC_WAIT = 2, NV2A_VK_ASYNC_HYBRID = 3 };
+void nv2a_vk_set_async_mode(int mode);
+int nv2a_vk_get_async_mode(void);
+/* SHADER NOTICE (maintainer 2026-11-18; RECOMP OPTIONS line right under SHADER COMPILE): a small "BUILDING
+ * SHADERS" panel in the top-right corner while draws wait for, skip or build a shader (and 1 s after), in the
+ * layout of every option-c status line (status_overlay.c). On by default; any thread; RECOMP_VK_SHADER_NOTICE=0/1
+ * forces it. Never in screenshots or surface dumps. */
+void nv2a_vk_set_shader_notice(int on);
 /* A parameter of the current preset (its #pragma parameter name), applied now
  * or once the preset is built. Any thread. */
 void nv2a_vk_set_shader_param(const char *name, float value);
