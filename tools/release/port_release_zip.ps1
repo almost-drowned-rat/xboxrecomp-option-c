@@ -90,6 +90,9 @@ try {
     if ((Get-Item -LiteralPath $rl).Length -gt 1MB) { throw "$rl is larger than 1 MiB" }
     $rlj = Get-Content -LiteralPath $rl -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($rlj.format -ne 1) { throw "$rl has no `"format`": 1" }
+    # still the template's placeholders (templates/game/recomplauncher.json: "<...>" / "@NAME@")? then not filled in
+    $rlt = [IO.File]::ReadAllText($rl)
+    if ($rlt -match '"<[^"]*>"|"[^"]*<the [^"]*>[^"]*"|@[A-Z0-9]+@') { throw "$rl still has template placeholders: $($Matches[0])" }
     [IO.File]::WriteAllText((Join-Path $Z "recomplauncher.json"), [IO.File]::ReadAllText($rl), $utf8)   # (no BOM)
     Copy-Item -LiteralPath $Notes -Destination (Join-Path $D "release_notes.md")
 

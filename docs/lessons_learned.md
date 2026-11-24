@@ -614,3 +614,19 @@ new one at the milestone it was found. Workflow: [porting_guide.md](porting_guid
   can still hold the slot - check the lock line before telling the maintainer "it is running".
 - An open remote-play stream (hardware video encoder in use) distorts timing: a regress can wait for it
   (`nvidia-smi encoder.stats.sessionCount == 0`) instead of asking someone to watch for it.
+
+## THPS 2X 2.0 on Android (2026-11-24)
+
+### Never read back from mapped upload memory
+The renderer's frame ring (`ring_alloc`) and every other host-visible buffer it writes for the GPU is mapped GPU
+memory: on phones (Adreno) write-combined / uncached, so every read from it goes to memory, one access at a time.
+`nv2a_backend_decode_texture` copied a linear X8R8G8B8 row into the ring and then set the alpha with
+`row[x] |= 0xFF000000` - a read of the ring for every texel. THPS 2X's 640x480 menu background, new every frame,
+cost ~75 ms a frame on the Odin 2: menus at 11 fps, GAME SPEED 16-21 %. Setting the alpha while copying (only
+writes; 735da21) gave 60 fps / ~100 %. On a desktop GPU the same code was fast, so desktop numbers never show it.
+**Rule:** into mapped memory only write - build the value in a local or read it from the source, then store it once;
+no `|=`, `+=`, `x = dst[i]`, `if (block->field)` on a mapped pointer. Readback buffers (screenshots, the crop
+check) are the exception: they are meant to be read.
+The grep after it (2026-11-24) found the same pattern three more times, all fixed with locals: the HUD squash
+read the position back from the ring (direct and converted attributes), and the vertex UBO block read `lit`,
+`aa[1]` and did `tgen |=` on the ring.

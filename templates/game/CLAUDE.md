@@ -85,7 +85,9 @@ Borrowed code: origin (repo, commit, file) in the header comment and in `docs/so
     play all in order, play all custom in order. Kept in the settings file.
   - **RECOMP OPTIONS** – the last line; one list (maintainer, 2026-10-26, built in THPS 2X; the model for
     every port): DISPLAY MODE (FULLSCREEN = exclusive at the display's native mode / BORDERLESS / WINDOWED;
-    default BORDERLESS, at once), RENDER RESOLUTION, ASPECT RATIO (4:3 / 16:9), MENUS AT 16:9 (PILLARBOXED /
+    default BORDERLESS, at once; **hidden on Android** - maintainer 2026-11-24, every window-mode line and
+    fullscreen toggle: `#ifdef __ANDROID__` leaves the line out, never greyed out; Android is always full screen
+    in landscape), RENDER RESOLUTION, ASPECT RATIO (4:3 / 16:9), MENUS AT 16:9 (PILLARBOXED /
     STRETCHED, shown only with 16:9; movies always stay 4:3), ANISOTROPIC FILTER, **ANTIALIASING ▸** (a sub-menu
     with every choice: OFF / FXAA / SMAA / MSAA 2X / MSAA 4X, default FXAA, at once), **FRAME RATE ▸** (FRAME RATE,
     VSYNC, FPS COUNTER: OFF / FPS / FPS AND FRAME TIME / FRAME TIME), **SHADERS ▸** (if the port has the shader

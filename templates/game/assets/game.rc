@@ -1,0 +1,57 @@
+// game.rc -- the exe's resources (assets/README.md): its icon, its identity (VERSIONINFO) and an application manifest.
+// Compiled with llvm-rc; Windows builds only. The port's CMakeLists.txt adds it to BOTH the game target and the
+// launcher target, and tools/release.psd1 names it (Rc = "assets\game.rc", RcFiles = @("assets\icon.ico")), so the
+// game the player's machine builds carries it as well.
+//
+// Why (maintainer 2026-11-24): two antivirus heuristics (Bkav Pro, Acronis Static ML) flagged Orta's release zip.
+// Releases stay unsigned; an exe that at least names itself (product, version, description) and declares asInvoker
+// scores as less suspicious. port_release.ps1 refuses a resource script without the VERSIONINFO or the manifest,
+// and one whose ProductVersion is not the start of -Version.
+//
+// Per release: FILEVERSION / PRODUCTVERSION (numbers, comma separated) and the two version strings = the release's
+// version (port_release -Version). No #include: plain numbers (llvm-rc on the player's machine has no include path).
+// Keep the manifest as it is - no DPI awareness, no common-controls entry (both change how the windows look).
+
+1 ICON "icon.ico"
+
+1 24
+BEGIN
+    "<?xml version=""1.0"" encoding=""UTF-8"" standalone=""yes""?>\n"
+    "<assembly xmlns=""urn:schemas-microsoft-com:asm.v1"" manifestVersion=""1.0"">\n"
+    "  <assemblyIdentity type=""win32"" name=""@NAME@"" version=""1.0.0.0"" processorArchitecture=""amd64""/>\n"
+    "  <description>@TITLE@</description>\n"
+    "  <trustInfo xmlns=""urn:schemas-microsoft-com:asm.v3"">\n"
+    "    <security><requestedPrivileges><requestedExecutionLevel level=""asInvoker"" uiAccess=""false""/></requestedPrivileges></security>\n"
+    "  </trustInfo>\n"
+    "  <compatibility xmlns=""urn:schemas-microsoft-com:compatibility.v1"">\n"
+    "    <application><supportedOS Id=""{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}""/></application>\n"
+    "  </compatibility>\n"
+    "</assembly>\n"
+END
+
+1 VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "ProductName", "@TITLE@"
+            VALUE "FileDescription", "@TITLE@ - static recompilation (needs your own copy of the game)"
+            VALUE "ProductVersion", "0.1.0"
+            VALUE "FileVersion", "0.1.0"
+            VALUE "InternalName", "@NAME@"
+            VALUE "Comments", "Contains no game data. Source: see README.txt."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

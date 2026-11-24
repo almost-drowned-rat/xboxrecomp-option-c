@@ -7375,28 +7375,32 @@ static int upload_vertices(const Nv2aRawBatch *b)
     for (i = 0; i < nrun; i++)
         if (!run[i].buf)
             memcpy(dst + run[i].at, run[i].lo, (size_t)(run[i].hi - run[i].lo));
+    /* dst is the frame ring - mapped GPU memory, write-combined / uncached on phones: the squash reads x from the
+     * title's vertex (guest memory) and the converted attributes are built in a local, never read back from dst
+     * (docs/lessons_learned.md, 2026-11-24) */
     if (s_sq_on && (direct & 1u) && b->direct[0].type == 2) {
         const VRun *r = &run[of_run[0]];
         uint8_t *p0 = dst + r->at + (size_t)(b->direct[0].ptr - r->lo);
+        const uint8_t *s0 = (const uint8_t *)b->direct[0].ptr;
         for (v = 0; v < nv; v++) {
             float x;
-            uint8_t *q = p0 + (size_t)v * b->direct[0].stride;
-            memcpy(&x, q, 4);
+            memcpy(&x, s0 + (size_t)v * b->direct[0].stride, 4);
             x = s_sq_a + (x - s_sq_a) / s_sq_kd;
-            memcpy(q, &x, 4);
+            memcpy(p0 + (size_t)v * b->direct[0].stride, &x, 4);
         }
     }
     if (np) {
         float *out = (float *)(dst + pack_at);
         for (v = 0; v < nv; v++)
             for (i = 0; i < np; i++) {
-                float *o = out + ((size_t)v * np + i) * 4;
+                float t4[4];
                 if (cdirect & (1u << slot[i]))
-                    attr_to_float4(b, slot[i], v, o);
+                    attr_to_float4(b, slot[i], v, t4);
                 else
-                    memcpy(o, b->attrs + ((size_t)v * NV2A_RAW_ATTRS + slot[i]) * 4, 16);
+                    memcpy(t4, b->attrs + ((size_t)v * NV2A_RAW_ATTRS + slot[i]) * 4, 16);
                 if (s_sq_on && slot[i] == 0)       /* HUD squash, converted position */
-                    o[0] = s_sq_a + (o[0] - s_sq_a) / s_sq_kd;
+                    t4[0] = s_sq_a + (t4[0] - s_sq_a) / s_sq_kd;
+                memcpy(out + ((size_t)v * np + i) * 4, t4, 16);
             }
     }
     memcpy(dst + const_at, b->attr_const, NV2A_RAW_ATTRS * 16);
@@ -8200,8 +8204,12 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
         }
         memcpy(vb->m, b->composite, sizeof vb->m);
         memcpy(vb->vpoff, b->vp_offset, sizeof vb->vpoff);
+        /* vb lies in the frame ring - mapped GPU memory, write-combined / uncached on phones: written only, never
+         * read back (docs/lessons_learned.md, 2026-11-24); what is needed again is kept in locals (aay, lit, tgen) */
+        const float aay = b->aa_sy > 0 ? b->aa_sy : 1.0f;
+        int32_t lit, tgen = 0;
         vb->aa[0] = b->aa_sx > 0 ? b->aa_sx : 1.0f;
-        vb->aa[1] = b->aa_sy > 0 ? b->aa_sy : 1.0f;
+        vb->aa[1] = aay;
         vb->xform = b->xform == 1 ? 1 : 0;
         /* The fog unit's input for fixed-function vertices (SET_FOG_GEN_MODE,
          * as xemu's vsh-ff.c reads it). Planar: distance = plane . eye + w,
@@ -8226,8 +8234,9 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
             vb->d1mode = !spec ? 1 : (lc & (1u << 17)) ? 3 : 2;
             vb->lflags = (r[0x03A4 / 4] ? 1 : 0) | ((lc & (1u << 16)) ? 2 : 0) | ((lc & 1u) ? 4 : 0)
                        | (spec ? 8 : 0) | ((lc & (1u << 17)) ? 16 : 0) | (s_ffp_mark ? 32 : 0);
-            vb->lit = b->xform == 1 && r[0x0314 / 4] && s_ffp_light;
-            if (vb->lit) {
+            lit = b->xform == 1 && r[0x0314 / 4] && s_ffp_light;
+            vb->lit = lit;
+            if (lit) {
                 int li;
                 vb->colmat = (int32_t)r[0x0298 / 4];
                 vb->lmask = (int32_t)r[0x03BC / 4];
@@ -8258,30 +8267,30 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
          * Before this every point was drawn 1 pixel wide (no gl_PointSize) - Burnout 3's particles. */
         vb->ptctl[0] = r[0x0318 / 4] ? 1.0f : 0.0f;
         vb->ptctl[1] = (float)(r[0x043C / 4] & 0x1FF) / 8.0f;
-        vb->ptctl[2] = vb->aa[1] * (float)s->ph / (float)s->h;
+        vb->ptctl[2] = aay * (float)s->ph / (float)s->h;
         if (b->prim == 1) {
             memcpy(vb->pt, &r[0x0A30 / 4], sizeof vb->pt);
-            if (!vb->lit)
+            if (!lit)
                 memcpy(vb->mv, &r[0x0480 / 4], sizeof vb->mv);
         }
         /* Fixed-function texgen (gl_vsh_ff.c, after xemu): REFLECTION_MAP on S/T/R
          * (SET_TEXGEN_S/T/R 0x03C0 + stage * 0x10) and the texture matrix after it
          * (SET_TEXTURE_MATRIX_ENABLE). THPS 2X's skaters sample a cube map with
          * it. Other texgen modes stay unimplemented: the vertex's own coordinates.
-         * The ring is not cleared, so tgen is always written. */
-        vb->tgen = 0;
+         * The ring is not cleared, so tgen is always written (once, from the local). */
         if (b->xform == 1 && (s_ffp_texgen == 1 || (s_ffp_texgen == 2 && !((s_frame / s_ffp_texgen_period) & 1u)))) {
             int st, c;
             for (st = 0; st < 4; st++) {
                 for (c = 0; c < 3; c++)
                     if (r[(0x03C0 + st * 0x10 + c * 4) / 4] == 0x8512)
-                        vb->tgen |= 1 << (st * 4 + c);
+                        tgen |= 1 << (st * 4 + c);
                 if (r[(0x0420 + st * 4) / 4]) {
-                    vb->tgen |= 1 << (16 + st);
+                    tgen |= 1 << (16 + st);
                     memcpy(vb->tmat[st * 4], &r[(0x06C0 + st * 0x40) / 4], 64);
                 }
             }
         }
+        vb->tgen = tgen;
         ub[0].buffer = s_f->ring;
         ub[0].offset = vat;
         ub[0].range = sizeof(VsBlock);

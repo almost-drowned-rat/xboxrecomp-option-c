@@ -14,7 +14,9 @@
 #     GameExe    = "ORTA.exe"                        # that target's output
 #     GameName   = "ORTA"                            # the lifter's --game-name
 #     GenMatch   = '[\\/]orta[\\/]gen[\\/][^\\/]+$'  # the generated-C include folder (becomes {GEN})
-#     Rc         = "assets\orta.rc"                  # resource script + the files it needs, relative to the repo
+#     Rc         = "assets\orta.rc"                  # resource script + the files it needs, relative to the repo; it must
+#                                                     #   hold a VERSIONINFO (ProductVersion = -Version) + a manifest
+#                                                     #   (model: templates/game/assets/game.rc)
 #     RcFiles    = @("assets\icon.ico")
 #     Config     = @("config\game.toml", "config\variants\*.toml")   # copied to the payload at the same paths
 #     Licence    = "LICENSE-Orta-recomp-GPL-3.0.txt"
@@ -178,6 +180,17 @@ try {
         $srcLines += "src`t{TOOLS}/$rel"
     }
     $rcLeaf = Split-Path -Leaf $C.Rc
+    # The resource script names the exe (maintainer 2026-11-24, after two antivirus heuristics flagged Orta's zip: an
+    # unsigned exe without any identity scores as suspicious): a VERSIONINFO with the port's names and this release's
+    # version, and an application manifest (asInvoker) - the model is templates/game/assets/game.rc. The launcher and
+    # the game the player's machine builds both carry it.
+    $rcText = [IO.File]::ReadAllText((Join-Path $Repo $C.Rc))
+    if ($rcText -notmatch '(?m)^\s*1\s+VERSIONINFO\b') { throw "$($C.Rc) has no '1 VERSIONINFO' block (templates/game/assets/game.rc)" }
+    if ($rcText -notmatch '(?m)^\s*1\s+24\b') { throw "$($C.Rc) has no application manifest '1 24' (templates/game/assets/game.rc)" }
+    $rcVer = [regex]::Match($rcText, 'VALUE\s+"ProductVersion"\s*,\s*"([^"]+)"').Groups[1].Value
+    if (-not $rcVer -or -not $Version.StartsWith($rcVer)) {
+        throw "$($C.Rc): ProductVersion '$rcVer' does not match -Version $Version (set FILEVERSION / PRODUCTVERSION / the version strings first)"
+    }
     New-Item -ItemType Directory "$P\src\assets" -Force | Out-Null
     Copy-Item (Join-Path $Repo $C.Rc) "$P\src\assets\$rcLeaf"
     foreach ($f in @($C.RcFiles)) { if ($f) { Copy-Item (Join-Path $Repo $f) "$P\src\assets" } }
@@ -290,6 +303,17 @@ try {
 
     # -- Python (embeddable) + capstone ----------------------------------------------------------------------------
     Expand-Archive -LiteralPath $PyZip -DestinationPath "$P\python"
+    # Only what the lifter uses (maintainer 2026-11-24, antivirus heuristics): it needs ctypes (capstone), subprocess,
+    # hashlib (the built-in SHA-2 when _hashlib is gone) and plain-Python modules. Network, TLS / crypto, databases,
+    # installer, sound, async and multiprocessing modules go - a launcher that downloads nothing carries no TLS - and
+    # pythonw.exe (toolchain.txt names python.exe).
+    foreach ($f in "_ssl.pyd", "libssl-3.dll", "libcrypto-3.dll", "_hashlib.pyd", "_socket.pyd", "_sqlite3.pyd",
+                   "sqlite3.dll", "_msi.pyd", "_wmi.pyd", "winsound.pyd", "_asyncio.pyd", "_overlapped.pyd",
+                   "_multiprocessing.pyd", "pythonw.exe") {
+        $fp = Join-Path "$P\python" $f
+        if (-not (Test-Path -LiteralPath $fp)) { throw "the embeddable Python has no $f (pinned zip changed?)" }
+        Remove-Item -LiteralPath $fp
+    }
     New-Item -ItemType Directory "$P\python\Lib\site-packages" | Out-Null
     Copy-Item $Capstone "$P\python\Lib\site-packages\capstone" -Recurse
     Get-ChildItem "$P\python\Lib\site-packages\capstone" -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force

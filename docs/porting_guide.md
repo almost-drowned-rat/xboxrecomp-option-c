@@ -517,6 +517,12 @@ State: toolkit branch `launcher` (head 65019c1: `src/launcher/`, `src/install/ga
    exe) and `RECOMPLAUNCHER_JSON=recomplauncher.json` (port_release_linux.sh: AppDir root `/recomplauncher.json`; a
    tar.gz carries it at its top) - both refuse a release without it, or with no `"format": 1`, or over 1 MiB. One file
    per repo for Windows + Linux: the Windows entries and the Linux / Android entries side by side.
+   **Start from `templates/game/recomplauncher.json`** (since 2026-11-24, the maintainer: everything the Android work found is
+   standard for every port; model THPS 2X 2.0.0): new_port.ps1 fills its placeholders; then the input's label and
+   `check`, the settings the port's settings file has, and `start.program` / `prepare.program` with the **exact file
+   names of the release** (`<exe>_launcher.exe`, the AppImage asset's name, `<exe>_launcher` in the tar.gz).
+   `prepare.done` = `{install}/data/build/stamp.txt` - written after a whole build on Windows and Linux (the game exe's
+   name differs per platform, so it cannot be the check).
 
 THPS 2X on the dev machine (2 compile threads): download 14 s, lift 117 s, compile 55 s, `tools\` 773 MB, exe
 24.6 MB.
@@ -536,7 +542,7 @@ a new port takes these instead of copying them from Orta or THPS:
 | Release exe + zip (Windows), AppImage (Linux) | `tools/release/port_release.ps1`, `port_release_zip.ps1`, `port_release_linux.sh` | `tools/release.psd1` / a `.conf` with its names (headers of the scripts) |
 | Regression + timing + first-start E2E | `tools/g3` (`g3_regress.ps1`, `g3_series.ps1`, `g3_firststart.ps1`) | `tools/g3/<port>.psd1` (parts, scripts, minimum frames / draws) |
 | Rumble | the OHCI model forwards the title's output report (260af9e) | nothing |
-| Android APK (Gradle app, loader, on-device lift / compile / link, Vulkan shim with Turnip, touch controls, BACK menu) | `templates/android/` (from Orta's packaging, MIT since 2026-11-19; README.md there) | `port_android.h`, `port_icon.h`, `setup_ui_sdl.c`, the icons, and the `-P` properties (app id, names, version) from its build script; **every Android port: the thread placement check** (maintainer 2026-11-24 - A/B with a recorded pad script, long frames, GAME SPEED, the `[GATE]` ISR/DPC wait maximum, schedstat run-queue waits; templates/android/README.md) and `libxbox_apu.so` in jniLibs when the port uses the APU |
+| Android APK (Gradle app, loader, on-device lift / compile / link, Vulkan shim with Turnip, touch controls, BACK menu) | `templates/android/` (from Orta's packaging, MIT since 2026-11-19; since 2026-11-24 Orta Android 1.3.0's standard: the Vista setup screen, 5 kept Turnip drivers, the fixed BACK menu, run logs; README.md there) - **the only Android base of every port** (the maintainer, 2026-11-24: no port keeps its own Android packaging; Orta's next Android release moves onto it too) | only `port_android.h`, `port_icon.h`, the icons, and the `-P` properties (app id, names, version, `setupGame` / `setupDisc`) from its build script - model: THPS 2X's `packaging/android`; **every Android port: the thread placement check** (maintainer 2026-11-24 - A/B with a recorded pad script, long frames, GAME SPEED, the `[GATE]` ISR/DPC wait maximum, schedstat run-queue waits; templates/android/README.md) and `libxbox_apu.so` in jniLibs when the port uses the APU |
 
 ## M6 – settings in the game's own menu
 
@@ -564,8 +570,10 @@ a new port takes these instead of copying them from Orta or THPS:
         RATE where the port has it, then four ON/OFF switches **V-SYNC, FPS, FRAME TIME, GAME SPEED** - the last
         three stored as `performance_overlay` = fps / frametime / speed joined by `+`, `all`, `off`, unset = the
         old `fps_counter` mapped; `nv2a_vk_set_perf_overlay(NV2A_VK_PERF_*)`, `nv2a_vk_perf_overlay_parse`; NO
-        FRAME PACING row any more - settings file only, see "Frame pacing" below; Android ports hide DISPLAY
-        MODE), **SHADER COMPILE: OFF / SKIP / WAIT / HYBRID** (maintainer, 2026-11-18: a FIXED part of every option-c
+        FRAME PACING row any more - settings file only, see "Frame pacing" below; **Android ports hide every
+        window-mode option** - DISPLAY MODE, fullscreen toggles, windowed fullscreen: the line is left out under
+        `#ifdef __ANDROID__`, never greyed out; Android is always full screen in landscape - maintainer 2026-11-24,
+        for every new port; the existing Android ports comply already), **SHADER COMPILE: OFF / SKIP / WAIT / HYBRID** (maintainer, 2026-11-18: a FIXED part of every option-c
         port's RECOMP OPTIONS; `nv2a_vk_set_async_mode` / `_get`, applies at once; OFF = compile on the spot
         (hitches), SKIP = draw it once built (objects missing for a moment), WAIT = wait up to 2.5 ms per frame,
         then skip, HYBRID = a prebuilt ubershader draws until the specialised shader is built; default HYBRID on

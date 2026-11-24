@@ -350,6 +350,10 @@ RLJ=$SRC/$RECOMPLAUNCHER_JSON
 [ "$(stat -c %s "$RLJ")" -le 1048576 ] || { echo "$RLJ is larger than 1 MiB"; exit 1; }
 python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8-sig")); sys.exit(0 if d.get("format")==1 else 1)' "$RLJ" \
   || { echo "$RLJ: not JSON, or no \"format\": 1"; exit 1; }
+# still the template's placeholders (templates/game/recomplauncher.json: "<...>" / "@NAME@")? then not filled in
+if grep -qE '"<[^"]*>"|"[^"]*<the [^"]*>[^"]*"|@[A-Z0-9]+@' "$RLJ"; then
+  echo "$RLJ still has template placeholders: $(grep -oE '"<[^"]*>"|"[^"]*<the [^"]*>[^"]*"|@[A-Z0-9]+@' "$RLJ" | head -1)"; exit 1
+fi
 sed '1s/^\xEF\xBB\xBF//' "$RLJ" > "$A/recomplauncher.json"     # (a BOM from a Windows editor dropped)
 
 # glibc check: no binary in the AppDir may need more than the sysroot's glibc (2.35)

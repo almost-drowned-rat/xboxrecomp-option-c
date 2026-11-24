@@ -11,3 +11,10 @@ Every port supplies its own icon here (maintainer, 2026-10-27; porting guide M6,
 lettering or any publisher / developer branding. The maintainer sees the icon before it goes into a release.
 
 Until a port has its own files, the build leaves the default icon in place (no `game.rc`, no `xbox_set_window_icon`).
+
+**`game.rc` (here, the model):** besides the icon it holds the exe's identity - a `VERSIONINFO` (product name,
+description, version) and an application manifest (`asInvoker`). Maintainer 2026-11-24, after two antivirus
+heuristics flagged Orta's unsigned release: every port's exe names itself. Link it into the game AND the launcher;
+`tools/release/port_release.ps1` refuses a resource script without both, and one whose `ProductVersion` is not the
+start of `-Version` - bump the version lines with each release. The icon has all four sizes (one 256 px PNG entry
+alone is a weak, high-entropy resource).

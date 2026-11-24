@@ -20,6 +20,11 @@ if(MSVC)
 else()
     target_compile_options(xbox_launcher PRIVATE -Wall -Wextra -O2)
 endif()
+# The launcher exe carries no debug sections (maintainer 2026-11-24, antivirus heuristics: a plain, stripped exe
+# with a VERSIONINFO + manifest - templates/game/assets/game.rc). INTERFACE: it reaches every exe linking the launcher.
+if(MINGW)
+    target_link_options(xbox_launcher INTERFACE -s)
+endif()
 
 # xbox_launcher_port (launcher_port.h, 2026-11-16, from Orta's launcher): the port launcher's main, setup window
 # and progress UI in the look of my other ports' launchers. INTERFACE sources, so they are compiled INTO the port's launcher exe:
