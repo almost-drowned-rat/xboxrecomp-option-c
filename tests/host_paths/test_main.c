@@ -75,6 +75,12 @@ int main(void)
          "D:\\Games\\Orta\\Data\\ORTA.exe", 0);
     rule("not data", "/home/p/orta/mydata/orta", NULL, NULL, "/home/p/orta/mydata/", "/home/p/orta/mydata/orta", 0);
     rule("data at top", "/data/orta", NULL, NULL, "/", "/data/orta", 0);
+    /* an AppImage unpacked by RecompLauncher: AppRun with APPDIR = the game's folder, no APPIMAGE (2026-11-24) */
+    rule("unpacked launcher", "/home/p/Games/THPS/usr/bin/thps2x-recomp", NULL, "/home/p/Games/THPS",
+         "/home/p/Games/THPS/", "/home/p/Games/THPS/usr/bin/thps2x-recomp", 0);
+    rule("unpacked game", "/home/p/Games/THPS/data/thps2x", NULL, "/home/p/Games/THPS/",
+         "/home/p/Games/THPS/", "/home/p/Games/THPS/data/thps2x", 0);
+    rule("unpacked elsewhere", "/usr/bin/othertool", NULL, "/home/p/Games/THPS", "/usr/bin/", "/usr/bin/othertool", 0);
 
     r = xbox_host_root();
     s = xbox_host_self();

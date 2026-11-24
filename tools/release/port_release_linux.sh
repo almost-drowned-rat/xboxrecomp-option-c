@@ -87,9 +87,10 @@ vars() {   # vars <build line regex>: the "  NAME = value" lines after it
 MV=$(vars "^build CMakeFiles/$TRX[.]dir/src/main[.]c[.]o:")
 FLAGS=$(sed -n 's/^  FLAGS = //p' <<<"$MV"); DEFINES=$(sed -n 's/^  DEFINES = //p' <<<"$MV")
 INCLUDES=$(sed -n 's/^  INCLUDES = //p' <<<"$MV")
-LINKLINE=$(grep -E "^build [^:]*/$GAME: C_EXECUTABLE_LINKER__$TRX" "$N" | head -1)
+# the game exe in a sub-folder of the build (Orta) or at its top (THPS 2X: "build THPS2X: ...")
+LINKLINE=$(grep -E "^build ([^:]*/)?$GAME: C_EXECUTABLE_LINKER__$TRX" "$N" | head -1)
 [ -n "$LINKLINE" ] || { echo "$GAME's link line not found"; exit 1; }
-LV=$(vars "^build [^:]*/$GAME: C_EXECUTABLE_LINKER__$TRX")
+LV=$(vars "^build ([^:]*/)?$GAME: C_EXECUTABLE_LINKER__$TRX")
 LFLAGS=$(sed -n 's/^  LINK_FLAGS = //p' <<<"$LV"); LLIBS=$(sed -n 's/^  LINK_LIBRARIES = //p' <<<"$LV")
 PORTOBJS=$(sed -e "s/^[^:]*: C_EXECUTABLE_LINKER__${TRX}_[A-Za-z]* //" -e 's/ | .*//' <<<"$LINKLINE" | tr ' ' '\n' | grep "^CMakeFiles/$TRX[.]dir/src/.*[.]o\$")
 [ -n "$PORTOBJS" ] || { echo "no port objects on the link line"; exit 1; }
@@ -141,8 +142,13 @@ for o in $PORTOBJS; do
   mkdir -p "$(dirname "$R/$rel")"; cp "$SRC/$rel" "$R/$rel"
   SRCLINES+=("src	{TOOLS}/$rel")
 done
-mkdir -p "$R/config/variants" "$R/sdk/build"
-cp "$SRC/config/game.toml" "$R/config/"; cp "$SRC"/config/variants/*.toml "$R/config/variants/"
+mkdir -p "$R/sdk/build"
+# the lifter config of a port that lifts with config/game.toml + variants (Orta); a port with its own LIFT_FILE and
+# no such files (THPS 2X: Windows' Config = @()) ships none
+if [ -f "$SRC/config/game.toml" ]; then
+  mkdir -p "$R/config/variants"; cp "$SRC/config/game.toml" "$R/config/"
+  ls "$SRC"/config/variants/*.toml >/dev/null 2>&1 && cp "$SRC"/config/variants/*.toml "$R/config/variants/"
+fi
 # shipped data (keys only, never game data): the toolkit launcher copies tools/data/* into data/ (launcher.c ship_data)
 for d in $DATA; do
   [ -f "$SRC/$d" ] || { echo "data file missing: $SRC/$d"; exit 1; }
@@ -165,8 +171,14 @@ fi
 # -- libraries (the link line, in order) --------------------------------------------------------------------------
 mkdir -p "$R/sdk/lib"
 LINK=()
+xl=""
 for f in $LFLAGS; do
   case "$f" in --sysroot=*|-fuse-ld=*) continue ;; esac  # added once below, as {TOOLS}
+  # CMake 3.27+ adds the linker's dependency file of this build ("-Xlinker --dependency-file=CMakeFiles/...link.d"
+  # or -Wl,--dependency-file=...): a path in the build machine's build tree - the player's link fails on it
+  if [ "$f" = -Xlinker ]; then xl=1; continue; fi
+  case "$f" in --dependency-file=*|-Wl,--dependency-file=*|-Wl,--dependency-file,*) xl=""; continue ;; esac
+  [ -n "$xl" ] && { LINK+=("-Xlinker"); xl=""; }
   LINK+=("$(to_tools "$f")")
 done
 LINK+=("-L{TOOLS}/sdk/lib")

@@ -71,6 +71,21 @@ int xbox_host_paths_resolve(const char *exe, const char *appimage, const char *a
         copy(self, self_n, appimage);
         return 1;
     }
+    /* An unpacked AppImage (2026-11-24): RecompLauncher never runs an AppImage on Linux - it unpacks it into
+     * the game's folder and starts AppRun with APPDIR = that folder and no APPIMAGE (its SDK guide, "AppImages").
+     * The folder is then the player's writable root (game/, saves/, media/, data/ beside AppRun and usr/), not the
+     * exe's usr/bin. AppRun sets APPDIR itself when it is started by hand from an extracted image. */
+    if (!is_absolute(appimage) && is_absolute(appdir) && under(exe, appdir)) {
+        size_t k;
+        copy(root, root_n, appdir);
+        k = strlen(root);
+        if (k > 0 && !is_sep(root[k - 1]) && k + 1 < root_n) {
+            root[k] = '/';
+            root[k + 1] = 0;
+        }
+        copy(self, self_n, exe);
+        return 0;                                  /* no AppImage file: a restart runs the exe itself */
+    }
     dir_of(root, root_n, exe);
     copy(self, self_n, exe);
     {

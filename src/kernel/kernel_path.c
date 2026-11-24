@@ -1245,6 +1245,29 @@ void xbox_path_init_cfg(const XboxPathConfig *cfg)
     tdata = s_tdata_place == XBOX_TDATA_DATA ? s_cache_dir : s_save_dir;
     mkdir_p(s_save_dir);
     mkdir_p(s_cache_dir);
+    {   /* The layout marker all the same (2026-11-24, THPS 2.0 Linux storage test): a later layout migrates
+         * from what it names, so a POSIX save folder must say which one it is in from its first start. The same file
+         * and text as storage_migrate (Win32); layout 1 = the Win32 XBOX_STORAGE_LAYOUT. Nothing is moved. */
+        const char *want = s_tdata_place == XBOX_TDATA_DATA ? "data" : "saves";
+        char have[16] = "";
+        int layout = 0;
+        FILE *fp;
+        snprintf(dir, sizeof dir, "%s/storage_layout.txt", s_save_dir);
+        if ((fp = fopen(dir, "r")) != NULL) {
+            if (fscanf(fp, "layout %d tdata %15s", &layout, have) < 1)
+                layout = 0;
+            fclose(fp);
+        }
+        if (layout != 1 || strcmp(have, want) != 0) {
+            if ((fp = fopen(dir, "w")) != NULL) {
+                fprintf(fp, "layout %d tdata %s\n", 1, want);
+                fprintf(fp, "# Written by the runtime; do not edit. A newer build migrates once\n"
+                            "# from the layout named here (moves, never deletes).\n");
+                fclose(fp);
+            }
+            fprintf(stderr, "  [STORAGE] layout %d -> 1 (tdata in %s), 0 item(s) moved\n", layout, want);
+        }
+    }
     mkdir_p(s_pending_dir);
     pending_cleanup();
     snprintf(dir, sizeof dir, "%s/UDATA/%08X", s_save_dir, s_title_id);

@@ -374,3 +374,13 @@ line says otherwise.
   it off), with a thread placement check for every Android port (`templates/android/README.md`).
 - **RECOMP OPTIONS layout** (`docs/recomp_options_layout.md`): one layout for every port, the same as
   ps2recomp-option-p's; each port builds its menu in its game's own look.
+
+## 14. Changes for the Linux build of THPS 2X Recompiled v2.0.0
+
+- **AppImage unpacked by RecompLauncher:** RecompLauncher unpacks an AppImage into the game's folder and starts
+  `AppRun` with `APPDIR` and no `APPIMAGE`; that folder is now the player's root (game/, saves/, data/ beside
+  `AppRun`), not `usr/bin` (`tests/host_paths`, 3 new cases).
+- **Storage layout marker on Linux / Android:** `saves/storage_layout.txt` is written as on Windows, so a later
+  layout can migrate from it.
+- **`port_release_linux.sh`:** a game exe at the top of the build folder, a port without `config/game.toml` (its own
+  lift steps), and CMake's linker dependency file kept off the player's link line.
