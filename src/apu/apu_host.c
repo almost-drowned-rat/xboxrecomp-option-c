@@ -28,6 +28,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern void xbox_ApuMmioUntrap(void);       /* kernel/xbox_memory_layout.h: no module -> the register span plain */
+
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -131,8 +133,10 @@ static const XrApuModule *mod(void)
     e = getenv("RECOMP_APU_MODULE");
     if (e && *e) {
         r = try_open(e);
-        if (!r)
+        if (!r) {
             fprintf(stderr, "[APU] RECOMP_APU_MODULE=%s does not load\n", e);
+            xbox_ApuMmioUntrap();                  /* no sound emulation, but no fault on the title's APU access */
+        }
         return s_mod;                              /* the user's choice or nothing */
     }
     if (!r && exe_dir(p, sizeof p) && strlen(p) + sizeof XR_APU_MODULE_FILE < sizeof p) {
@@ -145,9 +149,11 @@ static const XrApuModule *mod(void)
     if (!r)
         r = try_open(XR_APU_MODULE_FILE);
 #endif
-    if (!r)
+    if (!r) {
         fprintf(stderr, "[APU] no %s (next to the exe, install root, RECOMP_APU_MODULE) - no sound emulation\n",
                 XR_APU_MODULE_FILE);
+        xbox_ApuMmioUntrap();                      /* (2026-11-24: without this the first APU access faulted) */
+    }
     return s_mod;
 }
 

@@ -6,7 +6,8 @@
 #
 # Config keys used here (port_release.ps1's header has the rest): Who, ExeName, ZipPrefix ("Orta-Recompiled": the
 # zip is <ZipPrefix>-v<v>-win64.zip), Readme (the player's README template relative to the repo, "{VERSION}"
-# replaced; Orta: "tools\release_readme.txt").
+# replaced; Orta: "tools\release_readme.txt"), RecompLauncher (the port's recomplauncher.json relative to the repo,
+# required since 2026-11-24: copied to the top of the zip next to the exe, checked for JSON / "format": 1 / 1 MiB).
 # Into a new folder <deliver>\v<v>\ (refused if it exists): zip\ (the exe, README.txt, LICENSES\ from the release's
 # payload, tools\bundle\ with the pinned llvm-mingw zip), the zip, SHA256SUMS.txt, release_notes.md. The compiler ships
 # inside the zip, so the first start needs no internet (toolchain.txt format 2: a missing or damaged zip ends with
@@ -22,6 +23,9 @@ param(
 $ErrorActionPreference = "Stop"
 $C = Import-PowerShellDataFile -LiteralPath $Config
 foreach ($k in "Who", "ExeName", "ZipPrefix", "Readme") { if (-not $C.ContainsKey($k)) { throw "$Config has no $k" } }
+if (-not $C.ContainsKey("RecompLauncher")) {
+    throw "$Config has no RecompLauncher (the port's recomplauncher.json, relative to the repo - a fixed part of every release since 2026-11-24, RecompLauncher's agent guide)"
+}
 $Toolkit = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $Repo = if ($C.Repo) { $C.Repo } else { Split-Path -Parent (Split-Path -Parent ([IO.Path]::GetFullPath($Config))) }
 $Private = Join-Path (Split-Path -Parent $Repo) "private"
@@ -80,6 +84,13 @@ try {
     Copy-Item -LiteralPath $tcZip -Destination (Join-Path $Z "tools\$tcSub")
     $readme = [IO.File]::ReadAllText((Join-Path $Repo $C.Readme)).Replace("{VERSION}", $Version)
     [IO.File]::WriteAllText((Join-Path $Z "README.txt"), ($readme -replace "`r?`n", "`r`n"), $utf8)
+    # recomplauncher.json (the maintainer 2026-11-24: a fixed part of every release, like .recomp.json; RecompLauncher
+    # reads it at the top of the zip next to the exe): the port's file, checked - JSON, format 1, at most 1 MiB
+    $rl = Join-Path $Repo $C.RecompLauncher
+    if ((Get-Item -LiteralPath $rl).Length -gt 1MB) { throw "$rl is larger than 1 MiB" }
+    $rlj = Get-Content -LiteralPath $rl -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($rlj.format -ne 1) { throw "$rl has no `"format`": 1" }
+    [IO.File]::WriteAllText((Join-Path $Z "recomplauncher.json"), [IO.File]::ReadAllText($rl), $utf8)   # (no BOM)
     Copy-Item -LiteralPath $Notes -Destination (Join-Path $D "release_notes.md")
 
     # the zip: '/' separators (unpacks the same on Linux); the compiler zip stored as it is (already compressed)

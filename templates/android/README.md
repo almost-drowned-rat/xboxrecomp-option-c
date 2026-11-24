@@ -33,6 +33,22 @@ The Java package stays `xboxrecomp.port` in every port, so the JNI names in `jni
 - `port_icon.h` - the launcher icon as a BMP array (the same file the Windows / Linux launcher uses);
 - `setup_ui_sdl.c` - the launcher's progress UI in the port's look.
 
+**The APU module (ports that use the APU emulation, e.g. Orta; not THPS, which is DirectSound HLE):** the runtime
+SDK's `libxbox_apu.so` must go into the APK's `jniLibs/arm64-v8a/` next to the other native libraries - the game
+looks for it by its bare name in the app's lib folder (`docs/apu_module.md`). Without it the game runs with no sound
+emulation (since 2026-11-24 the APU register window then stays plain memory; before that the title's first APU
+register write crashed - found on Orta Android).
+
+**Thread placement check - every Android port (the maintainer's rule, 2026-11-24, after Orta Android's 33 ms
+frames):** phone schedulers (EAS / WALT) may pack the runtime's busy threads onto one core at low load; D3D's
+interrupt DPC then spins on the vblank bit while the NV2A flag thread that clears it waits for the same core. Since
+option-c 50b0751 (`src/kernel/thread_name.h`) `xr_thread_name` gives APU frame / NV2A flags / timer-DPC /
+NV2A exec a core each above the slowest cluster (`RECOMP_ANDROID_PIN=0` turns it off; the log line `[THREADS]
+Android: ...` names the cores). Check each new port anyway: an A/B run with a recorded pad script (pinning on / off),
+the long frames (> 25 ms) and GAME SPEED, the `[GATE] guest waits for a host ISR/DPC` maximum (Linux desktop ~1.4
+ms; 20-30 ms = the packing), and the threads' run-queue waits (`/proc/<pid>/task/<tid>/schedstat`, the second field).
+Orta on the Odin 2: long frames 64-73 -> 3-4 a minute, GAME SPEED 98 -> 99.9 %.
+
 **A res folder (`-PportRes`)** with the icons: `mipmap-*/ic_launcher.png`, `mipmap-anydpi-v26/ic_launcher.xml`,
 `drawable-nodpi/ic_launcher_fg.png`, and `values/colors.xml` (`ic_launcher_bg`).
 

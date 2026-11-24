@@ -42,6 +42,10 @@ else()
     # libm: win32_compat.c clears FP exceptions (feclearexcept); a target that
     # links only platform (tests/log_async via xbox_log) got it from nowhere.
     target_link_libraries(platform PUBLIC Threads::Threads m)
+    # host_vblank.c on Android: the Choreographer (libandroid)
+    if(ANDROID)
+        target_link_libraries(platform PUBLIC android)
+    endif()
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
 

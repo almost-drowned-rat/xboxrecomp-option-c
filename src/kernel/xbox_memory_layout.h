@@ -216,6 +216,9 @@ int xbox_FramePacingImmediate(void);
  * compares the sum with the guest vblanks gone by (xbox_GuestVblankCount). */
 void xbox_GuestFlipNote(uint32_t swap_interval);
 uint64_t xbox_GuestFlipVblanksAsked(void);
+/* The APU module did not load (apu_host.c): the trapped APU register span back to plain memory (no sound
+ * emulation, no fault). */
+void xbox_ApuMmioUntrap(void);
 /* RECOMP_PACING_STATS=1: the renderer after each present; a histogram of the
  * display refreshes per presented frame every 10 s (also with the timer). */
 void xbox_GuestPresentNote(void);

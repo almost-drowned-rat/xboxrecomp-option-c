@@ -215,17 +215,22 @@ static void display_hz_update(void)
         s_display_hz = hz;
         LOGE("display refresh: %.2f Hz\n", hz);
     }
-#if defined(_WIN32)
     {
         /* FRAME PACING Display: the kernel's clock binds to the display the
-         * window is on (at creation, on a display or mode change) */
+         * window is on (at creation, on a display or mode change; Android: also
+         * back in the foreground, where the Choreographer comes back). Windows
+         * needs the HWND; Linux (DRM, the first active display) and Android
+         * (the Choreographer) only a window (2026-11-24). */
         extern void xbox_GuestDisplayPacing(void *native_window);
+#if defined(_WIN32)
         void *hwnd = s_win ? SDL_GetPointerProperty(SDL_GetWindowProperties(s_win),
                                                     SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL) : NULL;
+#else
+        void *hwnd = s_win;
+#endif
         if (hwnd)
             xbox_GuestDisplayPacing(hwnd);
     }
-#endif
 }
 
 /* ── Display mode and the windowed rectangle (nv2a_vk.h) ─────────────
@@ -11954,6 +11959,7 @@ static void win_events(int at_flip)
                 break;
             case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
             case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+            case SDL_EVENT_DID_ENTER_FOREGROUND:   /* Android: the Choreographer was held in the background */
                 display_hz_update();
                 break;
             case SDL_EVENT_WINDOW_MOVED:

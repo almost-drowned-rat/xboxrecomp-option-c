@@ -358,3 +358,19 @@ line says otherwise.
   default (`tests/mmx_neon`, passed on a Snapdragon 8 Gen 2).
 - **Templates:** the Android APK packaging (`templates/android/`, from Orta Recompiled, MIT) and the `.recomp.json`
   template (`templates/recomp.json`).
+
+## 13. Changes since the v1.3.0 snapshot (THPS 2X Recompiled v2.0.0)
+
+- **Release scripts:** `recomplauncher.json` (RecompLauncher support) is a fixed part of every release - the
+  Windows zip and the Linux AppImage / tar.gz carry it at their top, and both refuse a release without it, with no
+  `"format": 1` or over 1 MiB; a port's own lift steps and lifter files (`LiftFile` / `LifterFiles`,
+  `LIFT_FILE` / `LIFTER_FILES`); the FSR 1.0 licence text in every release.
+- **APU:** when the APU module does not load, the APU register window becomes plain memory again (no sound
+  emulation, but no crash at the title's first APU register write).
+- **Linux / Android, platform layer:** invalid handles fail as on Windows (`WAIT_FAILED` / `ERROR_INVALID_HANDLE`)
+  instead of being dereferenced - a title that waits on an event it built itself no longer crashes at start; the
+  display's vblank on Linux (DRM) and Android (the Choreographer) for `frame_pacing = display+...` - `auto` stays the
+  60 Hz timer there; on Android the runtime's four busy threads get a fast core each (`RECOMP_ANDROID_PIN=0` turns
+  it off), with a thread placement check for every Android port (`templates/android/README.md`).
+- **RECOMP OPTIONS layout** (`docs/recomp_options_layout.md`): one layout for every port, the same as
+  ps2recomp-option-p's; each port builds its menu in its game's own look.

@@ -294,6 +294,7 @@ typedef struct mw_link {
 
 typedef struct w32_object {
     w32_kind        kind;
+    uint32_t        magic;          /* W32_OBJ_MAGIC while the object lives (obj_from) */
     LONG            refcount;
     pthread_mutex_t lock;
     pthread_cond_t  cond;
@@ -379,10 +380,31 @@ HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 
 static w32_object *current_thread_obj(void);   /* with the thread functions below */
 
+/* A HANDLE is the object's address. Windows answers a value that is no handle with ERROR_INVALID_HANDLE; here it
+ * was dereferenced. The kernel bridge hands a guest address on as a HANDLE when it knows no host object for it (an
+ * event the title built itself, kernel_bridge.c ke_guest_event): THPS 2X waits on one at start - on Windows the wait
+ * fails and the title retries, on Linux pthread_mutex_lock read the guest address and the game crashed
+ * (2026-11-24, THPS 2.0 Linux bring-up). So: on 64-bit hosts a handle below 4 GB (a guest address, never a heap
+ * block of ours) or without the magic is invalid, and every function that takes a handle checks it. */
+#define W32_OBJ_MAGIC 0x57334F42u   /* "W3OB" */
+
+static w32_object *obj_from(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    if (!o || h == INVALID_HANDLE_VALUE)
+        return NULL;
+    if (sizeof(void *) == 8 && (uint64_t)(uintptr_t)h < 0x100000000ull)
+        return NULL;
+    if (o->magic != W32_OBJ_MAGIC)
+        return NULL;
+    return o;
+}
+
 static w32_object *obj_alloc(w32_kind kind)
 {
     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
     o->kind     = kind;
+    o->magic    = W32_OBJ_MAGIC;
     o->refcount = 1;
     pthread_mutex_init(&o->lock, NULL);
     pthread_cond_init(&o->cond, NULL);
@@ -405,6 +427,7 @@ static void obj_release(w32_object *o)
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
     pthread_cond_destroy(&o->gate);
+    o->magic = 0;
     free(o);
 }
 
@@ -419,13 +442,13 @@ HANDLE w32_open_handle(int fd, const char *host_path)
 
 int w32_handle_fd(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_from(h);
     return (o && o->kind == K_FILE) ? o->fd : -1;
 }
 
 const char *w32_handle_path(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_from(h);
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
@@ -434,6 +457,10 @@ BOOL CloseHandle(HANDLE h)
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
         h == INVALID_HANDLE_VALUE)
         return TRUE;
+    if (!obj_from(h)) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
     obj_release((w32_object *)h);
     return TRUE;
 }
@@ -446,7 +473,11 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
     if (src == PSEUDO_CURRENT_THREAD)  src = (HANDLE)current_thread_obj();   /* a real handle, as on Windows */
     if (src == PSEUDO_CURRENT_PROCESS) { *dst = src; return TRUE; }
     if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
-    w32_object *o = (w32_object *)src;
+    w32_object *o = obj_from(src);
+    if (!o) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
     InterlockedIncrement(&o->refcount);
     *dst = src;
     if (options & DUPLICATE_CLOSE_SOURCE)
@@ -626,6 +657,10 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
+    if (!obj_from(h)) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return WAIT_FAILED;
+    }
     return wait_single((w32_object *)h, ms);
 }
 
@@ -673,6 +708,13 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
     if (!handles || count == 0 || count > MAXIMUM_WAIT_OBJECTS) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return WAIT_FAILED;
+    }
+    for (i = 0; i < count; i++) {                /* Windows: one invalid handle fails the whole wait */
+        HANDLE h = handles[i];
+        if (h && h != PSEUDO_CURRENT_THREAD && h != PSEUDO_CURRENT_PROCESS && !obj_from(h)) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return WAIT_FAILED;
+        }
     }
     if (alertable && drain_apcs() > 0)
         return WAIT_IO_COMPLETION;
@@ -834,7 +876,7 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
 
 BOOL SetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_from(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     if (o->manual_reset) {
@@ -852,7 +894,7 @@ BOOL SetEvent(HANDLE h)
 
 BOOL ResetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_from(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 0;
@@ -862,7 +904,7 @@ BOOL ResetEvent(HANDLE h)
 
 BOOL PulseEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_from(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     if (o->manual_reset)
@@ -895,7 +937,7 @@ HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LP
 
 BOOL ReleaseSemaphore(HANDLE h, LONG releaseCount, PLONG previousCount)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_from(h);
     if (!o || o->kind != K_SEM) return FALSE;
     pthread_mutex_lock(&o->lock);
     if (previousCount) *previousCount = (LONG)o->sem_count;
@@ -925,7 +967,7 @@ HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
 
 BOOL ReleaseMutex(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_from(h);
     if (!o || o->kind != K_MUTEX) {
         SetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
@@ -1028,7 +1070,7 @@ VOID ExitThread(DWORD exitCode)
 
 BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_from(h);
     if (!o || o->kind != K_THREAD || !exitCode) return FALSE;
     pthread_mutex_lock(&o->lock);
     *exitCode = o->exited ? o->exit_code : STILL_ACTIVE;
@@ -1038,7 +1080,7 @@ BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 
 DWORD ResumeThread(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_from(h);
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
@@ -1081,7 +1123,7 @@ void w32_suspend_point(void)
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_from(h);
     if (!o || o->kind != K_THREAD) return FALSE;
 #if defined(XR_COMPAT_NO_PTHREAD_CANCEL)
     /* No way to stop another thread here: say so instead of reporting a thread as ended that still runs (a
@@ -1345,7 +1387,7 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR 
 BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
                       PTIMERAPCROUTINE completion, PVOID arg, BOOL resume)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_from(h);
     (void)completion; (void)arg; (void)resume;
     if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
     pthread_mutex_lock(&o->lock);
@@ -1378,7 +1420,7 @@ BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
 
 BOOL CancelWaitableTimer(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_from(h);
     if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->waitable_triggered = 0;
@@ -1391,7 +1433,7 @@ BOOL CancelWaitableTimer(HANDLE h)
 /* Heap (thin wrapper over malloc; the single process heap)              */
 /* ===================================================================== */
 
-static w32_object s_process_heap = { .kind = K_HEAP };
+static w32_object s_process_heap = { .kind = K_HEAP, .magic = W32_OBJ_MAGIC };
 
 HANDLE GetProcessHeap(void)                       { return (HANDLE)&s_process_heap; }
 HANDLE HeapCreate(DWORD o, SIZE_T i, SIZE_T m)    { (void)o;(void)i;(void)m; return (HANDLE)&s_process_heap; }

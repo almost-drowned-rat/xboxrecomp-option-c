@@ -750,6 +750,26 @@ static void *g_mcpx_regs = NULL;
  * counter ticking below must leave them alone -- writing through the pointer
  * faults, and the emulated APU owns those registers anyway. */
 static int g_apu_mmio_trapped = 0;
+#define XBOX_APU_TRAP_BYTES 0x00030000u     /* the trapped span (registers + VP), as armed in the layout set-up */
+
+/* No APU emulation after all (apu_host.c: the APU module did not load, 2026-11-24 - Orta Android SEGV on
+ * the title's first APU register write without libxbox_apu.so): the trapped span goes back to plain memory, so the
+ * title's writes land and its reads see what it wrote - no sound emulation, but no fault the handler would decline.
+ * The MCPX counters tick there again (the loop below). Called once, before the title touches the APU. */
+void xbox_ApuMmioUntrap(void)
+{
+    DWORD old;
+    if (!g_apu_mmio_trapped || !g_mcpx_memory)
+        return;
+    if (VirtualProtect((char *)g_mcpx_memory, XBOX_APU_TRAP_BYTES, PAGE_READWRITE, &old)) {
+        g_apu_mmio_trapped = 0;
+        fprintf(stderr, "  APU: no APU emulation - 0x%08X..0x%08X plain memory again (no sound emulation)\n",
+                XBOX_MCPX_BASE, XBOX_MCPX_BASE + XBOX_APU_TRAP_BYTES);
+    } else {
+        fprintf(stderr, "  APU: the register span could not be made plain memory again (error %lu) - "
+                        "the title's first APU access will fault\n", (unsigned long)GetLastError());
+    }
+}
 
 /*
  * GPU completion fences the title waits on in guest memory rather than in the
@@ -1326,13 +1346,21 @@ static void fp_parse(void)
         s_fp_timer = 1;
     else if (strcmp(src, "display"))
         s_fp_auto = 1;                            /* unset, "auto" or unknown */
+#if !defined(_WIN32)
+    /* Linux / Android have a display vblank since 2026-11-24 (DRM / the Choreographer), but auto stays the timer
+     * there - option-p's decision after held pictures on the Odin's display source (0.1-0.5 s, 3 of 6 runs); the
+     * display only when chosen ("display+..." in the settings file) until a worst-second check passes there */
+    if (s_fp_auto)
+        s_fp_timer = 1;
+#endif
     s_fp_immediate = !strcmp(pic, "immediate");
     if (e && *e && s_fp_auto && strcmp(e, "auto"))
         fprintf(stderr, "[pacing] RECOMP_FRAME_PACING=%s not known -> auto\n", e);
     fprintf(stderr, "[pacing] mode %s%s: source %s, pictures %s\n",
             s_fp_auto ? "auto" : s_fp_timer ? "timer" : "display",
             s_fp_auto ? "" : s_fp_immediate ? "+immediate" : "+paced",
-            s_fp_timer ? "60 Hz timer" : "the display when it runs at 60 / 120 / 180 / 240 Hz, else the timer",
+            s_fp_timer ? (s_fp_auto ? "60 Hz timer (auto on this system)" : "60 Hz timer")
+                       : "the display when it runs at 60 / 120 / 180 / 240 Hz, else the timer",
             s_fp_immediate ? "immediate" : "paced");
 }
 
@@ -4061,7 +4089,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  * rep movsd, which the lifter lowers to a host memcpy, and
                  * that faulted at 0xFE830B78 with no way to resume. Plain
                  * memory keeps what the title writes. */
-                enum { APU_TRAP_BYTES = 0x00030000 };
+                enum { APU_TRAP_BYTES = XBOX_APU_TRAP_BYTES };   /* (xbox_ApuMmioUntrap undoes this span) */
                 DWORD old_protect;
                 if (VirtualProtect((char *)g_mcpx_memory, APU_TRAP_BYTES,
                                    PAGE_NOACCESS, &old_protect))

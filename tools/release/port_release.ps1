@@ -24,6 +24,11 @@
 #     Build      = "<private>\build\orta_recomp"     # optional: the build folder (default <Private>\build\<repo name>)
 #     Repo       = "D:\src\my_port"   # optional: when the config does not sit in <repo>\tools\
 #     Licences   = @{ "LICENSE-librashader.txt" = "<path>" }  # optional: further licence texts
+#     LiftFile   = "tools\lift.txt"                  # optional: the port's own lift steps (lift.txt format: a name, then
+#                                                     #   python's arguments, tab-separated; {XBE} {PIPE} {GEN} {TOOLS});
+#                                                     #   default: Orta's steps (config\game.toml, --split 400)
+#     LifterFiles = @{ "port\hooks.toml" = "config\hooks.toml"; "port\seeds" = "seeds\*_seeds.json" }   # optional:
+#                                                     #   files the lift needs, copied under lifter\ ({TOOLS}/lifter/...)
 #     PublicToolkit = "<clone of xboxrecomp-option-c>"   # a public release: licenses\source from this clone ...
 #     PublicTag  = "v1.2.0"                               # ... at this tag (default: the version); without it the
 #   }                                                     #     bundle is the private tree's, for test releases only
@@ -250,8 +255,26 @@ try {
         if ($rc -ge 8) { throw "copy of tools\$m failed" }
     }
     Copy-Item "$Toolkit\templates\runtime" "$Lf\templates\runtime" -Recurse
+    # a port with its own lift (THPS 2X: seeds, hooks, --split 1000, 2026-11-24): LifterFiles copies its files under
+    # lifter\ (key = path under lifter\, value = source relative to the repo; a wildcard or a folder -> into that
+    # folder), LiftFile is its lift.txt (the same format as below, used as it is - Windows and Linux share it)
+    if ($C.LifterFiles) {
+        foreach ($k in $C.LifterFiles.Keys) {
+            $src = Join-Path $Repo $C.LifterFiles[$k]
+            $dst = Join-Path $Lf $k
+            $items = @(Get-ChildItem -Path $src -ErrorAction SilentlyContinue)
+            if ($items.Count -eq 0) { throw "LifterFiles: nothing at $src" }
+            if ($items.Count -gt 1 -or $items[0].PSIsContainer -or $C.LifterFiles[$k] -match '[*?]') {
+                New-Item -ItemType Directory -Force $dst | Out-Null
+                foreach ($it in $items) { Copy-Item $it.FullName $dst -Recurse }
+            } else {
+                New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
+                Copy-Item $items[0].FullName $dst
+            }
+        }
+    }
     $cfg = "{TOOLS}/config/game.toml"
-    $lift = @(
+    $lift = if ($C.LiftFile) { @(Get-Content -LiteralPath (Join-Path $Repo $C.LiftFile) -Encoding UTF8) } else { @(
         "# the lift (the same steps as the port's tools\lift.ps1): name, then python's arguments; {XBE} {PIPE} {GEN} {TOOLS}",
         "mkdir`t{PIPE}/disasm`t{PIPE}/func_id`t{PIPE}/abi`t{PIPE}/recomp`t{GEN}",
         "xbe_parser`t-m`ttools.xbe_parser`t{XBE}`t--json`t{PIPE}/xbe.json`t--quiet",
@@ -261,7 +284,8 @@ try {
         # --split 400 + a fresh weight-balanced partition layout: ~47 files of even compile cost instead of
         # chunks of 1000 functions (Orta: one 12.6 MB file of 19 held the parallel compile back; 2026-11-16, 6a)
         "recomp`t-m`ttools.recomp`t{XBE}`t--all`t--game-config`t$cfg`t--game-name`t$($C.GameName)`t--gen-dir`t{GEN}`t--disasm-dir`t{PIPE}/disasm`t--func-id-dir`t{PIPE}/func_id`t--abi-dir`t{PIPE}/abi`t-o`t{PIPE}/recomp`t--split`t400`t--partitions`t{PIPE}/partitions.json`t--repartition"
-    )
+    ) }
+    if (-not ($lift | Where-Object { $_ -match "^recomp`t" })) { throw "the lift has no recomp line ($(if ($C.LiftFile) { $C.LiftFile } else { 'default' }))" }
     [IO.File]::WriteAllText("$P\lift.txt", (($lift -join "`r`n") + "`r`n"), $utf8)
 
     # -- Python (embeddable) + capstone ----------------------------------------------------------------------------
@@ -284,6 +308,7 @@ try {
         "LICENSE-pl_mpeg-MIT.txt"                  = "$Toolkit\src\bootvideo\third_party\pl_mpeg\LICENSE"
         "LICENSE-miniz-MIT.txt"                    = "$Toolkit\src\shaderpack\third_party\miniz\LICENSE"
         "LICENSE-SMAA-MIT.txt"                     = "$Toolkit\src\nv2a_vk\third_party\smaa\LICENSE.txt"
+        "LICENSE-FSR1-MIT.txt"                     = "$Toolkit\src\nv2a_vk\third_party\fsr1\LICENSE.txt"
         "LICENSE-DejaVu-fonts.txt"                 = "$Toolkit\src\nv2a_vk\third_party\dejavu\LICENSE"
         "LICENSE-SDL3-zlib.txt"                    = (Join-Path $Shared "deps\src\SDL3\LICENSE.txt")
         "LICENSE-glslang.txt"                      = (Join-Path $Shared "deps\src\glslang\LICENSE.txt")

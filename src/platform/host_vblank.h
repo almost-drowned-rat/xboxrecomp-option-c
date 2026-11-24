@@ -10,8 +10,8 @@
  *
  *   host_vblank_open   bind to the display a native window is on (Windows:
  *                      the HWND; gdi32's D3DKMT kernel thunks, no D3D
- *                      runtime). 0 = not available (other hosts for now:
- *                      VK_KHR_present_wait later, the timer meanwhile)
+ *                      runtime; Android: the Choreographer; Linux: DRM on the
+ *                      first active CRTC). 0 = not available (the timer)
  *   host_vblank_wait   block until the next vblank of that display; 0 when the
  *                      wait failed (display gone / mode change) -- the caller
  *                      falls back to its timer

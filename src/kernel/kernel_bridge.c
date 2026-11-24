@@ -4211,7 +4211,7 @@ static void deliver_one_apc(X86Ctx *ctx, uint32_t apc_routine, uint32_t apc_cont
  * the clear and the main thread hung after START. On the console a user APC runs at the issuing thread's next
  * alertable user-mode wait, which then returns STATUS_USER_APC (XAPI: WAIT_IO_COMPLETION). With the switch the
  * completion is queued per guest thread (keyed by its register set - one X86Ctx per guest thread; a host
- * __declspec(thread) was not per guest thread in O's test) and run there. Opt-in first: it changes a path every
+ * __declspec(thread) was not per guest thread in Orta's test) and run there. Opt-in first: it changes a path every
  * title takes (Halo, Burnout). Queue full or no slot: delivered inline as before. Memory only, no I/O. */
 #define APC_QUEUE_LEN     32
 #define APC_QUEUE_THREADS 64

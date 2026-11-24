@@ -509,6 +509,14 @@ State: toolkit branch `launcher` (head 65019c1: `src/launcher/`, `src/install/ga
    against the game (not the series). No `launchers`, no game files or links to them; extra fields (`links`, `notes`)
    only on his word. Validate against the schema before the snapshot (e.g. `python -m jsonschema`, or an editor that
    reads `$schema`).
+9. **`recomplauncher.json` in every release** (maintainer, 2026-11-24; every recomp, a fixed release part like
+   `.recomp.json`): RecompLauncher support after its agent guide (https://recomplauncher.com/sdk-files/recomplauncher-agent.md:
+   `inputs` with `check` + only verified `dumps` from Redump, `start.program` = the launcher (Windows exe first, then
+   the AppImage), settings, saves, the README badge, the report). The port keeps the file in its repo and names it
+   in the release config - `RecompLauncher = "recomplauncher.json"` (port_release_zip.ps1: top of the zip next to the
+   exe) and `RECOMPLAUNCHER_JSON=recomplauncher.json` (port_release_linux.sh: AppDir root `/recomplauncher.json`; a
+   tar.gz carries it at its top) - both refuse a release without it, or with no `"format": 1`, or over 1 MiB. One file
+   per repo for Windows + Linux: the Windows entries and the Linux / Android entries side by side.
 
 THPS 2X on the dev machine (2 compile threads): download 14 s, lift 117 s, compile 55 s, `tools\` 773 MB, exe
 24.6 MB.
@@ -528,7 +536,7 @@ a new port takes these instead of copying them from Orta or THPS:
 | Release exe + zip (Windows), AppImage (Linux) | `tools/release/port_release.ps1`, `port_release_zip.ps1`, `port_release_linux.sh` | `tools/release.psd1` / a `.conf` with its names (headers of the scripts) |
 | Regression + timing + first-start E2E | `tools/g3` (`g3_regress.ps1`, `g3_series.ps1`, `g3_firststart.ps1`) | `tools/g3/<port>.psd1` (parts, scripts, minimum frames / draws) |
 | Rumble | the OHCI model forwards the title's output report (260af9e) | nothing |
-| Android APK (Gradle app, loader, on-device lift / compile / link, Vulkan shim with Turnip, touch controls, BACK menu) | `templates/android/` (from Orta's packaging, MIT since 2026-11-19; README.md there) | `port_android.h`, `port_icon.h`, `setup_ui_sdl.c`, the icons, and the `-P` properties (app id, names, version) from its build script |
+| Android APK (Gradle app, loader, on-device lift / compile / link, Vulkan shim with Turnip, touch controls, BACK menu) | `templates/android/` (from Orta's packaging, MIT since 2026-11-19; README.md there) | `port_android.h`, `port_icon.h`, `setup_ui_sdl.c`, the icons, and the `-P` properties (app id, names, version) from its build script; **every Android port: the thread placement check** (maintainer 2026-11-24 - A/B with a recorded pad script, long frames, GAME SPEED, the `[GATE]` ISR/DPC wait maximum, schedstat run-queue waits; templates/android/README.md) and `libxbox_apu.so` in jniLibs when the port uses the APU |
 
 ## M6 – settings in the game's own menu
 

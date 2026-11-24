@@ -65,13 +65,13 @@ for the maintainer (no licence text changed without his word).
 
 - Windows / Linux: the LGPL files are compiled into `libxbox_apu.a`; the release payload ships that library
   prebuilt (no APU sources), and the **player's machine links ORTA.exe** from the shipped objects (launcher).
-- Android: the same library linked into the APK's `libmain.so` (L's build).
+- Android: the same library linked into the APK's `libmain.so` (the Android build).
 - Orta itself is GPL-3.0-or-later; LGPL-2.1-or-later code may be combined with it (via the "or later" clause).
 
 ## Duties for a public release (LGPL-2.1 section 6, statically linked)
 
 1. **Notice + licence text** shipped: done today - `licenses\LICENSE-xemu-parts-LGPL-2.1.txt`,
-   `NOTICE-toolkit.txt`, `licenses\README.txt` (Windows, AppImage); L's APK carries the same 18 texts.
+   `NOTICE-toolkit.txt`, `licenses\README.txt` (Windows, AppImage); the Android APK carries the same 18 texts.
 2. **Corresponding source of the library**, accompanying the release or "access from the same place": done
    today by publishing the toolkit snapshot with a tag per release (xboxrecomp-option-c v1.1.0 / v1.1.1 / v1.1.2)
    and linking it from the release notes. Weak point: it is a different repository than the release download.

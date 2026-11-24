@@ -34,6 +34,10 @@
 #   ICON=assets/icon_256.png               # relative to src/
 #   PUBLIC_TOOLKIT=~/xboxrecomp-option-c   # a public release: licenses/source from this clone of the public toolkit,
 #   PUBLIC_TAG=v1.2.0                      # at this tag (default: the version); without it only a --dev build passes
+#   LIFT_FILE=tools/lift.txt               # optional: the port's own lift steps (the same lift.txt as on Windows);
+#                                          # default: Orta's steps (config/game.toml, --split 400)
+#   LIFTER_FILES="port/hooks.toml=config/hooks.toml port/seeds=seeds/*_seeds.json"   # optional: under lifter/
+#   RECOMPLAUNCHER_JSON=recomplauncher.json   # required (2026-11-24): the port's file, relative to src/ - AppDir root
 set -eu
 CONF="${1:?port config}"
 VERSION="${2:?version}"
@@ -44,7 +48,7 @@ DEV=0; for a in "$@"; do [ "$a" = --dev ] && DEV=1; done
 DATA=""; ICON=assets/icon_256.png
 # shellcheck disable=SC1090
 . "$CONF"
-for v in W SLUG TARGET GAME TITLE APPIMAGE LICENCE PUBLIC_REPO DEPS; do
+for v in W SLUG TARGET GAME TITLE APPIMAGE LICENCE PUBLIC_REPO DEPS RECOMPLAUNCHER_JSON; do
   [ -n "${!v:-}" ] || { echo "$CONF: $v not set"; exit 1; }
 done
 TRX=${TARGET//./[.]}               # the target as a regex (awk -v / grep -E / sed alike)
@@ -198,8 +202,23 @@ for m in xbe_parser disasm func_id abi_analysis recomp ghidra_naming; do
   rsync -a --exclude __pycache__ --exclude tests --exclude 'test_*.py' "$TK/tools/$m/" "$L/tools/$m/"
 done
 cp -r "$TK/templates/runtime" "$L/templates/runtime"
+# a port with its own lift (THPS 2X, 2026-11-24): LIFTER_FILES="<path under lifter/>=<source relative to src/> ..."
+# (a wildcard or a folder -> into that folder), LIFT_FILE = its lift.txt relative to src/ (the same file as on Windows)
+for pair in ${LIFTER_FILES:-}; do
+  dst="$L/${pair%%=*}"; pat="${pair#*=}"
+  # shellcheck disable=SC2206
+  files=( $SRC/$pat )
+  [ -e "${files[0]}" ] || { echo "LIFTER_FILES: nothing at $SRC/$pat"; exit 1; }
+  if [ ${#files[@]} -gt 1 ] || [ -d "${files[0]}" ] || [[ "$pat" == *[*?]* ]]; then
+    mkdir -p "$dst"; cp -r "${files[@]}" "$dst/"
+  else
+    mkdir -p "$(dirname "$dst")"; cp "${files[0]}" "$dst"
+  fi
+done
 CFG="{TOOLS}/config/game.toml"
-{
+if [ -n "${LIFT_FILE:-}" ]; then
+  tr -d '\r' < "$SRC/$LIFT_FILE" > "$R/lift.txt"
+else {
   echo "# the lift (the same steps as the port's tools/lift.ps1): name, then python's arguments; {XBE} {PIPE} {GEN} {TOOLS}"
   printf 'mkdir\t{PIPE}/disasm\t{PIPE}/func_id\t{PIPE}/abi\t{PIPE}/recomp\t{GEN}\n'
   printf 'xbe_parser\t-m\ttools.xbe_parser\t{XBE}\t--json\t{PIPE}/xbe.json\t--quiet\n'
@@ -208,6 +227,8 @@ CFG="{TOOLS}/config/game.toml"
   printf 'abi_analysis\t-m\ttools.abi_analysis\t{XBE}\t--disasm-dir\t{PIPE}/disasm\t--func-id-dir\t{PIPE}/func_id\t--output-dir\t{PIPE}/abi\n'
   printf 'recomp\t-m\ttools.recomp\t{XBE}\t--all\t--game-config\t%s\t--game-name\t%s\t--gen-dir\t{GEN}\t--disasm-dir\t{PIPE}/disasm\t--func-id-dir\t{PIPE}/func_id\t--abi-dir\t{PIPE}/abi\t-o\t{PIPE}/recomp\t--split\t400\t--partitions\t{PIPE}/partitions.json\t--repartition\n' "$CFG" "$GAME"
 } > "$R/lift.txt"
+fi
+grep -q $'^recomp\t' "$R/lift.txt" || { echo "the lift has no recomp line (${LIFT_FILE:-default})"; exit 1; }
 
 # -- the toolchain: the bundle (llvm/ + python/), copied; capstone + the lifter's path into Python -----------------
 cp -a "$BUNDLE/llvm" "$R/llvm"
@@ -236,6 +257,7 @@ lic LICENSE-xemu-parts-LGPL-2.1.txt          "$TK/LICENSES/LGPL-2.1.txt"
 lic LICENSE-pl_mpeg-MIT.txt                  "$TK/src/bootvideo/third_party/pl_mpeg/LICENSE"
 lic LICENSE-miniz-MIT.txt                    "$TK/src/shaderpack/third_party/miniz/LICENSE"
 lic LICENSE-SMAA-MIT.txt                     "$TK/src/nv2a_vk/third_party/smaa/LICENSE.txt"
+lic LICENSE-FSR1-MIT.txt                     "$TK/src/nv2a_vk/third_party/fsr1/LICENSE.txt"
 lic LICENSE-DejaVu-fonts.txt                 "$TK/src/nv2a_vk/third_party/dejavu/LICENSE"
 lic LICENSE-LiberationFonts-OFL.txt          "$TK/src/launcher/third_party/liberation/LICENSE"
 lic LICENSE-SDL3-zlib.txt                    "$HOME/deps/SDL3/LICENSE.txt"
@@ -309,6 +331,14 @@ cp "$B/launcher/$SLUG" "$A/usr/bin/$SLUG"
 cp "$SRC/packaging/linux/AppRun" "$A/AppRun"; chmod +x "$A/AppRun"
 cp "$SRC/packaging/linux/$SLUG.desktop" "$A/"; cp "$SRC/packaging/linux/$SLUG.desktop" "$A/usr/share/applications/"
 cp "$SRC/$ICON" "$A/$SLUG.png"; cp "$SRC/$ICON" "$A/usr/share/icons/hicolor/256x256/apps/$SLUG.png"
+# recomplauncher.json (the maintainer 2026-11-24: a fixed part of every release): at the AppDir root, where RecompLauncher
+# reads it from the image without running it - JSON, "format": 1, at most 1 MiB (a tar.gz the port makes from the same
+# files carries it at its top)
+RLJ=$SRC/$RECOMPLAUNCHER_JSON
+[ "$(stat -c %s "$RLJ")" -le 1048576 ] || { echo "$RLJ is larger than 1 MiB"; exit 1; }
+python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8-sig")); sys.exit(0 if d.get("format")==1 else 1)' "$RLJ" \
+  || { echo "$RLJ: not JSON, or no \"format\": 1"; exit 1; }
+sed '1s/^\xEF\xBB\xBF//' "$RLJ" > "$A/recomplauncher.json"     # (a BOM from a Windows editor dropped)
 
 # glibc check: no binary in the AppDir may need more than the sysroot's glibc (2.35)
 MAXG=$(find "$A" -type f \( -perm -u+x -o -name '*.so*' \) -exec sh -c 'objdump -T "$1" 2>/dev/null' _ {} \; \
