@@ -5,7 +5,9 @@
  * the player chooses a Turnip driver package beside the ISO (maintainer 2026-11-11: chosen like the ISO, not
  * shipped): an adrenotools .adpkg.zip, imported by PortActivity.importDriver into <files>/turnip; the game's Vulkan
  * library (vkshim/vulkan_port.c) then loads it. Asked BEFORE the build, so nobody waits minutes for a game that
- * cannot start. Other GPUs below 1.3 go on to the game's own apology box (the toolkit's xr_vk_check). */
+ * cannot start. Other GPUs below 1.3 get a clear message before the build too (2026-11-19: a player saw
+ * only a black screen and a closing app), and a Turnip package on a GPU that is no Adreno is switched off.
+ * The system GPU's name goes to <files>/system_gpu.txt for PortActivity (driver import check, Export log). */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include <SDL3/SDL.h>
@@ -93,11 +95,48 @@ int driver_check(const char *files)
     uint32_t api = system_vulkan(name, sizeof name);
     int ok = 1;
     SDL_snprintf(drvtxt, sizeof drvtxt, "%s/turnip/driver.txt", files);
+    {
+        char gp[1024];
+        FILE *f;
+        SDL_snprintf(gp, sizeof gp, "%s/system_gpu.txt", files);
+        if ((f = fopen(gp, "w")) != NULL) {
+            fprintf(f, "%s\nVulkan %u.%u.%u\n", name[0] ? name : "no device", VK_API_VERSION_MAJOR(api),
+                    VK_API_VERSION_MINOR(api), VK_API_VERSION_PATCH(api));
+            fclose(f);
+        }
+    }
     LOGI("[DRIVER] system: %s (Vulkan %u.%u.%u), Turnip chosen: %s", name[0] ? name : "no device",
          VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api), VK_API_VERSION_PATCH(api),
          stat(drvtxt, &st) == 0 ? "yes" : "no");
-    if (api >= VK_API_VERSION_1_3 || !strstr(name, "Adreno") || stat(drvtxt, &st) == 0)
+    /* Turnip is a driver for Adreno GPUs only: on any other GPU it would end the game at its first Vulkan call */
+    if (name[0] && !strstr(name, "Adreno") && stat(drvtxt, &st) == 0) {
+        remove(drvtxt);
+        LOGI("[DRIVER] Turnip switched off: %s is no Adreno GPU", name);
+        SDL_Init(SDL_INIT_VIDEO);
+        SDL_snprintf(msg, sizeof msg, "A Turnip driver was chosen, but Turnip works only on Adreno GPUs (Snapdragon). "
+                     "This device has: %s.\n\nThe app uses the system driver again.", name);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Graphics driver", msg, NULL);
+        SDL_Quit();
+    }
+    if (api >= VK_API_VERSION_1_3 || stat(drvtxt, &st) == 0)
         return 1;
+    if (!strstr(name, "Adreno")) {
+        /* no Adreno and below 1.3 (or no Vulkan device at all): nothing the player can install - said now, not after
+         * the build (the game's own check, src/vk_check.c, would say it only then) */
+        LOGI("[DRIVER] no Vulkan 1.3 and no Adreno GPU: the game cannot run here");
+        SDL_Init(SDL_INIT_VIDEO);
+        if (api)
+            SDL_snprintf(msg, sizeof msg, "I am sorry - this device's graphics driver (%s) offers only Vulkan %u.%u, and "
+                         PORT_TITLE " needs Vulkan 1.3.\n\nThe Turnip driver that helps other devices "
+                         "exists only for Adreno GPUs (Snapdragon), so the game cannot run on this device. A system "
+                         "update sometimes adds Vulkan 1.3.", name, VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api));
+        else
+            SDL_snprintf(msg, sizeof msg, "I am sorry - this device offers no working Vulkan graphics driver, and " PORT_TITLE
+                         " needs Vulkan 1.3. The game cannot run on this device.");
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, PORT_TITLE, msg, NULL);
+        SDL_Quit();
+        return 0;
+    }
     SDL_Init(SDL_INIT_VIDEO);
     err[0] = 0;
     for (;;) {

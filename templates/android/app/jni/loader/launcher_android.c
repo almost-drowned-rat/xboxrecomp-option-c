@@ -49,6 +49,10 @@ static int port_open_uri(const char *uri, char *path, size_t n)
     return ok;
 }
 
+/* the standard Android setup screen's form (setup_ui_android.c): the disc image + the graphics driver */
+int port_setup_image_page(void *ui, const char *disc, char *iso, size_t n, const char *note);
+void xr_launcher_set_image_page(int (*fn)(void *ui, const char *disc, char *iso, size_t n, const char *note));
+
 int port_android_launcher(int argc, char **argv)
 {
     /* the supported versions (port_android.h: region + SHA-1 of the XBE) */
@@ -75,5 +79,6 @@ int port_android_launcher(int argc, char **argv)
         av[n++] = argv[i];
     av[n++] = "--no-start";
     av[n] = NULL;
+    xr_launcher_set_image_page(port_setup_image_page);
     return xr_launcher_main(&c, n, av);
 }

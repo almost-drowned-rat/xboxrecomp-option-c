@@ -384,3 +384,15 @@ line says otherwise.
   layout can migrate from it.
 - **`port_release_linux.sh`:** a game exe at the top of the build folder, a port without `config/game.toml` (its own
   lift steps), and CMake's linker dependency file kept off the player's link line.
+
+## 15. Changes for the Android build of THPS 2X Recompiled v2.0.0
+
+- **Texture upload on phones:** linear X8R8G8B8 textures get their alpha while being copied, without reading the
+  upload memory back (mapped GPU memory, write-combined / uncached on Adreno). A 640x480 background new every
+  frame cost about 75 ms a frame before; menus went from 11 to 60 fps on an Odin 2. The same output on every
+  platform.
+- **Android template** (`templates/android/`) brought to Panzer Dragoon Orta 1.3.0's Android standard, port-neutral:
+  the setup screen in the Windows Vista look (`VistaSetupView` / `PortSetup` / `jni/loader/setup_ui_android.c`, new
+  Gradle properties `setupGame` / `setupDisc`), five kept Turnip drivers plus the system driver, a driver check
+  before the build, the BACK menu in a fixed order, run logs with Export log, and the Vulkan 1.3 feature no longer
+  required in the manifest.

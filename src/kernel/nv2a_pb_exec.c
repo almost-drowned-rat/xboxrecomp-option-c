@@ -1029,14 +1029,20 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
 
     /* Linear 32-bit ARGB is already the output layout: copy rows, not
      * texels. A movie frame is one of these every frame. */
+    /* X8R8G8B8 (0x1E): the alpha set while copying - argb_out is often the renderer's upload ring, mapped GPU
+     * memory that is write-combined / uncached on phones (Adreno): reading it back ("row[x] |= ...") cost THPS 2X's
+     * 640x480 menu background ~75 ms a frame on the Odin 2 (menus at 11 fps; 2026-11-24). Only writes now. */
     if ((tex->color == 0x12 || tex->color == 0x1E) && tex->pitch >= tex->width * 4) {
         const uint8_t *src = (const uint8_t *)xbox_GetMemoryOffset() + tex->offset;
         for (y = 0; y < tex->height; y++) {
             uint32_t *row = argb_out + (size_t)y * tex->width;
-            memcpy(row, src + (size_t)y * tex->pitch, (size_t)tex->width * 4);
-            if (tex->color == 0x1E)
+            if (tex->color == 0x12) {
+                memcpy(row, src + (size_t)y * tex->pitch, (size_t)tex->width * 4);
+            } else {
+                const uint32_t *s = (const uint32_t *)(src + (size_t)y * tex->pitch);
                 for (x = 0; x < tex->width; x++)
-                    row[x] |= 0xFF000000u;
+                    row[x] = s[x] | 0xFF000000u;
+            }
         }
         return 1;
     }

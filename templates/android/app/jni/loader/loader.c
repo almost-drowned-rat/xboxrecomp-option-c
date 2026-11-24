@@ -258,6 +258,27 @@ int main(int argc, char **argv)
     SDL_SetHint(SDL_HINT_VULKAN_LIBRARY, "libvulkan_port.so");
     if (!SDL_getenv("RECOMP_FLIP_STALL_MS"))      /* dev builds: a stall dump after 500 ms without a frame (option-c cd23de2) */
         SDL_setenv_unsafe("RECOMP_FLIP_STALL_MS", "500", 1);
+    {   /* measurements without a rebuild (2026-11-19): <shared files>/dev_env.txt, KEY=VALUE per line, set
+         * before the game starts (e.g. RECOMP_PROG_CACHE=0 = no shader caches = a fresh first session,
+         * RECOMP_VK_PIPELIST=none = without the shipped list). No file = nothing changes; never shipped. */
+        const char *ext = SDL_GetAndroidExternalStoragePath();
+        char path[1024], line[1024];
+        FILE *f;
+        if (ext) {
+            SDL_snprintf(path, sizeof path, "%s/dev_env.txt", ext);
+            if ((f = fopen(path, "r")) != NULL) {
+                while (fgets(line, sizeof line, f)) {
+                    char *eq = strchr(line, '='), *e = line + strlen(line);
+                    while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+                    if (line[0] == '#' || !eq || eq == line) continue;
+                    *eq = 0;
+                    SDL_setenv_unsafe(line, eq + 1, 1);
+                    __android_log_print(ANDROID_LOG_INFO, PORT_TAG, "[LOADER] dev_env.txt: %s=%s", line, eq + 1);
+                }
+                fclose(f);
+            }
+        }
+    }
     touchpad_init();                             /* the touch controls' virtual gamepad (touchpad.c) */
     game_starting();                             /* TouchOverlay shows from now on */
     h = dlopen(lib, RTLD_NOW | RTLD_GLOBAL);

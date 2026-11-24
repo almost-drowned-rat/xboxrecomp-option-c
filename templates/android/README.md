@@ -30,8 +30,18 @@ The Java package stays `xboxrecomp.port` in every port, so the JNI names in `jni
 - `port_android.h` - the port's names (copy `port_example/port_android.h`): logcat tag, title, game library and its
   entry point, the lifter's game name and config package, the media env variable, the touch pad's name, optional
   touch aim and compile jobs, the launcher config (game, disc, title id, versions);
-- `port_icon.h` - the launcher icon as a BMP array (the same file the Windows / Linux launcher uses);
-- `setup_ui_sdl.c` - the launcher's progress UI in the port's look.
+- `port_icon.h` - the launcher icon as a BMP array (the same file the Windows / Linux launcher uses).
+
+The setup screen is the template's own since 2026-11-24 (from Panzer Dragoon Orta 1.3.0; the maintainer's
+rule: ZOE's Android launcher is the design standard of every Android port, Android = the Windows Vista look):
+`VistaSetupView.java` (drawn procedurally: the disc row, the graphics-driver row - the system driver or a Turnip
+package from the player's own file, up to five kept -, Install / Quit / Play, the "Quit anyway?" question, the
+progress with the step and its time), `PortSetup.java` (the bridge) and `jni/loader/setup_ui_android.c` (the toolkit
+launcher's `game_setup_ui.h` over JNI; `xr_launcher_set_image_page` = the form). A port has no `setup_ui_sdl.c` any
+more; it passes the game's name and the disc it asks for (`setupGame`, `setupDisc`).
+
+The BACK menu has the fixed order of every Android port: Back to the game / Controls / Settings (Saves, Export log,
+Boot animation, Graphics driver - five kept Turnip packages or the system driver -, About and licences).
 
 **The APU module (ports that use the APU emulation, e.g. Orta; not THPS, which is DirectSound HLE):** the runtime
 SDK's `libxbox_apu.so` must go into the APK's `jniLibs/arm64-v8a/` next to the other native libraries - the game
@@ -62,6 +72,8 @@ Orta on the Odin 2: long frames 64-73 -> 3-4 a minute, GAME SPEED 98 -> 99.9 %.
 | `savesPrefix` | save backup file `<prefix>-saves-<stamp>.zip` | `Orta` |
 | `touchName` | the virtual pad's name (= `PORT_TOUCH_NAME`) | `Orta touch controls` |
 | `touchAim` | `true`: the BACK menu offers the aiming layout (needs `PORT_TOUCH_AIM`) | `true` |
+| `setupGame` | the setup screen's game name | `Panzer Dragoon Orta` |
+| `setupDisc` | the disc it asks for, with the region | `Panzer Dragoon Orta (Europe)` |
 | `versionCode`, `versionName` | the APK's version | `7`, `0.1.1` |
 | `keyAlias` | release key alias (with `releaseStore`, `releasePassFile`) | `orta` |
 | `portDir`, `portRes` | the two folders above | (set when Orta adopts the template) |

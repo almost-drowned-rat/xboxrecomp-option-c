@@ -15,10 +15,11 @@ set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
 set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(${SDL3_SRC} sdl3 EXCLUDE_FROM_ALL)
 
-# The port's folder: port_android.h (names), port_icon.h (the launcher icon as a BMP array), setup_ui_sdl.c (the
-# launcher's progress UI in the port's look)
+# The port's folder: port_android.h (names), port_icon.h (the launcher icon as a BMP array). The setup UI is the
+# standard Android setup screen in the Vista look, the same in every port (loader/setup_ui_android.c -> PortSetup.java /
+# VistaSetupView.java; 2026-11-24, from Panzer Dragoon Orta 1.3.0) - no port setup_ui_sdl.c any more.
 if(NOT PORT_DIR OR NOT EXISTS "${PORT_DIR}/port_android.h")
-    message(FATAL_ERROR "-DPORT_DIR=<folder with port_android.h, port_icon.h, setup_ui_sdl.c> missing (-PportDir)")
+    message(FATAL_ERROR "-DPORT_DIR=<folder with port_android.h, port_icon.h> missing (-PportDir)")
 endif()
 
 add_library(main SHARED loader/loader.c loader/pylift.c loader/launcher_android.c loader/touchpad.c loader/driver_check.c smoke/vk_smoke.c)
@@ -33,7 +34,7 @@ if(NOT XR_TOOLKIT)
 endif()
 set(TK ${XR_TOOLKIT}/src)
 target_sources(main PRIVATE ${TK}/launcher/launcher.c ${TK}/launcher/sha256.c ${TK}/install/game_setup.c
-               ${PORT_DIR}/setup_ui_sdl.c ${TK}/install/xdvdfs.c ${TK}/shaderpack/zip_read.c
+               loader/setup_ui_android.c ${TK}/install/xdvdfs.c ${TK}/shaderpack/zip_read.c
                ${TK}/shaderpack/third_party/miniz/miniz_tinfl.c ${TK}/kernel/window_icon.c ${TK}/platform/host_paths.c)
 target_include_directories(main PRIVATE ${TK}/launcher ${TK}/install ${TK}/shaderpack ${TK}/shaderpack/third_party/miniz
                            ${TK}/kernel ${TK} ${CMAKE_CURRENT_BINARY_DIR}/miniz)
