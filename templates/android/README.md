@@ -43,6 +43,16 @@ more; it passes the game's name and the disc it asks for (`setupGame`, `setupDis
 The BACK menu has the fixed order of every Android port: Back to the game / Controls / Settings (Saves, Export log,
 Boot animation, Graphics driver - five kept Turnip packages or the system driver -, About and licences).
 
+**Soundtracks (ports with custom soundtracks, Gradle `-PmediaTracks=<the game's songs per album>`, e.g. THPS 2X: 128;
+2026-11-24, the maintainer's design):** BACK > Settings > Soundtracks sits after Boot animation. *Import
+folder...* opens the system folder picker (also SD cards); `MediaImport.java` copies the MP3 / FLAC / Ogg Vorbis / WAV
+files and the .m3u / .m3u8 lists of the picked folder, sub folders kept, into `media/<folder name>/` - the media scan
+(`src/media/media_scan.h`) then makes every folder that holds music one album, so a folder of album folders gives one
+album each. Before copying it shows the albums, songs and size, the files it leaves out, albums over the game's limit
+and a replace question; free space is checked; the copy has a progress bar with Cancel and leaves nothing behind when
+cancelled. The page lists the albums (songs, size; tap = remove) and every change offers a restart (the game scans
+media/ at its start). Copies, not links: the game opens plain paths, and the albums survive a removed SD card.
+
 **The APU module (ports that use the APU emulation, e.g. Orta; not THPS, which is DirectSound HLE):** the runtime
 SDK's `libxbox_apu.so` must go into the APK's `jniLibs/arm64-v8a/` next to the other native libraries - the game
 looks for it by its bare name in the app's lib folder (`docs/apu_module.md`). Without it the game runs with no sound

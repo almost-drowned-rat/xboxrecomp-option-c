@@ -279,7 +279,7 @@ public class PortActivity extends SDLActivity {
     }
 
     private static final int PICK_DRIVER = 4711, PICK_BOOT = 4712, PICK_SAVE_EXPORT = 4713, PICK_SAVE_IMPORT = 4714,
-                             PICK_LOG_EXPORT = 4715;
+                             PICK_LOG_EXPORT = 4715, PICK_MEDIA = 4716;
 
     /** The system file picker for a Turnip package, opened in Downloads (where a downloaded .adpkg.zip lands). */
     private void pickDriver() {
@@ -456,6 +456,11 @@ public class PortActivity extends SDLActivity {
                 .show();
             return;
         }
+        if (request == PICK_MEDIA) {
+            immersive();
+            if (result == RESULT_OK && data != null && data.getData() != null) importMedia(data.getData());
+            return;
+        }
         if (request == PICK_LOG_EXPORT) {
             immersive();
             if (result != RESULT_OK || data == null || data.getData() == null) return;
@@ -522,6 +527,12 @@ public class PortActivity extends SDLActivity {
                 l.add(new SideMenu.Item("Boot animation: " + (bootVideo(PortActivity.this).exists() ? "boot.mpg" : "none")) {
                     @Override void run() { mMenu.push(bootPage()); }
                 });
+                if (mediaTracks() > 0) {                      // a port with custom soundtracks (-PmediaTracks)
+                    int n = MediaImport.albums(mediaDir()).size();
+                    l.add(new SideMenu.Item("Soundtracks: " + (n == 0 ? "none" : n + (n == 1 ? " album" : " albums"))) {
+                        @Override void run() { mMenu.push(soundtracksPage()); }
+                    });
+                }
                 String drv = driverName(PortActivity.this);
                 l.add(new SideMenu.Item("Graphics driver: " + (drv != null ? drv : "system")) {
                     @Override void run() { mMenu.push(driverPage()); }
@@ -988,6 +999,153 @@ public class PortActivity extends SDLActivity {
         String[] slot = { null };
         String err = importDriver(ctx, android.net.Uri.parse(uri), slot);
         return err.isEmpty() ? activateKept(ctx, slot[0]) : err;
+    }
+
+    // ---- Soundtracks (2026-11-24, the maintainer's design; MediaImport.java): BACK > Settings > Soundtracks -
+    // "Import folder..." (the system folder picker; one album per folder that holds music, sub folders included), the
+    // albums in media/ with their songs and size (tap = remove), and a restart afterwards so the game reads the new list.
+
+    private int mediaTracks() { return getResources().getInteger(R.integer.media_tracks); }
+    private File mediaDir() { return new File(userDir(this), "media"); }
+
+    private SideMenu.Page soundtracksPage() {
+        return new SideMenu.Page() {
+            public String title() { return "Soundtracks"; }
+            public java.util.List<SideMenu.Item> items() {
+                java.util.List<SideMenu.Item> l = new java.util.ArrayList<>();
+                l.add(new SideMenu.Item("Import folder...") { @Override void run() { mMenu.close(); pickMediaFolder(); } });
+                for (final MediaImport.Album a : MediaImport.albums(mediaDir())) {
+                    String more = a.songs > mediaTracks() ? "  - only the first " + mediaTracks() + " play" : "";
+                    int cut = a.rel.lastIndexOf('/');        // the album's name as the game shows it, its folder after
+                    String label = cut < 0 ? a.rel : a.rel.substring(cut + 1) + "  (" + a.rel.substring(0, cut) + ")";
+                    l.add(new SideMenu.Item(label + "  - " + a.songs + (a.songs == 1 ? " song, " : " songs, ")
+                                            + MediaImport.mb(a.bytes) + more) {
+                        @Override void run() { confirmRemoveAlbum(a); }
+                    });
+                }
+                l.add(new SideMenu.Item("(a folder with music files is one album; a folder of album folders gives one "
+                                        + "album each - MP3, FLAC, Ogg Vorbis, WAV)"));
+                l.add(new SideMenu.Item("(choose them in the game's options: the soundtrack setting; tap an album to "
+                                        + "remove it)"));
+                return l;
+            }
+        };
+    }
+
+    private void pickMediaFolder() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        // opens in the device's Music folder (where music usually is); the player can go anywhere from there
+        i.putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI,
+                   android.net.Uri.parse("content://com.android.externalstorage.documents/document/primary%3AMusic"));
+        try {
+            startActivityForResult(i, PICK_MEDIA);
+        } catch (Exception e) {
+            message("Soundtracks", "This device has no folder picker.");
+        }
+    }
+
+    private void askRestart(String title, String text) {
+        new android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle(title).setMessage(text + " The game reads the soundtracks when it starts: restart it now?")
+            .setPositiveButton("Restart now", (dlg, w) -> { restartApp(); System.exit(0); })
+            .setNegativeButton("Later", null).show();
+    }
+
+    private void confirmRemoveAlbum(final MediaImport.Album a) {
+        new android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Soundtracks")
+            .setMessage("Remove the album \"" + a.rel + "\" (" + a.songs + " songs, " + MediaImport.mb(a.bytes)
+                        + ") from the app? The music in the folder you imported it from stays.")
+            .setPositiveButton("Remove", (dlg, w) -> {
+                MediaImport.remove(mediaDir(), a.rel);
+                Log.i(TAG, "[MEDIA] album removed: " + a.rel);
+                mMenu.refresh();
+                askRestart("Soundtracks", "\"" + a.rel + "\" is removed.");
+            })
+            .setNegativeButton("Cancel", null).show();
+    }
+
+    /** The picked folder: scan it (in the background), tell what it holds and ask, then copy with a progress bar. */
+    private void importMedia(final android.net.Uri tree) {
+        final android.app.ProgressDialog wait = new android.app.ProgressDialog(this, android.R.style.Theme_DeviceDefault_Dialog_Alert);
+        wait.setTitle("Soundtracks");
+        wait.setMessage("Looking at the folder...");
+        wait.setCancelable(false);
+        wait.show();
+        new Thread(() -> {
+            final MediaImport.Plan p = MediaImport.scan(getContentResolver(), tree);
+            runOnUiThread(() -> { wait.dismiss(); askImport(p); });
+        }, "media-scan").start();
+    }
+
+    private void askImport(final MediaImport.Plan p) {
+        if (p.albums.isEmpty()) {
+            message("Soundtracks", "There is no music the game can play in \"" + p.name + "\" (MP3, FLAC, Ogg Vorbis "
+                    + "or WAV), neither in it nor in its sub folders.");
+            return;
+        }
+        int songs = 0;
+        StringBuilder big = new StringBuilder();
+        for (java.util.Map.Entry<String, Integer> e : p.albums.entrySet()) {
+            songs += e.getValue();
+            if (e.getValue() > mediaTracks())
+                big.append("\n- ").append(e.getKey().isEmpty() ? p.name : p.name + "/" + e.getKey()).append(": ")
+                   .append(e.getValue()).append(" songs");
+        }
+        long free = mediaDir().getParentFile().getUsableSpace();
+        if (p.bytes + (64L << 20) > free) {
+            message("Soundtracks", "Not enough free space: the music needs " + MediaImport.mb(p.bytes) + ", the device "
+                    + "has " + MediaImport.mb(free) + " free.");
+            return;
+        }
+        int n = p.albums.size();
+        StringBuilder msg = new StringBuilder();
+        msg.append("\"").append(p.name).append("\": ").append(n).append(n == 1 ? " album, " : " albums, ").append(songs)
+           .append(songs == 1 ? " song, " : " songs, ").append(MediaImport.mb(p.bytes)).append(".");
+        if (p.skipped > 0) msg.append("\n").append(p.skipped).append(" other files (pictures, text, other formats) are left out.");
+        if (big.length() > 0) msg.append("\n\nThe game plays at most ").append(mediaTracks())
+                                 .append(" songs per album - only the first ones of these play:").append(big);
+        if (new File(mediaDir(), p.name).exists())
+            msg.append("\n\nThe app already has \"").append(p.name).append("\" - it is replaced.");
+        new android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Import soundtracks").setMessage(msg.toString())
+            .setPositiveButton(new File(mediaDir(), p.name).exists() ? "Replace" : "Import", (dlg, w) -> copyMedia(p))
+            .setNegativeButton("Cancel", null).show();
+    }
+
+    private void copyMedia(final MediaImport.Plan p) {
+        final android.app.ProgressDialog bar = new android.app.ProgressDialog(this, android.R.style.Theme_DeviceDefault_Dialog_Alert);
+        final boolean[] cancel = { false };
+        bar.setTitle("Importing \"" + p.name + "\"");
+        bar.setProgressStyle(android.app.ProgressDialog.STYLE_HORIZONTAL);
+        bar.setMax(1000);
+        bar.setCancelable(false);
+        bar.setButton(android.content.DialogInterface.BUTTON_NEGATIVE, "Cancel", (d, w) -> cancel[0] = true);
+        bar.show();
+        final File media = mediaDir();
+        media.mkdirs();
+        new Thread(() -> {
+            final long[] last = { 0 };
+            final String err = MediaImport.copy(getContentResolver(), p, media, (done, total, file) -> {
+                long now = android.os.SystemClock.uptimeMillis();
+                if (now - last[0] > 100) {
+                    last[0] = now;
+                    final int v = (int) (done * 1000 / Math.max(1, total));
+                    runOnUiThread(() -> { bar.setProgress(v); bar.setMessage(file); });
+                }
+                return !cancel[0];
+            });
+            shareTree(media);
+            runOnUiThread(() -> {
+                bar.dismiss();
+                if (err.equals("cancel")) { message("Soundtracks", "The import is cancelled - nothing was added."); return; }
+                if (!err.isEmpty()) { message("Soundtracks", err); return; }
+                Log.i(TAG, "[MEDIA] imported \"" + p.name + "\": " + p.files.size() + " files, " + p.bytes + " bytes, "
+                      + p.albums.size() + " albums");
+                int n = p.albums.size();
+                askRestart("Soundtracks", "\"" + p.name + "\" is imported (" + n + (n == 1 ? " album)." : " albums)."));
+            });
+        }, "media-import").start();
     }
 
     private void message(String title, String text) {
