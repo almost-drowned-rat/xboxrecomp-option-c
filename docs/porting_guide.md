@@ -476,6 +476,12 @@ State: toolkit branch `launcher` (head 65019c1: `src/launcher/`, `src/install/ga
      (`xbox_host_root`, `host_win32.c` / `host_linux.c`), so `game\`, `saves\`, `media\` and `data\` stay where they
      were; an older install's game next to the launcher is moved into `data\` at the next start (no rebuild).
      Android keeps its library in the app's root;
+   - **Android version numbers (maintainer, 2026-11-24; every port):** the Android app counts its own versions,
+     independent of the desktop release (Android sometimes needs other fixes). Its first release on a new base is
+     **1.0.0** - or **0.5.0** while the desktop release has not reached 1.0 (ZOE: desktop 0.8.5 -> Android 0.5.0) -
+     and older Android releases are deleted completely. **Every Android release's notes name the base**: "Based on
+     <desktop release> and xboxrecomp-option-c <tag>", plus the Android-only fixes on top. Desktop READMEs link the
+     Android repository without claiming the same version;
    - arguments: `--repair` (rebuild; `saves\` and `media\` are never touched), `--image <path>`, `--no-start`.
 3. **Progress window** = the installer UI (`game_setup_ui.c`): 640x240, the step text word-wrapped (37 characters,
    up to 4 lines, the 8x8 debug font at scale 2). Every step logs to `data\launcher.log`.

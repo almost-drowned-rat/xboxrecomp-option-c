@@ -1474,6 +1474,49 @@ static NTSTATUS errno_to_status(int e)
     }
 }
 
+/* The host path of an OBJECT_ATTRIBUTES name, as translate_obj_path on Windows: a bare name with a
+ * RootDirectory is relative to that open folder. XAPI does this when it overwrites a save (THPS 2X: the
+ * save folder is opened, then "saveimage.xbx" relative to it); without it the name was an "unrecognized
+ * Xbox path", the open failed and the game said "unsuccessfully saved" / "the memory unit was removed
+ * during use" on Linux and Android (THPS 2X issue #27). Xbox names are Latin-1 (as kernel_path.c). */
+static BOOL posix_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, char *out, size_t n)
+{
+    const char *xbox_path = get_xbox_path(ObjectAttributes);
+    if (!xbox_path)
+        return FALSE;
+    if (ObjectAttributes->RootDirectory && xbox_path[0] != '\\' && !(xbox_path[0] && xbox_path[1] == ':')) {
+        const char *base = w32_handle_path(ObjectAttributes->RootDirectory);
+        size_t used, bl;
+        const unsigned char *c;
+        if (!base)
+            return FALSE;
+        bl = strlen(base);
+        while (bl > 1 && base[bl - 1] == '/')
+            bl--;
+        if (bl + 2 >= n)
+            return FALSE;
+        memcpy(out, base, bl);
+        out[bl] = '/';
+        used = bl + 1;
+        for (c = (const unsigned char *)xbox_path; *c; c++) {
+            if (used + 3 >= n)
+                return FALSE;
+            if (*c == '\\')
+                out[used++] = '/';
+            else if (*c < 0x80)
+                out[used++] = (char)*c;
+            else {                                  /* Latin-1 -> UTF-8 */
+                out[used++] = (char)(0xC0 | (*c >> 6));
+                out[used++] = (char)(0x80 | (*c & 0x3F));
+            }
+        }
+        out[used] = 0;
+        xbox_host_path_fix_case(out, bl + 1);       /* the name as the folder has it (case-insensitive, as FATX) */
+        return TRUE;
+    }
+    return xbox_translate_path(xbox_path, out, (DWORD)n);
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -1487,8 +1530,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
 
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, XBOX_HOST_PATH)) {
+    if (!posix_obj_path(ObjectAttributes, host_path, sizeof host_path)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
@@ -1655,8 +1697,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     char host_path[XBOX_HOST_PATH];
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, XBOX_HOST_PATH))
+    if (!posix_obj_path(ObjectAttributes, host_path, sizeof host_path))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %s", host_path);
     if (unlink(host_path) == 0) return STATUS_SUCCESS;
@@ -1799,10 +1840,20 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
                 return STATUS_SUCCESS;
             }
             /* POSIX: unlinking an open file removes it on last close -- this
-             * matches NT "delete on close" semantics exactly. */
+             * matches NT "delete on close" semantics exactly. A folder needs rmdir: unlink always refused it
+             * (EISDIR), so XDeleteSaveGame's last step - the save folder itself, after its files - never took
+             * place, and the overwrite's XCreateSaveGame then found the folder still there: "unsuccessfully
+             * saved" / "the memory unit was removed during use" (THPS 2X issue #27, Linux + Android). As the
+             * Windows side: a refusal (a folder not empty) is reported on stderr, the call still succeeds. */
             if (info->DeleteFile) {
                 const char* p = w32_handle_path(FileHandle);
-                if (p) unlink(p);
+                struct stat ds;
+                if (p && stat(p, &ds) == 0 && S_ISDIR(ds.st_mode)) {
+                    if (rmdir(p) != 0)
+                        fprintf(stderr, "  [FILE] delete-on-close refused by the host: %s (errno %d)\n", p, errno);
+                } else if (p) {
+                    unlink(p);
+                }
             }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
@@ -1948,8 +1999,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 
     if (!FileInformation)
         return STATUS_INVALID_PARAMETER;
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, XBOX_HOST_PATH))
+    if (!posix_obj_path(ObjectAttributes, host_path, sizeof host_path))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     if (stat(host_path, &st) != 0)
         return STATUS_OBJECT_NAME_NOT_FOUND;
